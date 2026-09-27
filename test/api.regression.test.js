@@ -176,6 +176,17 @@ test('DIV 10 end-to-end regression — RIMO / route 918 / 08/24–09/06/2026', {
     assert.equal(r.data.view.calculation.net, '2217.49');
     r = await call('POST', `/vdps/${rimo._id}/adjustments`, { type: 'REIMBURSEMENT', amount: '-5' });
     assert.equal(r.status, 400);
+
+    // Removing an adjustment takes it off the VDP (and it stays off on reload).
+    r = await call('POST', `/vdps/${rimo._id}/adjustments`, { type: 'TOLL', amount: '10.00' });
+    const toll = r.data.view.adjustments.find((a) => a.type === 'TOLL');
+    assert.ok(toll?._id);
+    r = await call('DELETE', `/vdps/${rimo._id}/adjustments/${toll._id}`);
+    assert.equal(r.status, 200);
+    assert.equal(r.data.view.adjustments.some((a) => a.type === 'TOLL'), false);
+    r = await call('GET', `/vdps/${rimo._id}`);
+    assert.equal(r.data.view.adjustments.some((a) => a.type === 'TOLL'), false);
+    assert.equal(r.data.view.calculation.net, '2217.49');
   });
 
   await t.test('TUI can be switched off for a provider and back on', async () => {

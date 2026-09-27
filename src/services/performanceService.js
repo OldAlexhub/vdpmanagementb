@@ -5,13 +5,15 @@ import Provider from '../models/Provider.js';
 import Vdp from '../models/Vdp.js';
 import { parsePerformanceFile, ReportFormatError } from './performanceParser.js';
 import { isoDate } from './cycleService.js';
+import { runsRouteOn } from './operators.js';
 import { badRequest, conflict, notFound, actor } from './errors.js';
 
 export const activeImportFor = (cycleId) => PerformanceImport.findOne({ cycleId, status: 'ACTIVE' });
 
 /**
  * Route → provider association for an import.
- * A route matches the single ACTIVE provider in the division that lists it.
+ * A route matches the single ACTIVE provider in the division that lists it. When an operator
+ * moved between providers, both list the route and it is split by date (`split`).
  * Explicit resolutions on the import win. Anything else is left for a human.
  */
 export function matchRoutes(importDoc, providers) {
@@ -29,12 +31,31 @@ export function matchRoutes(importDoc, providers) {
       const p = byId.get(String(res.providerId));
       return { ...summary, status: 'ASSIGNED', providerId: res.providerId, providerName: p?.name, resolution: res };
     }
-    const candidates = active.filter((p) => p.routes.includes(route));
+    const listing = active.filter((p) => p.routes.includes(route));
+    // An operator who moved between providers leaves the route on both profiles; their dates decide.
+    const days = [...new Set(rows.map((r) => r.date))].sort();
+    const owners = (p) => days.filter((d) => runsRouteOn(p, route, d));
+    const candidates = listing.length > 1 ? listing.filter((p) => owners(p).length) : listing;
     if (candidates.length === 1) {
       return { ...summary, status: 'MATCHED', providerId: candidates[0]._id, providerName: candidates[0].name };
     }
     if (candidates.length === 0) {
       return { ...summary, status: 'UNKNOWN', message: `Route ${route} is not assigned to any active provider.` };
+    }
+    const split = candidates.map((p) => ({ p, days: owners(p) }));
+    const eachDayOnce = days.every((d) => split.filter((s) => s.days.includes(d)).length === 1);
+    if (eachDayOnce) {
+      const parts = split
+        .map(({ p, days: own }) => ({ providerId: p._id, providerName: p.name, from: own[0], to: own[own.length - 1], days: own.length }))
+        .sort((a, b) => a.from.localeCompare(b.from));
+      const last = parts[parts.length - 1];
+      return {
+        ...summary,
+        status: 'MATCHED',
+        providerId: last.providerId,
+        providerName: parts.map((s) => `${s.providerName} (${s.from} – ${s.to})`).join(' → '),
+        split: parts,
+      };
     }
     return {
       ...summary,

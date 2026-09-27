@@ -62,6 +62,7 @@ api.get('/providers', providers.list);
 api.post('/providers', providers.create);
 api.get('/providers/:id', providers.get);
 api.put('/providers/:id', providers.update);
+api.post('/providers/:id/operators/:operatorId/transfer', providers.transferOperator);
 
 // Bulk import from Excel: divisions | plans | providers. Admin-only kinds are checked in the controller.
 api.get('/imports/:kind/template', imports.template);

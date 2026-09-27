@@ -416,7 +416,7 @@ const providers = {
     const routeOwners = new Map(); // "divisionId|route" → who has it (system or earlier row)
     for (const p of ctx.providers) {
       if (p.status !== 'ACTIVE') continue;
-      for (const o of operatorsOf(p).filter((x) => x.status === 'ACTIVE')) {
+      for (const o of operatorsOf(p).filter((x) => x.status === 'ACTIVE' && !x.transferredTo)) {
         o.routes.forEach((rt) => routeOwners.set(`${p.divisionId}|${ci(rt)}`, o.name === p.name ? p.name : `${o.name} (${p.name})`));
       }
     }

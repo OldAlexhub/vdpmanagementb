@@ -2,9 +2,12 @@ import Provider from '../models/Provider.js';
 import VdpPlan from '../models/VdpPlan.js';
 import Division from '../models/Division.js';
 import { resolveSettings, currentVersion } from '../services/planService.js';
+import Vdp from '../models/Vdp.js';
+import VdpCycle from '../models/VdpCycle.js';
 import { markStale } from '../services/vdpService.js';
-import { operatorsOf } from '../services/operators.js';
-import { badRequest, notFound } from '../services/errors.js';
+import { operatorsOf, worksBetween, LEGACY_OPERATOR_ID } from '../services/operators.js';
+import { isoDate, addDays, toDateOnly } from '../services/cycleService.js';
+import { badRequest, conflict, notFound, actor } from '../services/errors.js';
 import { decimalInput, pick } from './validate.js';
 
 const normRoutes = (routes) =>
@@ -39,12 +42,25 @@ function operatorInput(o, i) {
   };
 }
 
+// Transfer dates are only set by a transfer, never by the edit form. Operators who moved to
+// another provider are not on the form; they are kept so earlier cycles still pay correctly.
+const TRANSFER_FIELDS = ['startDate', 'endDate', 'transferredFrom', 'transferredTo'];
+
 function applyOperators(provider, list) {
   if (!Array.isArray(list)) throw badRequest('Operators must be a list.');
-  const operators = list.map(operatorInput);
+  const existing = new Map(provider.operators.map((o) => [String(o._id), o]));
+  const operators = list.map(operatorInput).map((o) => {
+    const before = o._id && existing.get(String(o._id));
+    if (!before) return o;
+    const kept = Object.fromEntries(TRANSFER_FIELDS.map((k) => [k, before.toObject()[k] ?? null]));
+    return { ...o, ...kept };
+  });
+  const listed = new Set(operators.filter((o) => o._id).map((o) => String(o._id)));
+  const movedAway = provider.operators.filter((o) => o.transferredTo?.providerId && !listed.has(String(o._id))).map((o) => o.toObject());
   const seenName = new Set();
   const routeOwner = new Map();
   for (const o of operators) {
+    if (o.transferredTo?.providerId) continue; // moved away: their dates no longer overlap anyone here
     if (seenName.has(o.name.toLowerCase())) throw badRequest(`Operator ${o.name} is listed twice.`);
     seenName.add(o.name.toLowerCase());
     if (o.status !== 'ACTIVE') continue;
@@ -53,7 +69,7 @@ function applyOperators(provider, list) {
       routeOwner.set(r, o.name);
     }
   }
-  provider.operators = operators;
+  provider.operators = [...operators, ...movedAway];
 }
 
 export async function applyInput(provider, body) {
@@ -119,12 +135,18 @@ async function withPayment(provider) {
   json.paymentSettings = plan && version ? resolveSettings(provider, plan, version) : null;
   json.operators = operatorsOf(provider);
   // Routes shared with another active provider are a matching problem worth showing early.
+  // A route handed over by an operator transfer is on both profiles for different dates — not shared.
   if (provider.routes.length) {
     const others = await Provider.find(
       { divisionId: provider.divisionId, _id: { $ne: provider._id }, status: 'ACTIVE', routes: { $in: provider.routes } },
-      'name routes',
+      'name routes operators operatorName liftLease',
     );
-    json.sharedRoutes = others.flatMap((o) => o.routes.filter((r) => provider.routes.includes(r)).map((route) => ({ route, provider: o.name })));
+    const runs = (p, route) => operatorsOf(p).filter((o) => o.status === 'ACTIVE' && o.routes.includes(route));
+    const overlap = (a, b) => worksBetween(a, b.startDate || '0000-01-01', b.endDate || '9999-12-31');
+    json.sharedRoutes = others.flatMap((other) => other.routes
+      .filter((r) => provider.routes.includes(r))
+      .filter((r) => { const mine = runs(provider, r); const theirs = runs(other, r); return !mine.length || !theirs.length || mine.some((a) => theirs.some((b) => overlap(a, b))); })
+      .map((route) => ({ route, provider: other.name })));
   }
   return json;
 }
@@ -167,4 +189,80 @@ export async function update(req, res) {
   await p.save();
   await markStale({ providerId: p._id });
   res.json(await withPayment(p));
+}
+
+// A provider saved before operators existed gets its one operator as a real record first.
+function materializeOperators(provider) {
+  if (provider.operators.length || (!provider.routes.length && !provider.operatorName)) return;
+  const [legacy] = operatorsOf(provider);
+  provider.operators = [{ name: legacy.name, routes: legacy.routes, status: 'ACTIVE', liftLease: legacy.liftLease }];
+}
+
+const dayBefore = (day) => isoDate(addDays(day, -1));
+
+/**
+ * Move an operator to another provider from an effective date. The operator stays on the old
+ * provider until the day before (so earlier report days still pay there) and is added to the
+ * new provider from that date with the same routes, contracted hours and lift lease.
+ */
+export async function transferOperator(req, res) {
+  const { toProviderId, effectiveDate, note } = req.body;
+  const source = await Provider.findById(req.params.id);
+  if (!source) throw notFound('Provider');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(effectiveDate || '')) || Number.isNaN(Date.parse(effectiveDate))) {
+    throw badRequest('Choose the effective date (the operator’s first day with the new provider).');
+  }
+  if (!toProviderId || String(toProviderId) === String(source._id)) throw badRequest('Choose the provider the operator is moving to.');
+  const target = await Provider.findById(toProviderId);
+  if (!target || String(target.divisionId) !== String(source.divisionId)) throw badRequest('Choose a provider in the same division.');
+  if (target.status !== 'ACTIVE') throw badRequest(`${target.name} is inactive. Activate it before moving an operator there.`);
+
+  materializeOperators(source);
+  const op = req.params.operatorId === LEGACY_OPERATOR_ID && source.operators.length === 1
+    ? source.operators[0]
+    : source.operators.id(req.params.operatorId);
+  if (!op) throw notFound('Operator');
+  if (op.status !== 'ACTIVE') throw badRequest(`${op.name} is inactive on ${source.name}.`);
+  if (op.transferredTo?.providerId) throw badRequest(`${op.name} already moved to ${op.transferredTo.providerName} on ${op.transferredTo.effectiveDate}.`);
+  if (op.startDate && effectiveDate <= op.startDate) throw badRequest(`${op.name} only started with ${source.name} on ${op.startDate}. Choose a later date.`);
+
+  materializeOperators(target);
+  const clash = target.operators.find((o) => o.status === 'ACTIVE' && worksBetween(o, effectiveDate, '9999-12-31')
+    && (o.name.toLowerCase() === op.name.toLowerCase() || o.routes.some((r) => op.routes.includes(r))));
+  if (clash) {
+    throw badRequest(clash.name.toLowerCase() === op.name.toLowerCase()
+      ? `${target.name} already has an operator named ${op.name}.`
+      : `${target.name}’s operator ${clash.name} already runs route ${clash.routes.filter((r) => op.routes.includes(r)).join(', ')}.`);
+  }
+
+  // Approved statements are frozen; changing who ran those days would contradict them.
+  const cycles = await VdpCycle.find({ divisionId: source.divisionId, cycleEnd: { $gte: toDateOnly(effectiveDate) } }, '_id');
+  const locked = await Vdp.find({
+    providerId: { $in: [source._id, target._id] },
+    cycleId: { $in: cycles.map((c) => c._id) },
+    status: { $nin: ['DRAFT', 'NEEDS_REVIEW', 'READY'] },
+  }).populate('providerId', 'name').populate('cycleId', 'cycleStart cycleEnd');
+  if (locked.length) {
+    const list = locked.map((v) => `${v.providerId.name} (${isoDate(v.cycleId.cycleStart)} – ${isoDate(v.cycleId.cycleEnd)})`).join(', ');
+    throw conflict(`These VDPs cover dates on or after ${effectiveDate} and are already approved: ${list}. Reopen them first, or choose a later date.`);
+  }
+
+  const by = actor(req.user);
+  const text = String(note || '').trim() || undefined;
+  target.operators.push({
+    name: op.name,
+    routes: op.routes,
+    status: 'ACTIVE',
+    contractedHours: op.contractedHours,
+    liftLease: op.liftLease,
+    notes: op.notes,
+    startDate: effectiveDate,
+    transferredFrom: { providerId: source._id, providerName: source.name, effectiveDate, note: text, by },
+  });
+  op.endDate = dayBefore(effectiveDate);
+  op.transferredTo = { providerId: target._id, providerName: target.name, effectiveDate, note: text, by };
+  await target.save();
+  await source.save();
+  await markStale({ providerId: { $in: [source._id, target._id] } });
+  res.json(await withPayment(source));
 }

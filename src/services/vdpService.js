@@ -9,7 +9,7 @@ import { resolveVersion, resolveSettings, engineSettings, validateVersion } from
 import { activeImportFor, matchRoutes, unresolvedRoutes } from './performanceService.js';
 import { hoursForMetric, HOUR_METRICS } from './performanceParser.js';
 import { weekOf, isoDate, endOfDayIn } from './cycleService.js';
-import { activeOperators, operatorsOf } from './operators.js';
+import { activeOperators, operatorsOf, worksOn, leaseWeeksInCycle } from './operators.js';
 import { D, sum, isBlank, str, fmtMoney, fmtRate, fmtNum } from './money.js';
 import { badRequest, conflict, notFound, actor } from './errors.js';
 
@@ -46,18 +46,28 @@ const weekTotals = (days, cycle) => [1, 2].map((n) => {
 // A route matched to the provider but on none of its operators is reported, not guessed
 // (unless the provider has a single operator, who then runs every route).
 function providerPerformance({ provider, cycle, importDoc, matches, metric, otherColumn }) {
-  const routes = matches
-    .filter((m) => ['MATCHED', 'ASSIGNED'].includes(m.status) && String(m.providerId) === String(provider._id))
-    .map((m) => m.route);
-  const ops = activeOperators(provider);
-  const operatorOfRoute = new Map(ops.flatMap((o) => o.routes.map((r) => [r, o.id])));
-  const operatorFor = (route) => operatorOfRoute.get(route) ?? (ops.length === 1 ? ops[0].id : null);
+  const me = String(provider._id);
+  // A route split between providers by an operator transfer: only this provider's dates.
+  const mine = new Map();
+  for (const m of matches) {
+    if (!['MATCHED', 'ASSIGNED'].includes(m.status)) continue;
+    const part = m.split?.find((s) => String(s.providerId) === me);
+    if (part) mine.set(m.route, part);
+    else if (!m.split && String(m.providerId) === me) mine.set(m.route, null);
+  }
+  const routes = [...mine.keys()];
+  const ops = activeOperators(provider, cycle);
+  // The operator on the route that day; if none has those dates, whoever has the route; else a sole operator.
+  const operatorFor = (route, day) => (ops.find((o) => o.routes.includes(route) && worksOn(o, day))
+    ?? ops.find((o) => o.routes.includes(route))
+    ?? (ops.length === 1 ? ops[0] : null))?.id ?? null;
   const days = importDoc.rows
-    .filter((r) => routes.includes(r.route))
+    .filter((r) => mine.has(r.route))
+    .filter((r) => { const part = mine.get(r.route); return !part || (r.date >= part.from && r.date <= part.to); })
     .map((r) => ({
       date: r.date,
       route: r.route,
-      operatorId: operatorFor(r.route),
+      operatorId: operatorFor(r.route, r.date),
       week: weekOf(r.date, cycle),
       trips: str(r.trips) ?? '0',
       hours: str(hoursForMetric(r, metric, otherColumn)),
@@ -71,6 +81,9 @@ function providerPerformance({ provider, cycle, importDoc, matches, metric, othe
       routes: [...new Set(own.map((d) => d.route))],
       contractedHours: o.contractedHours,
       liftLease: o.liftLease,
+      leaseWeeks: leaseWeeksInCycle(o, cycle),
+      startDate: o.startDate,
+      endDate: o.endDate,
       weeks: weekTotals(own, cycle),
     };
   });
@@ -117,22 +130,22 @@ export async function computeVdp(vdp, preloaded = {}) {
           exceptions.push(exception('TUI_WITHOUT_TIERS',
             `TUI is switched on for ${provider.name}, but plan "${plan.name}" has no incentive tiers.`));
         }
-        const noContract = activeOperators(provider).filter((o) => isBlank(o.contractedHours))
+        const noContract = activeOperators(provider, cycle).filter((o) => isBlank(o.contractedHours))
           .filter(() => isBlank(s.contractedHours) || D(s.contractedHours).lte(0));
         if (s.paymentType === 'HOURLY' && noContract.length) {
-          exceptions.push(exception('MISSING_CONTRACTED_HOURS', `Contracted hours are missing for ${provider.name}${noContract.length < activeOperators(provider).length ? ` (operator ${noContract.map((o) => o.name).join(', ')})` : ''}.`));
+          exceptions.push(exception('MISSING_CONTRACTED_HOURS', `Contracted hours are missing for ${provider.name}${noContract.length < activeOperators(provider, cycle).length ? ` (operator ${noContract.map((o) => o.name).join(', ')})` : ''}.`));
         }
       }
     }
   }
 
-  for (const o of activeOperators(provider)) {
+  for (const o of activeOperators(provider, cycle)) {
     const lease = o.liftLease;
     if (lease.frequency !== 'NONE' && isBlank(lease.amount)) {
       exceptions.push(exception('MISSING_LEASE_AMOUNT', `${o.name} (${provider.name}) has a ${lease.frequency.toLowerCase()} lift lease with no amount.`));
     }
   }
-  if (!activeOperators(provider).length) {
+  if (!activeOperators(provider, cycle).length) {
     exceptions.push(exception('NO_OPERATORS', `${provider.name} has no active operators. Add one on the provider profile.`));
   }
 
@@ -173,7 +186,8 @@ export async function computeVdp(vdp, preloaded = {}) {
           routes: o.routes,
           contractedHours: o.contractedHours,
           weeks: o.weeks,
-          lease: { ...o.liftLease, weeksCharged: str(vdp.leaseWeeksCharged) },
+          // A reviewer's weeks-charged wins; otherwise a transfer inside the cycle limits the weeks.
+          lease: { ...o.liftLease, weeksCharged: str(vdp.leaseWeeksCharged) ?? o.leaseWeeks },
         })),
         adjustments: vdp.adjustments.map((a) => ({ type: a.type, amount: str(a.amount) })),
       }));
@@ -319,15 +333,26 @@ export async function acknowledge(id, { code, note }, user) {
 
 // Lift lease as shown on the VDP: one entry per active operator. amount/frequency are kept
 // for single-operator providers (and older screens).
-function leaseView(provider, vdp) {
-  const operators = activeOperators(provider).map((o) => ({ name: o.name, amount: o.liftLease.amount, frequency: o.liftLease.frequency }));
+function leaseView(provider, vdp, cycle) {
+  const operators = activeOperators(provider, cycle).map((o) => ({
+    name: o.name,
+    amount: o.liftLease.amount,
+    frequency: o.liftLease.frequency,
+    weeksCharged: str(vdp.leaseWeeksCharged) ?? (cycle ? leaseWeeksInCycle(o, cycle) : null),
+    transfer: o.transferredTo?.effectiveDate && cycle && o.endDate <= isoDate(cycle.cycleEnd)
+      ? `moved to ${o.transferredTo.providerName} from ${o.transferredTo.effectiveDate}`
+      : o.transferredFrom?.effectiveDate && cycle && o.startDate >= isoDate(cycle.cycleStart)
+        ? `joined from ${o.transferredFrom.providerName} on ${o.transferredFrom.effectiveDate}`
+        : null,
+  }));
   const only = operators.length === 1 ? operators[0] : null;
+  const transfers = operators.filter((o) => o.transfer).map((o) => `${o.name} ${o.transfer}`);
   return {
     amount: only ? only.amount : null,
     frequency: only ? only.frequency : operators.some((o) => o.frequency !== 'NONE') ? 'PER_OPERATOR' : 'NONE',
     operators,
-    weeksCharged: str(vdp.leaseWeeksCharged),
-    note: vdp.leaseNote,
+    weeksCharged: str(vdp.leaseWeeksCharged) ?? only?.weeksCharged ?? null,
+    note: [vdp.leaseNote, ...transfers].filter(Boolean).join(' · ') || null,
   };
 }
 
@@ -350,7 +375,7 @@ async function buildSnapshot(vdp, c, user) {
     cycle: cycleInfo(c.cycle),
     plan: { id: c.plan._id, name: c.plan.name, versionId: c.version._id, versionNumber: c.version.versionNumber },
     settings: c.settings,
-    lease: leaseView(c.provider, vdp),
+    lease: leaseView(c.provider, vdp, c.cycle),
     performance: c.performance,
     performanceImport: c.importDoc
       ? { id: c.importDoc._id, fileName: c.importDoc.originalFileName, fileHash: c.importDoc.fileHash, uploadedAt: c.importDoc.uploadedAt }
@@ -613,7 +638,7 @@ export async function vdpView(vdp) {
       cycle: cycle && cycleInfo(cycle),
       plan: plan && { id: plan._id, name: plan.name, versionId: vdp.planVersionId, versionNumber: vdp.settings?.versionNumber },
       settings: vdp.settings,
-      lease: provider ? leaseView(provider, vdp) : null,
+      lease: provider ? leaseView(provider, vdp, cycle) : null,
       performance: vdp.performance,
       adjustments: json.adjustments,
       calculation: vdp.calculation,

@@ -8,6 +8,18 @@ const leaseSchema = {
   frequency: { type: String, enum: ['WEEKLY', 'PER_VDP_CYCLE', 'NONE'], default: 'NONE' },
 };
 
+const transferSchema = new Schema(
+  {
+    providerId: { type: Schema.Types.ObjectId, ref: 'Provider' },
+    providerName: String,
+    effectiveDate: String, // first day with the new provider
+    note: String,
+    by: { id: { type: Schema.Types.ObjectId, ref: 'User' }, name: String },
+    at: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
 // An operator (driver) working for the provider. The provider is the one who gets paid;
 // each operator's routes are measured against their own contract, then summed into one VDP.
 const operatorSchema = new Schema(
@@ -18,6 +30,12 @@ const operatorSchema = new Schema(
     contractedHours: dec({ default: null }), // null = provider override, else plan
     liftLease: leaseSchema, // per operator (vehicle)
     notes: String,
+    // Dates this operator works for this provider (YYYY-MM-DD, inclusive; null = open).
+    // Set by a transfer between providers so report days before/after it go to the right one.
+    startDate: { type: String, default: null },
+    endDate: { type: String, default: null },
+    transferredFrom: transferSchema,
+    transferredTo: transferSchema,
   },
   { toJSON: { getters: true, versionKey: false }, toObject: { getters: true } },
 );
@@ -56,8 +74,10 @@ const providerSchema = new Schema(
 providerSchema.pre('validate', function syncFromOperators() {
   if (!this.operators.length) return;
   const active = this.operators.filter((o) => o.status === 'ACTIVE');
+  // Routes of an operator who moved away stay listed so earlier cycles still match here.
   this.routes = [...new Set(active.flatMap((o) => o.routes))];
-  this.operatorName = active.map((o) => o.name).join(', ');
+  const today = new Date().toISOString().slice(0, 10);
+  this.operatorName = active.filter((o) => !o.endDate || o.endDate >= today).map((o) => o.name).join(', ');
   this.liftLease = { amount: null, frequency: 'NONE' };
 });
 
