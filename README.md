@@ -46,8 +46,9 @@ When the client is served by this API (same origin), the defaults are enough.
 
 | Path | Contents |
 |---|---|
-| `server.js` | Entry point: loads `.env`, connects to MongoDB, starts listening |
+| `server.js` | Entry point: loads `.env`, connects to MongoDB, starts listening, runs VDP auto-approval every 5 minutes |
 | `src/app.js` | Express app: security headers, CORS, routes, client build |
+| `src/config/` | Database connection |
 | `src/controllers/`, `src/routes/` | HTTP handlers |
 | `src/services/` | Business logic (calculations, imports, VDPs, PDFs, reports) |
 | `src/models/` | Mongoose models |
