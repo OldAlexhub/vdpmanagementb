@@ -39,6 +39,7 @@ When the client is served by this API (same origin), the defaults are enough.
 | `npm start` | Start the API |
 | `npm run dev` | Start with nodemon (restarts on file changes) |
 | `npm run seed` | Load the base division, plans and roster (safe to run again) |
+| `npm run import:json -- <folder> --uri "<MONGO_URI>" [--db name] [--drop]` | Load an Extended JSON export (one `<collection>.json` per collection) into a database, keeping ObjectIds, dates and decimals. Collections that already have data are skipped unless `--drop` is given |
 | `npm run test:engine` | Calculation engine, parser, cycles and plans (no database needed) |
 | `npm test` | Everything, including end-to-end API tests on the `bigstar_vdp_test` database |
 
@@ -54,4 +55,5 @@ When the client is served by this API (same origin), the defaults are enough.
 | `src/models/` | Mongoose models |
 | `src/middleware/` | Auth (session cookie), errors |
 | `scripts/seed.js` | Seed data |
+| `scripts/importJson.js` | Import a JSON export into another database |
 | `test/` | Node test runner suites |

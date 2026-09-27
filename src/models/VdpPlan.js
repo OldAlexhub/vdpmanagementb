@@ -26,6 +26,9 @@ const versionSchema = new Schema(
     incentiveTiers: { type: [tierSchema], default: [] },
     bonusEnabled: { type: Boolean, default: false },
     bonusRate: dec({ default: null }),
+    // Fuel reimbursement: trips × rate, added to the VDP after Gross. Off = nothing added.
+    fuelReimbursementEnabled: { type: Boolean, default: false },
+    fuelReimbursementRate: dec({ default: null }), // $ per trip
     performanceHourMetric: {
       type: String,
       enum: ['TOTAL_HOURS', 'SERVICE_HOURS', 'REVENUE_HOURS', 'OTHER'],

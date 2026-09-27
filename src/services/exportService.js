@@ -61,7 +61,7 @@ export async function cycleWorkbook(cycleId) {
     'Provider', 'Provider #', 'Operator', 'Route(s)', 'Plan', 'Status',
     'W1 Trips', 'W1 Hours', 'W1 %', 'W1 Rate', 'W1 Core', 'W1 Bonus', 'W1 Total',
     'W2 Trips', 'W2 Hours', 'W2 %', 'W2 Rate', 'W2 Core', 'W2 Bonus', 'W2 Total',
-    'Gross VDP', 'Lift Lease', 'Fares', 'Other Deductions', 'Reimbursements', 'Other Income', 'Net VDP',
+    'Gross VDP', 'Lift Lease', 'Fares', 'Other Deductions', 'Fuel Reimbursement', 'Reimbursements', 'Other Income', 'Net VDP',
     'Provider approval',
   ];
   const h = ws.addRow(header);
@@ -82,7 +82,7 @@ export async function cycleWorkbook(cycleId) {
       e.planName, e.status,
       ...weekCols(0), ...weekCols(1),
       num(e.calc?.gross), num(e.calc?.lease), num(e.calc?.fares), num(e.calc?.otherDeductions),
-      num(e.calc?.reimbursements), num(e.calc?.otherIncome), num(e.calc?.net),
+      num(e.calc?.fuelReimbursement), num(e.calc?.reimbursements), num(e.calc?.otherIncome), num(e.calc?.net),
       e.approval,
     ]);
   });
@@ -92,21 +92,39 @@ export async function cycleWorkbook(cycleId) {
   if (entries.length) {
     const total = ws.addRow(['Total']);
     total.font = { bold: true };
-    for (let c = 21; c <= 27; c += 1) {
+    for (let c = 21; c <= 28; c += 1) {
       const col = ws.getColumn(c).letter;
       total.getCell(c).value = { formula: `SUM(${col}${first}:${col}${last})` };
     }
   }
-  [11, 12, 13, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27].forEach((c) => { ws.getColumn(c).numFmt = MONEY; });
+  [11, 12, 13, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28].forEach((c) => { ws.getColumn(c).numFmt = MONEY; });
   [10, 17].forEach((c) => { ws.getColumn(c).numFmt = '$0.00##'; });
   [9, 16].forEach((c) => { ws.getColumn(c).numFmt = '0.00%'; });
-  ws.columns.forEach((col, i) => { col.width = i < 5 || i === 27 ? 24 : 12; });
+  ws.columns.forEach((col, i) => { col.width = i < 5 || i === 28 ? 24 : 12; });
 
   const adj = wb.addWorksheet('Adjustments');
   adj.addRow(['Provider', 'Type', 'Direction', 'Amount', 'Description', 'Date', 'Entered by']).font = { bold: true };
   adjRows.forEach((r) => adj.addRow(r));
   adj.getColumn(4).numFmt = MONEY;
   adj.columns.forEach((c) => { c.width = 20; });
+
+  // Per-operator detail: each operator is measured against their own contract.
+  const byOp = wb.addWorksheet('By operator');
+  byOp.addRow(['Provider', 'Operator', 'Route(s)', 'W1 Trips', 'W1 Hours', 'W1 Contract', 'W1 %', 'W1 Rate', 'W1 Total',
+    'W2 Trips', 'W2 Hours', 'W2 Contract', 'W2 %', 'W2 Rate', 'W2 Total', 'Earned', 'Lift Lease']).font = { bold: true };
+  entries.forEach((e) => {
+    for (const o of e.calc?.operators || []) {
+      const wk = (i) => {
+        const w = o.weeks[i] || {};
+        return [num(w.trips), num(w.actualHours), num(w.contractedHours), num(w.performancePercentage) / 100 || null, num(w.incentiveRate), num(w.weeklyEarnings)];
+      };
+      byOp.addRow([e.provider.name, o.name || e.provider.operatorName, (o.routes || []).join(', '), ...wk(0), ...wk(1), num(o.earnings), num(o.lease)]);
+    }
+  });
+  [9, 15, 16, 17].forEach((c) => { byOp.getColumn(c).numFmt = MONEY; });
+  [8, 14].forEach((c) => { byOp.getColumn(c).numFmt = '$0.00##'; });
+  [7, 13].forEach((c) => { byOp.getColumn(c).numFmt = '0.00%'; });
+  byOp.columns.forEach((c, i) => { c.width = i < 3 ? 24 : 11; });
 
   const fileName = `VDP ${division.divisionNumber} ${isoDate(cycle.cycleStart)} to ${isoDate(cycle.cycleEnd)}.xlsx`;
   return { buffer: await wb.xlsx.writeBuffer(), fileName };

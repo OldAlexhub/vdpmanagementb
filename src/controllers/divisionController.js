@@ -2,26 +2,12 @@ import Division from '../models/Division.js';
 import Provider from '../models/Provider.js';
 import VdpPlan from '../models/VdpPlan.js';
 import { badRequest, notFound } from '../services/errors.js';
-import { toDateOnly } from '../services/cycleService.js';
 import { pick } from './validate.js';
+import { joinOpenPeriods } from './cycleController.js';
 
-function applyInput(division, body) {
+// The VDP cycle schedule is company-wide (Settings), not per division.
+export function applyInput(division, body) {
   Object.assign(division, pick(body, ['divisionNumber', 'name', 'location', 'timezone', 'notes']));
-  if (body.cycleSettings) {
-    const cs = body.cycleSettings;
-    if (cs.anchorDate) {
-      const d = toDateOnly(cs.anchorDate);
-      if (d.getUTCDay() !== 1) throw badRequest('The cycle anchor date must be a Monday (invoice weeks run Monday–Sunday).');
-      division.cycleSettings.anchorDate = d;
-    }
-    for (const k of ['submissionOffsetDays', 'paymentOffsetDays']) {
-      if (cs[k] !== undefined && cs[k] !== '') {
-        const n = Number(cs[k]);
-        if (!Number.isInteger(n) || n < 0) throw badRequest('Cycle offsets must be whole days.');
-        division.cycleSettings[k] = n;
-      }
-    }
-  }
 }
 
 export async function list(_req, res) {
@@ -45,6 +31,7 @@ export async function create(req, res) {
   const d = new Division();
   applyInput(d, req.body);
   await d.save();
+  await joinOpenPeriods(d);
   res.status(201).json(d);
 }
 

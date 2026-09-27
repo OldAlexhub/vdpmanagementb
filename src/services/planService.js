@@ -19,6 +19,9 @@ export function validateVersion(v) {
     if (v.paymentType !== 'HOURLY') errors.push('Bonus hours apply to hourly plans only.');
     if (isBlank(v.bonusRate) || D(v.bonusRate).lte(0)) errors.push('Bonus rate must be greater than zero.');
   }
+  if (v.fuelReimbursementEnabled && (isBlank(v.fuelReimbursementRate) || D(v.fuelReimbursementRate).lte(0))) {
+    errors.push('Fuel reimbursement rate (per trip) must be greater than zero.');
+  }
   if (v.incentiveEnabled) {
     if (isBlank(v.contractedHours) || D(v.contractedHours).lte(0)) {
       errors.push('TUI tiers need contracted hours to measure performance %.');
@@ -96,6 +99,8 @@ export function resolveSettings(provider, plan, version) {
     bonusEnabled: { value: Boolean(version.bonusEnabled), source: 'PLAN' },
     bonusRate: pick(o.bonusRate, version.bonusRate),
     tuiEligible: { value: tuiEligible, source: tuiSource },
+    fuelReimbursementEnabled: { value: Boolean(version.fuelReimbursementEnabled), source: 'PLAN' },
+    fuelReimbursementRate: { value: version.fuelReimbursementEnabled ? str(version.fuelReimbursementRate) : null, source: 'PLAN' },
     incentiveTiers: {
       value: (version.incentiveTiers || []).map((t) => ({
         minimumPercentage: str(t.minimumPercentage),
@@ -118,4 +123,6 @@ export const engineSettings = (s) => ({
   incentiveTiers: s.incentiveTiers.value,
   bonusEnabled: s.bonusEnabled.value,
   bonusRate: s.bonusRate.value,
+  fuelReimbursementEnabled: Boolean(s.fuelReimbursementEnabled?.value),
+  fuelReimbursementRate: s.fuelReimbursementRate?.value ?? null,
 });

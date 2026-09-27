@@ -1,10 +1,12 @@
-// PDF reports: the provider VDP statement and the cycle payment register.
+// PDF reports: the provider VDP statement, the cycle payment register and the cycle schedule.
 // Built with pdfkit's standard Helvetica (WinAnsi), so text is sanitised to that character set.
 import PDFDocument from 'pdfkit';
 import { loadRegister } from './exportService.js';
 import { isoDate, localDate } from './cycleService.js';
 import { fmtMoney, fmtNum, fmtRate, sum, money } from './money.js';
 import { ISSUE_AREAS } from '../models/Vdp.js';
+import VdpCycle from '../models/VdpCycle.js';
+import Division from '../models/Division.js';
 
 const C = {
   navy: '#0f2a4a',
@@ -51,6 +53,7 @@ const cycleText = (c) => (c ? `${shortDate(c.cycleStart)} – ${shortDate(c.cycl
 const mny = (v) => (v === null || v === undefined || v === '' ? '—' : fmtMoney(v));
 const hrs = (v) => (v === null || v === undefined ? '—' : `${fmtNum(v)} h`);
 const pctText = (v) => (v === null || v === undefined ? '—' : `${Number(v).toFixed(3).replace(/\.?0+$/, '')}%`);
+const rateOrOps = (v) => (v === null || v === undefined ? 'Per operator' : fmtRate(v));
 
 // ---------- primitives ----------
 
@@ -350,6 +353,7 @@ export async function statementPdf(m) {
     ['Contracted hours', s?.contractedHours?.value ? `${fmtNum(s.contractedHours.value)} h / week` : '—'],
     [perTrip ? 'Base rate' : 'Base rate', s?.basePay?.value ? `${fmtRate(s.basePay.value)}${perTrip ? ' / trip' : ' / h'}` : '—'],
     ['Bonus rate', s?.bonusEnabled?.value ? `${fmtRate(s.bonusRate.value)} / h above contract` : 'None'],
+    ...(s?.fuelReimbursementEnabled?.value ? [['Fuel reimbursement', `${fmtRate(s.fuelReimbursementRate.value)} / trip`]] : []),
   ], L, top, W - boxW - 16, 2);
   netBox(doc, calc, L + W - boxW, top - 2, boxW, 92);
   doc.y = Math.max(endY, top + 92) + 10;
@@ -372,7 +376,7 @@ export async function statementPdf(m) {
     ? [
         row('Trips provided', (w) => fmtNum(w.trips)),
         row('Hours worked', (w) => hrs(w.actualHours)),
-        row('Rate per trip', (w) => fmtRate(w.incentiveRate), { boldCols: weeks.map((_, i) => i + 1) }),
+        row('Rate per trip', (w) => rateOrOps(w.incentiveRate), { boldCols: weeks.map((_, i) => i + 1) }),
         row('Trip pay', (w) => fmtMoney(w.coreEarnings)),
       ]
     : [
@@ -381,12 +385,37 @@ export async function statementPdf(m) {
         row('Contracted hours', (w) => hrs(w.contractedHours)),
         row('Performance', (w) => pctText(w.performancePercentage)),
         row('Incentive tier', (w) => w.tierLabel, { style: 'muted' }),
-        row('Hourly rate', (w) => fmtRate(w.incentiveRate), { boldCols: weeks.map((_, i) => i + 1) }),
+        row('Hourly rate', (w) => rateOrOps(w.incentiveRate), { boldCols: weeks.map((_, i) => i + 1) }),
         row('Core pay', (w) => `${fmtNum(w.corePaidHours)} h  ·  ${fmtMoney(w.coreEarnings)}`),
         row('Bonus pay', (w) => `${fmtNum(w.bonusHours)} h  ·  ${fmtMoney(w.bonusEarnings)}`),
       ];
   perfRows.push({ cells: ['Week total', ...weeks.map((w) => fmtMoney(w.weeklyEarnings))], style: 'total' });
   table(doc, cols, perfRows);
+
+  // Several operators: each one is measured against their own contract.
+  const ops = calc.operators || [];
+  if (ops.length > 1) {
+    ensure(doc, 60 + ops.length * 22);
+    sectionTitle(doc, 'By operator', 'Each operator’s hours are measured against their own contracted hours');
+    const opW = [W * 0.22, W * 0.1, ...weeks.map(() => (W * 0.46) / weeks.length), W * 0.11, W * 0.11];
+    table(doc, [
+      { header: 'Operator', width: opW[0] },
+      { header: 'Route', width: opW[1] },
+      ...weeks.map((w, i) => ({ header: `Week ${w.weekNumber}`, width: opW[2 + i], align: 'right' })),
+      { header: 'Earned', width: opW[2 + weeks.length], align: 'right' },
+      { header: 'Lease', width: opW[3 + weeks.length], align: 'right' },
+    ], ops.map((o) => ({
+      cells: [
+        o.name,
+        (o.routes || []).join(', ') || '—',
+        ...o.weeks.map((w) => (perTrip
+          ? `${fmtNum(w.trips)} trips · ${fmtMoney(w.weeklyEarnings)}`
+          : `${fmtNum(w.actualHours)} h · ${pctText(w.performancePercentage)} · ${fmtMoney(w.weeklyEarnings)}`)),
+        fmtMoney(o.earnings),
+        o.lease !== '0.00' ? `–${fmtMoney(o.lease)}` : '—',
+      ],
+    })), { fontSize: 8.2, rowPad: 5 });
+  }
 
   // Payment summary
   if (calc.steps?.length) {
@@ -415,7 +444,9 @@ export async function statementPdf(m) {
         { header: perTrip ? 'Rate per trip' : 'Hourly rate', width: W * 0.25, align: 'right' },
         { header: 'Reached', width: W * 0.35, align: 'right' },
       ], tiers.map((tier, i) => {
-        const hit = weeks.filter((w) => w.tierIndex === i).map((w) => `Week ${w.weekNumber}`);
+        const hit = ops.length > 1
+          ? ops.flatMap((o) => o.weeks.filter((w) => w.tierIndex === i).map((w) => `${o.name} wk ${w.weekNumber}`))
+          : weeks.filter((w) => w.tierIndex === i).map((w) => `Week ${w.weekNumber}`);
         return {
           cells: [
             tier.maximumPercentage ? `${fmtNum(tier.minimumPercentage)}% – ${fmtNum(tier.maximumPercentage)}%` : `${fmtNum(tier.minimumPercentage)}% and above`,
@@ -602,11 +633,94 @@ export async function registerPdf(cycleId) {
   });
   table(doc, cols, rows, { fontSize: 8.4, rowPad: 4, totalBump: 0 });
   doc.fillColor(C.muted).font(F.reg).fontSize(7.5)
-    .text('Wk 1 / Wk 2 = hours worked (trips below). Lease, Fares and Other are deductions; Added = reimbursements and other income.', L, doc.y + 2, { width: W });
+    .text('Wk 1 / Wk 2 = hours worked (trips below). Lease, Fares and Other are deductions; Added = fuel reimbursement, reimbursements and other income.', L, doc.y + 2, { width: W });
 
   footers(doc, `Big Star Transit · VDP payment register · DIV ${division.divisionNumber} – ${division.name} · ${cycleText(cycle)} · Generated ${localDate(new Date(), division.timezone)}`);
   return {
     buffer: await toBuffer(doc),
     fileName: `VDP Register DIV ${division.divisionNumber} ${isoDate(cycle.cycleStart)} to ${isoDate(cycle.cycleEnd)}.pdf`,
   };
+}
+
+// ---------- company VDP cycle schedule ----------
+const CYCLE_LABEL = {
+  UPCOMING: 'Upcoming', OPEN: 'Open', PROCESSING: 'Processing', READY_FOR_REVIEW: 'Ready for review',
+  APPROVED: 'Approved', PAID: 'Paid', CLOSED: 'Closed',
+};
+
+/**
+ * Company-wide VDP cycle schedule: one row per period (same dates for every division),
+ * with each division's status. `year` limits it to cycles starting in that year.
+ */
+export async function cycleSchedulePdf({ year, schedule } = {}) {
+  const [cycles, divisions] = await Promise.all([
+    VdpCycle.find().sort({ cycleStart: 1 }),
+    Division.find({ status: 'ACTIVE' }).sort({ divisionNumber: 1 }),
+  ]);
+  const divNumber = new Map(divisions.map((d) => [String(d._id), d.divisionNumber]));
+  const periods = new Map();
+  for (const c of cycles) {
+    if (year && c.cycleStart.getUTCFullYear() !== Number(year)) continue;
+    const key = isoDate(c.cycleStart);
+    if (!periods.has(key)) periods.set(key, { ...c.toObject(), statuses: [] });
+    if (divNumber.has(String(c.divisionId))) periods.get(key).statuses.push({ div: divNumber.get(String(c.divisionId)), status: c.status });
+  }
+  const rows = [...periods.values()];
+
+  const doc = newDoc('landscape', { Title: `VDP cycle schedule${year ? ` ${year}` : ''}` });
+  const L = doc.content.left;
+  const W = doc.content.width;
+  headerBand(doc, {
+    title: 'VDP Cycle Schedule',
+    rightLabel: 'Company-wide · all divisions',
+    rightTitle: year ? `${year}` : rows.length ? `${shortDate(rows[0].cycleStart)} – ${shortDate(rows[rows.length - 1].cycleEnd)}` : 'No cycles yet',
+    rightSub: `${rows.length} cycle${rows.length === 1 ? '' : 's'}  ·  ${divisions.length} division${divisions.length === 1 ? '' : 's'}`,
+  });
+  if (schedule) {
+    doc.fillColor(C.muted).font(F.reg).fontSize(8.5).text(t(
+      `Cycles are ${schedule.lengthDays} days: two invoice weeks, Monday to Sunday, with the same dates for every division. `
+      + 'Providers approve their VDP by the end of the Closed for Submission date; payment is made on the payment date.',
+    ), L, doc.y, { width: W });
+    doc.y += 8;
+  }
+
+  const today = isoDate(new Date());
+  const statusText = (p) => {
+    const distinct = [...new Set(p.statuses.map((s) => s.status))];
+    if (distinct.length === 1) return CYCLE_LABEL[distinct[0]] || distinct[0];
+    return p.statuses.map((s) => `DIV ${s.div} ${CYCLE_LABEL[s.status] || s.status}`).join(' · ');
+  };
+  const widths = [34, 150, 92, 92, 128, 118];
+  const cols = [
+    { header: '#', width: widths[0] },
+    { header: 'VDP cycle', width: widths[1] },
+    { header: 'Week 1', width: widths[2] },
+    { header: 'Week 2', width: widths[3] },
+    { header: 'Closed for submission', width: widths[4] },
+    { header: 'Payment date', width: widths[5] },
+    { header: 'Status', width: W - widths.reduce((a, b) => a + b, 0) },
+  ];
+  if (!rows.length) {
+    doc.fillColor(C.muted).font(F.reg).fontSize(10).text('No VDP cycles have been generated for this period.', L, doc.y + 10);
+  } else {
+    table(doc, cols, rows.map((p, i) => {
+      const current = isoDate(p.cycleStart) <= today && today <= isoDate(p.cycleEnd);
+      return {
+        cells: [
+          `${i + 1}`,
+          cycleText(p),
+          `${md(p.week1Start)} – ${md(p.week1End)}`,
+          `${md(p.week2Start)} – ${md(p.week2End)}`,
+          longDate(p.submissionDate),
+          longDate(p.paymentDate),
+          current ? `Current · ${statusText(p)}` : statusText(p),
+        ],
+        fill: current ? C.greenSoft : undefined,
+        boldCols: [1, 5],
+        labelBold: false,
+      };
+    }), { fontSize: 8.8, rowPad: 6 });
+  }
+  footers(doc, `Big Star Transit · VDP cycle schedule${year ? ` ${year}` : ''} · Generated ${localDate(new Date(), 'America/Los_Angeles')}`);
+  return { buffer: await toBuffer(doc), fileName: `VDP Cycle Schedule${year ? ` ${year}` : ''}.pdf` };
 }

@@ -9,8 +9,9 @@ import * as cycles from '../controllers/cycleController.js';
 import * as performance from '../controllers/performanceController.js';
 import * as vdps from '../controllers/vdpController.js';
 import * as portal from '../controllers/portalController.js';
+import * as imports from '../controllers/importController.js';
 import { cycleWorkbook } from '../services/exportService.js';
-import { registerPdf } from '../services/pdfService.js';
+import { registerPdf, cycleSchedulePdf } from '../services/pdfService.js';
 import { leadershipReport, providerReport } from '../services/analyticsService.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
@@ -62,7 +63,16 @@ api.post('/providers', providers.create);
 api.get('/providers/:id', providers.get);
 api.put('/providers/:id', providers.update);
 
+// Bulk import from Excel: divisions | plans | providers. Admin-only kinds are checked in the controller.
+api.get('/imports/:kind/template', imports.template);
+api.post('/imports/:kind/preview', upload.single('file'), imports.preview);
+api.post('/imports/:kind/commit', upload.single('file'), imports.commit);
+
+// VDP cycles are company-wide: one schedule, every period exists for every active division.
+api.get('/settings/cycle-schedule', cycles.getSchedule);
+api.put('/settings/cycle-schedule', requireAdmin, cycles.updateSchedule);
 api.get('/cycles', cycles.list);
+api.get('/cycles/periods', cycles.periods);
 api.post('/cycles/generate', cycles.generate);
 api.get('/cycles/preview', cycles.preview);
 api.get('/cycles/:id', cycles.get);
@@ -87,6 +97,12 @@ api.post('/vdps/:id/approve', vdps.approve);
 api.post('/vdps/:id/reopen', vdps.reopen);
 api.post('/vdps/:id/mark-paid', vdps.markPaid);
 api.post('/vdps/:id/issues/respond', vdps.respondToIssue);
+
+api.get('/exports/cycle-schedule.pdf', async (req, res) => {
+  const year = /^\d{4}$/.test(String(req.query.year || '')) ? Number(req.query.year) : undefined;
+  const { buffer, fileName } = await cycleSchedulePdf({ year, schedule: await cycles.cycleSchedule() });
+  vdps.sendPdf(res, buffer, fileName);
+});
 
 api.get('/exports/cycles/:cycleId.xlsx', async (req, res) => {
   const { buffer, fileName } = await cycleWorkbook(req.params.cycleId);

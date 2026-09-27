@@ -9,6 +9,7 @@ import { resolveVersion, resolveSettings, engineSettings, validateVersion } from
 import { activeImportFor, matchRoutes, unresolvedRoutes } from './performanceService.js';
 import { hoursForMetric, HOUR_METRICS } from './performanceParser.js';
 import { weekOf, isoDate, endOfDayIn } from './cycleService.js';
+import { activeOperators, operatorsOf } from './operators.js';
 import { D, sum, isBlank, str, fmtMoney, fmtRate, fmtNum } from './money.js';
 import { badRequest, conflict, notFound, actor } from './errors.js';
 
@@ -29,33 +30,52 @@ function cycleInfo(cycle) {
   };
 }
 
-// Gather this provider's report rows and total them by week.
+const weekTotals = (days, cycle) => [1, 2].map((n) => {
+  const rows = days.filter((d) => d.week === n);
+  return {
+    weekNumber: n,
+    start: n === 1 ? isoDate(cycle.week1Start) : isoDate(cycle.week2Start),
+    end: n === 1 ? isoDate(cycle.week1End) : isoDate(cycle.week2End),
+    days: rows.length,
+    trips: sum(rows.map((d) => d.trips)).toString(),
+    actualHours: sum(rows.map((d) => d.hours ?? 0)).toString(),
+  };
+});
+
+// Gather this provider's report rows and total them by week — overall and per operator.
+// A route matched to the provider but on none of its operators is reported, not guessed
+// (unless the provider has a single operator, who then runs every route).
 function providerPerformance({ provider, cycle, importDoc, matches, metric, otherColumn }) {
   const routes = matches
     .filter((m) => ['MATCHED', 'ASSIGNED'].includes(m.status) && String(m.providerId) === String(provider._id))
     .map((m) => m.route);
+  const ops = activeOperators(provider);
+  const operatorOfRoute = new Map(ops.flatMap((o) => o.routes.map((r) => [r, o.id])));
+  const operatorFor = (route) => operatorOfRoute.get(route) ?? (ops.length === 1 ? ops[0].id : null);
   const days = importDoc.rows
     .filter((r) => routes.includes(r.route))
     .map((r) => ({
       date: r.date,
       route: r.route,
+      operatorId: operatorFor(r.route),
       week: weekOf(r.date, cycle),
       trips: str(r.trips) ?? '0',
       hours: str(hoursForMetric(r, metric, otherColumn)),
     }))
     .filter((d) => d.week);
-  const weeks = [1, 2].map((n) => {
-    const rows = days.filter((d) => d.week === n);
+  const operators = ops.map((o) => {
+    const own = days.filter((d) => d.operatorId === o.id);
     return {
-      weekNumber: n,
-      start: n === 1 ? isoDate(cycle.week1Start) : isoDate(cycle.week2Start),
-      end: n === 1 ? isoDate(cycle.week1End) : isoDate(cycle.week2End),
-      days: rows.length,
-      trips: sum(rows.map((d) => d.trips)).toString(),
-      actualHours: sum(rows.map((d) => d.hours ?? 0)).toString(),
+      id: o.id,
+      name: o.name,
+      routes: [...new Set(own.map((d) => d.route))],
+      contractedHours: o.contractedHours,
+      liftLease: o.liftLease,
+      weeks: weekTotals(own, cycle),
     };
   });
-  return { routes, days, weeks, metric, metricLabel: HOUR_METRICS[metric]?.label || otherColumn };
+  const unassignedRoutes = [...new Set(days.filter((d) => !d.operatorId).map((d) => d.route))];
+  return { routes, days, weeks: weekTotals(days, cycle), operators, unassignedRoutes, metric, metricLabel: HOUR_METRICS[metric]?.label || otherColumn };
 }
 
 /** Recompute a VDP from current provider, plan, report and reviewer inputs. Does not save. */
@@ -97,16 +117,23 @@ export async function computeVdp(vdp, preloaded = {}) {
           exceptions.push(exception('TUI_WITHOUT_TIERS',
             `TUI is switched on for ${provider.name}, but plan "${plan.name}" has no incentive tiers.`));
         }
-        if (s.paymentType === 'HOURLY' && (isBlank(s.contractedHours) || D(s.contractedHours).lte(0))) {
-          exceptions.push(exception('MISSING_CONTRACTED_HOURS', `Contracted hours are missing for ${provider.name}.`));
+        const noContract = activeOperators(provider).filter((o) => isBlank(o.contractedHours))
+          .filter(() => isBlank(s.contractedHours) || D(s.contractedHours).lte(0));
+        if (s.paymentType === 'HOURLY' && noContract.length) {
+          exceptions.push(exception('MISSING_CONTRACTED_HOURS', `Contracted hours are missing for ${provider.name}${noContract.length < activeOperators(provider).length ? ` (operator ${noContract.map((o) => o.name).join(', ')})` : ''}.`));
         }
       }
     }
   }
 
-  const lease = provider.liftLease || {};
-  if (lease.frequency && lease.frequency !== 'NONE' && isBlank(lease.amount)) {
-    exceptions.push(exception('MISSING_LEASE_AMOUNT', `${provider.name} has a ${lease.frequency.toLowerCase()} lift lease with no amount.`));
+  for (const o of activeOperators(provider)) {
+    const lease = o.liftLease;
+    if (lease.frequency !== 'NONE' && isBlank(lease.amount)) {
+      exceptions.push(exception('MISSING_LEASE_AMOUNT', `${o.name} (${provider.name}) has a ${lease.frequency.toLowerCase()} lift lease with no amount.`));
+    }
+  }
+  if (!activeOperators(provider).length) {
+    exceptions.push(exception('NO_OPERATORS', `${provider.name} has no active operators. Add one on the provider profile.`));
   }
 
   let performance = null;
@@ -124,6 +151,10 @@ export async function computeVdp(vdp, preloaded = {}) {
     }
     const matches = preloaded.matches || matchRoutes(importDoc, await Provider.find({ divisionId: provider.divisionId }));
     performance = providerPerformance({ provider, cycle, importDoc, matches, metric, otherColumn });
+    if (performance.unassignedRoutes.length) {
+      exceptions.push(exception('ROUTE_WITHOUT_OPERATOR',
+        `Route ${performance.unassignedRoutes.join(', ')} is matched to ${provider.name} but not to any of its operators. Add it to an operator on the provider profile.`));
+    }
     if (performance.days.length === 0) {
       const routeText = provider.routes.length ? `route ${provider.routes.join(', ')}` : 'no routes on the profile';
       exceptions.push(exception('NO_PERFORMANCE_DATA',
@@ -137,8 +168,13 @@ export async function computeVdp(vdp, preloaded = {}) {
     try {
       calculation = serializeResult(calculateVdp({
         settings: engineSettings(settings),
-        weeks: performance.weeks,
-        lease: { amount: str(lease.amount), frequency: lease.frequency || 'NONE', weeksCharged: str(vdp.leaseWeeksCharged) },
+        operators: performance.operators.map((o) => ({
+          name: o.name,
+          routes: o.routes,
+          contractedHours: o.contractedHours,
+          weeks: o.weeks,
+          lease: { ...o.liftLease, weeksCharged: str(vdp.leaseWeeksCharged) },
+        })),
         adjustments: vdp.adjustments.map((a) => ({ type: a.type, amount: str(a.amount) })),
       }));
     } catch (err) {
@@ -281,28 +317,40 @@ export async function acknowledge(id, { code, note }, user) {
   return recalcAndSave(vdp, user, 'EXCEPTION_ACKNOWLEDGED', `${code}: ${note}`);
 }
 
+// Lift lease as shown on the VDP: one entry per active operator. amount/frequency are kept
+// for single-operator providers (and older screens).
+function leaseView(provider, vdp) {
+  const operators = activeOperators(provider).map((o) => ({ name: o.name, amount: o.liftLease.amount, frequency: o.liftLease.frequency }));
+  const only = operators.length === 1 ? operators[0] : null;
+  return {
+    amount: only ? only.amount : null,
+    frequency: only ? only.frequency : operators.some((o) => o.frequency !== 'NONE') ? 'PER_OPERATOR' : 'NONE',
+    operators,
+    weeksCharged: str(vdp.leaseWeeksCharged),
+    note: vdp.leaseNote,
+  };
+}
+
+const providerView = (p, routes) => ({
+  id: p._id,
+  name: p.name,
+  providerNumber: p.providerNumber,
+  operatorName: p.operatorName,
+  routes: routes?.length ? routes : p.routes,
+  serviceType: p.serviceType,
+  operators: operatorsOf(p).map((o) => ({ name: o.name, routes: o.routes, status: o.status })),
+});
+
 async function buildSnapshot(vdp, c, user) {
   const division = await Division.findById(vdp.divisionId);
   return {
     capturedAt: new Date(),
-    provider: {
-      id: c.provider._id,
-      name: c.provider.name,
-      providerNumber: c.provider.providerNumber,
-      operatorName: c.provider.operatorName,
-      routes: c.performance?.routes?.length ? c.performance.routes : c.provider.routes,
-      serviceType: c.provider.serviceType,
-    },
+    provider: providerView(c.provider, c.performance?.routes),
     division: { id: division._id, divisionNumber: division.divisionNumber, name: division.name, location: division.location, timezone: division.timezone },
     cycle: cycleInfo(c.cycle),
     plan: { id: c.plan._id, name: c.plan.name, versionId: c.version._id, versionNumber: c.version.versionNumber },
     settings: c.settings,
-    lease: {
-      amount: str(c.provider.liftLease?.amount),
-      frequency: c.provider.liftLease?.frequency || 'NONE',
-      weeksCharged: str(vdp.leaseWeeksCharged),
-      note: vdp.leaseNote,
-    },
+    lease: leaseView(c.provider, vdp),
     performance: c.performance,
     performanceImport: c.importDoc
       ? { id: c.importDoc._id, fileName: c.importDoc.originalFileName, fileHash: c.importDoc.fileHash, uploadedAt: c.importDoc.uploadedAt }
@@ -560,20 +608,12 @@ export async function vdpView(vdp) {
     ...json,
     view: {
       source: 'LIVE',
-      provider: provider && {
-        id: provider._id, name: provider.name, providerNumber: provider.providerNumber,
-        operatorName: provider.operatorName, routes: provider.routes, serviceType: provider.serviceType,
-      },
+      provider: provider && providerView(provider),
       division: division && { id: division._id, divisionNumber: division.divisionNumber, name: division.name, location: division.location, timezone: division.timezone },
       cycle: cycle && cycleInfo(cycle),
       plan: plan && { id: plan._id, name: plan.name, versionId: vdp.planVersionId, versionNumber: vdp.settings?.versionNumber },
       settings: vdp.settings,
-      lease: {
-        amount: str(provider?.liftLease?.amount),
-        frequency: provider?.liftLease?.frequency || 'NONE',
-        weeksCharged: str(vdp.leaseWeeksCharged),
-        note: vdp.leaseNote,
-      },
+      lease: provider ? leaseView(provider, vdp) : null,
       performance: vdp.performance,
       adjustments: json.adjustments,
       calculation: vdp.calculation,

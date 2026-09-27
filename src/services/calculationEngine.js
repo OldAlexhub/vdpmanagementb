@@ -182,34 +182,114 @@ export function calculateLease(lease, weeksInCycle) {
   };
 }
 
+// Fuel reimbursement (plan option): every trip in the cycle × the plan's per-trip rate,
+// rounded once to the cent. Added after Gross — it is not earnings. Off = $0 and no line.
+export function calculateFuelReimbursement(settings, weekResults) {
+  if (!settings.fuelReimbursementEnabled) return { enabled: false, amount: D(0) };
+  if (isBlank(settings.fuelReimbursementRate) || D(settings.fuelReimbursementRate).lte(0)) {
+    throw new CalculationError('Fuel reimbursement is on, but the per-trip rate is missing.');
+  }
+  const rate = D(settings.fuelReimbursementRate);
+  const trips = sum(weekResults.map((w) => w.trips));
+  const amount = cents(trips.times(rate));
+  return {
+    enabled: true,
+    trips,
+    rate,
+    amount,
+    explanation: `Fuel reimbursement: ${fmtNum(trips)} trips × ${fmtRate(rate)} = ${fmtMoney(amount)}`,
+    detail: `${fmtNum(trips)} trips × ${fmtRate(rate)}`,
+  };
+}
+
+// One operator: every week measured against this operator's own contract.
+function calculateOperator(settings, unit) {
+  const s = isBlank(unit.contractedHours) ? settings : { ...settings, contractedHours: unit.contractedHours };
+  const weekFn = s.paymentType === 'HOURLY' ? calculateHourlyWeek : calculatePerTripWeek;
+  const weeks = unit.weeks.map((w) => ({
+    weekNumber: w.weekNumber,
+    start: w.start,
+    end: w.end,
+    trips: D(w.trips),
+    actualHours: D(w.actualHours),
+    contractedHours: isBlank(s.contractedHours) ? null : D(s.contractedHours),
+    ...weekFn(s, w),
+  }));
+  return {
+    name: unit.name ?? null,
+    routes: unit.routes || [],
+    weeks,
+    earnings: sum(weeks.map((w) => w.weeklyEarnings)),
+    lease: calculateLease(unit.lease, unit.weeks.length),
+  };
+}
+
+// Several operators: the provider's week is the sum of its operators' weeks.
+// Tier, rate and % stay per operator (they would be meaningless summed).
+function combineWeeks(ops, perTrip) {
+  return ops[0].weeks.map((first, i) => {
+    const parts = ops.map((o) => ({ o, w: o.weeks[i] }));
+    const total = (k) => sum(parts.map(({ w }) => w[k] ?? 0));
+    const contracted = parts.every(({ w }) => w.contractedHours === null) ? null : total('contractedHours');
+    const weeklyEarnings = total('weeklyEarnings');
+    const line = ({ o, w }) => (perTrip
+      ? `${fmtNum(w.trips)} trips × ${fmtRate(w.incentiveRate)}`
+      : `${fmtNum(w.actualHours)} h of ${fmtNum(w.contractedHours)} (${w.performancePercentage.toFixed(1)}%) · ${w.tierLabel}`);
+    return {
+      weekNumber: first.weekNumber,
+      start: first.start,
+      end: first.end,
+      trips: total('trips'),
+      actualHours: total('actualHours'),
+      contractedHours: contracted,
+      performancePercentage: null,
+      tierLabel: 'Per operator',
+      tierIndex: null,
+      incentiveRate: null,
+      corePaidHours: total('corePaidHours'),
+      bonusHours: total('bonusHours'),
+      bonusRate: null,
+      coreEarnings: total('coreEarnings'),
+      bonusEarnings: total('bonusEarnings'),
+      weeklyEarnings,
+      steps: [
+        ...parts.map((p) => step(p.o.name, line(p), fmtMoney(p.w.weeklyEarnings), 'money')),
+        step(`Week ${first.weekNumber} total`, `${parts.length} operators`, fmtMoney(weeklyEarnings), 'total'),
+      ],
+      explanation: [
+        ...parts.map((p) => `${p.o.name}: ${line(p)} = ${fmtMoney(p.w.weeklyEarnings)}`),
+        `Week ${first.weekNumber}: ${parts.map((p) => fmtMoney(p.w.weeklyEarnings)).join(' + ')} = ${fmtMoney(weeklyEarnings)}`,
+      ],
+    };
+  });
+}
+
 /**
  * @param {object} input
- * @param {object} input.settings  resolved plan + provider settings
- * @param {Array}  input.weeks     [{ weekNumber, start, end, trips, actualHours }]
- * @param {object} input.lease     { amount, frequency, weeksCharged? }
+ * @param {object} input.settings   resolved plan + provider settings
+ * @param {Array}  input.operators  [{ name, routes, contractedHours?, weeks, lease }] — one per operator
+ * @param {Array}  input.weeks      single-operator shorthand: [{ weekNumber, start, end, trips, actualHours }]
+ * @param {object} input.lease      single-operator shorthand: { amount, frequency, weeksCharged? }
  * @param {Array}  input.adjustments [{ type, amount, description }]
  */
-export function calculateVdp({ settings, weeks, lease, adjustments = [] }) {
+export function calculateVdp({ settings, weeks, lease, operators, adjustments = [] }) {
   if (!PAYMENT_TYPES.includes(settings.paymentType)) {
     throw new CalculationError(`Unsupported payment type "${settings.paymentType}".`);
   }
-  const weekFn = settings.paymentType === 'HOURLY' ? calculateHourlyWeek : calculatePerTripWeek;
-
-  const weekResults = weeks.map((w) => {
-    const r = weekFn(settings, w);
-    return {
-      weekNumber: w.weekNumber,
-      start: w.start,
-      end: w.end,
-      trips: D(w.trips),
-      actualHours: D(w.actualHours),
-      contractedHours: isBlank(settings.contractedHours) ? null : D(settings.contractedHours),
-      ...r,
-    };
-  });
+  const units = operators?.length ? operators : [{ name: null, weeks, lease }];
+  const ops = units.map((u) => calculateOperator(settings, u));
+  const many = ops.length > 1;
+  const weekResults = many ? combineWeeks(ops, settings.paymentType === 'PER_TRIP') : ops[0].weeks;
 
   const gross = sum(weekResults.map((w) => w.weeklyEarnings));
-  const leaseResult = calculateLease(lease, weeks.length);
+  const leaseResult = many
+    ? {
+      amount: sum(ops.map((o) => o.lease.amount)),
+      weeksCharged: ops.find((o) => o.lease.weeksCharged !== undefined)?.lease.weeksCharged,
+      explanation: ops.map((o) => `${o.name} — ${o.lease.explanation}`).join('; '),
+    }
+    : ops[0].lease;
+  const fuel = calculateFuelReimbursement(settings, weekResults);
 
   const groups = { fares: D(0), otherDeductions: D(0), reimbursements: D(0), otherIncome: D(0) };
   for (const adj of adjustments) {
@@ -221,13 +301,14 @@ export function calculateVdp({ settings, weeks, lease, adjustments = [] }) {
   }
 
   const totalDeductions = leaseResult.amount.plus(groups.fares).plus(groups.otherDeductions);
-  const totalAdditions = groups.reimbursements.plus(groups.otherIncome);
+  const totalAdditions = fuel.amount.plus(groups.reimbursements).plus(groups.otherIncome);
   const net = gross.minus(totalDeductions).plus(totalAdditions);
 
   const explanation = [
     ...weekResults.map((w) => `Week ${w.weekNumber}: ${fmtMoney(w.weeklyEarnings)}`),
     `Gross VDP: ${weekResults.map((w) => fmtMoney(w.weeklyEarnings)).join(' + ')} = ${fmtMoney(gross)}`,
     leaseResult.explanation,
+    ...(fuel.enabled ? [fuel.explanation] : []),
     `Fares collected: ${fmtMoney(groups.fares)}`,
     `Other deductions: ${fmtMoney(groups.otherDeductions)}`,
     `Reimbursements: ${fmtMoney(groups.reimbursements)}`,
@@ -244,10 +325,13 @@ export function calculateVdp({ settings, weeks, lease, adjustments = [] }) {
   const steps = [
     ...weekResults.map((w) => step(`Week ${w.weekNumber} earnings`, '', fmtMoney(w.weeklyEarnings), 'money')),
     step('Gross VDP', '', fmtMoney(gross), 'subtotal'),
-    step('Lift lease', leaseResult.detail, `−${fmtMoney(leaseResult.amount)}`, 'minus'),
+    ...(many
+      ? ops.map((o) => step(`Lift lease — ${o.name}`, o.lease.detail, `−${fmtMoney(o.lease.amount)}`, 'minus'))
+      : [step('Lift lease', leaseResult.detail, `−${fmtMoney(leaseResult.amount)}`, 'minus')]),
   ];
   if (groups.fares.gt(0)) steps.push(step('Fares collected', entries('fares'), `−${fmtMoney(groups.fares)}`, 'minus'));
   if (groups.otherDeductions.gt(0)) steps.push(step('Other deductions', entries('otherDeductions'), `−${fmtMoney(groups.otherDeductions)}`, 'minus'));
+  if (fuel.enabled) steps.push(step('Fuel reimbursement', fuel.detail, `+${fmtMoney(fuel.amount)}`, 'plus'));
   if (groups.reimbursements.gt(0)) steps.push(step('Reimbursements', entries('reimbursements'), `+${fmtMoney(groups.reimbursements)}`, 'plus'));
   if (groups.otherIncome.gt(0)) steps.push(step('Other income', entries('otherIncome'), `+${fmtMoney(groups.otherIncome)}`, 'plus'));
   steps.push(step('Net VDP payment', '', fmtMoney(net), 'total'));
@@ -256,9 +340,13 @@ export function calculateVdp({ settings, weeks, lease, adjustments = [] }) {
     weeks: weekResults,
     gross,
     lease: leaseResult.amount,
+    operators: ops.map((o) => ({ name: o.name, routes: o.routes, weeks: o.weeks, earnings: o.earnings, lease: o.lease.amount, leaseDetail: o.lease.detail })),
     leaseWeeksCharged: leaseResult.weeksCharged ?? null,
     fares: groups.fares,
     otherDeductions: groups.otherDeductions,
+    fuelReimbursement: fuel.amount,
+    fuelTrips: fuel.enabled ? fuel.trips : null,
+    fuelReimbursementRate: fuel.enabled ? fuel.rate : null,
     reimbursements: groups.reimbursements,
     otherIncome: groups.otherIncome,
     totalDeductions,
@@ -270,33 +358,46 @@ export function calculateVdp({ settings, weeks, lease, adjustments = [] }) {
 }
 
 // Plain-string form for storage / API. Money as fixed 2dp, rates/hours exact.
+const serializeWeek = (w) => ({
+  weekNumber: w.weekNumber,
+  start: w.start,
+  end: w.end,
+  trips: str(w.trips),
+  actualHours: str(w.actualHours),
+  contractedHours: str(w.contractedHours),
+  performancePercentage: w.performancePercentage === null ? null : w.performancePercentage.toDecimalPlaces(6).toString(),
+  tierLabel: w.tierLabel,
+  incentiveRate: str(w.incentiveRate),
+  corePaidHours: str(w.corePaidHours),
+  bonusHours: str(w.bonusHours),
+  bonusRate: str(w.bonusRate),
+  coreEarnings: money(w.coreEarnings),
+  bonusEarnings: money(w.bonusEarnings),
+  weeklyEarnings: money(w.weeklyEarnings),
+  tierIndex: w.tierIndex,
+  steps: w.steps,
+  explanation: w.explanation,
+});
+
 export function serializeResult(r) {
   return {
-    weeks: r.weeks.map((w) => ({
-      weekNumber: w.weekNumber,
-      start: w.start,
-      end: w.end,
-      trips: str(w.trips),
-      actualHours: str(w.actualHours),
-      contractedHours: str(w.contractedHours),
-      performancePercentage: w.performancePercentage === null ? null : w.performancePercentage.toDecimalPlaces(6).toString(),
-      tierLabel: w.tierLabel,
-      incentiveRate: str(w.incentiveRate),
-      corePaidHours: str(w.corePaidHours),
-      bonusHours: str(w.bonusHours),
-      bonusRate: str(w.bonusRate),
-      coreEarnings: money(w.coreEarnings),
-      bonusEarnings: money(w.bonusEarnings),
-      weeklyEarnings: money(w.weeklyEarnings),
-      tierIndex: w.tierIndex,
-      steps: w.steps,
-      explanation: w.explanation,
+    weeks: r.weeks.map(serializeWeek),
+    operators: (r.operators || []).map((o) => ({
+      name: o.name,
+      routes: o.routes,
+      earnings: money(o.earnings),
+      lease: money(o.lease),
+      leaseDetail: o.leaseDetail,
+      weeks: o.weeks.map(serializeWeek),
     })),
     gross: money(r.gross),
     lease: money(r.lease),
     leaseWeeksCharged: str(r.leaseWeeksCharged),
     fares: money(r.fares),
     otherDeductions: money(r.otherDeductions),
+    fuelReimbursement: money(r.fuelReimbursement),
+    fuelTrips: str(r.fuelTrips),
+    fuelReimbursementRate: str(r.fuelReimbursementRate),
     reimbursements: money(r.reimbursements),
     otherIncome: money(r.otherIncome),
     totalDeductions: money(r.totalDeductions),

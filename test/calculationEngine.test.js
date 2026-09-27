@@ -237,3 +237,86 @@ describe('DIV 10 regression — RIMO / Lisa Moore / route 918 / 08/24–09/06/20
     assert.equal(unrounded.toFixed(3), '2637.338');
   });
 });
+
+describe('fuel reimbursement (plan option)', () => {
+  const fuelRun = (settings, trips = [40, 45]) =>
+    serializeResult(calculateVdp({
+      settings: { ...NIGHT, ...settings },
+      weeks: [week(1, '40', trips[0]), week(2, '40', trips[1])],
+      lease: LEASE,
+      adjustments: [{ type: 'REIMBURSEMENT', amount: '10.00' }],
+    }));
+
+  test('off adds nothing and shows no line', () => {
+    const r = fuelRun({});
+    assert.equal(r.fuelReimbursement, '0.00');
+    assert.equal(r.fuelTrips, null);
+    assert.equal(r.totalAdditions, '10.00');
+    assert.ok(!r.steps.some((s) => s.label === 'Fuel reimbursement'));
+  });
+
+  test('on: all trips in the cycle × rate, added after gross', () => {
+    const off = fuelRun({});
+    const r = fuelRun({ fuelReimbursementEnabled: true, fuelReimbursementRate: '2.3333' });
+    // 85 trips × 2.3333 = 198.3305 → 198.33
+    assert.equal(r.fuelTrips, '85');
+    assert.equal(r.fuelReimbursement, '198.33');
+    assert.equal(r.gross, off.gross, 'fuel is not earnings');
+    assert.equal(r.totalAdditions, '208.33');
+    assert.equal(r.net, (Number(off.net) + 198.33).toFixed(2));
+    const s = r.steps.find((x) => x.label === 'Fuel reimbursement');
+    assert.equal(s.value, '+$198.33');
+    assert.equal(s.detail, '85 trips × $2.3333');
+  });
+
+  test('works on per-trip plans too', () => {
+    const r = fuelRun({ paymentType: 'PER_TRIP', basePay: '21.50', tuiEligible: false, bonusEnabled: false, fuelReimbursementEnabled: true, fuelReimbursementRate: '3' }, [10, 0]);
+    assert.equal(r.gross, '215.00');
+    assert.equal(r.fuelReimbursement, '30.00');
+  });
+
+  test('on without a rate is a calculation error', () => {
+    assert.throws(() => fuelRun({ fuelReimbursementEnabled: true, fuelReimbursementRate: null }), CalculationError);
+  });
+});
+
+describe('providers with several operators', () => {
+  const op = (name, h1, h2, extra = {}) => ({ name, routes: [name], weeks: [week(1, h1, 10), week(2, h2, 10)], lease: LEASE, ...extra });
+  const runOps = (operators, settings = {}) =>
+    serializeResult(calculateVdp({ settings: { ...NIGHT, ...settings }, operators, adjustments: [] }));
+
+  test('each operator is measured against their own contract, then summed', () => {
+    const r = runOps([op('A', '40', '40'), op('B', '30', '30')]);
+    // A: 40/40 = 100% → 28.86 × 40 = 1154.40; B: 30/40 = 75% → 25.97 × 30 = 779.10
+    assert.deepEqual(r.operators.map((o) => o.weeks[0].tierLabel), ['100%+', '0% – 79.99%']);
+    assert.deepEqual(r.operators.map((o) => o.earnings), ['2308.80', '1558.20']);
+    assert.equal(r.weeks[0].weeklyEarnings, '1933.50');
+    assert.equal(r.weeks[0].actualHours, '70');
+    assert.equal(r.weeks[0].contractedHours, '80');
+    assert.equal(r.weeks[0].performancePercentage, null);
+    assert.equal(r.weeks[0].bonusHours, '0', 'no bonus: nobody went over their own 40 h');
+    assert.equal(r.gross, '3867.00');
+  });
+
+  test('lift lease is charged per operator', () => {
+    const r = runOps([op('A', '40', '40'), op('B', '30', '30', { lease: { amount: '100', frequency: 'PER_VDP_CYCLE' } })]);
+    assert.equal(r.lease, '495.00'); // 197.50 × 2 + 100
+    assert.deepEqual(r.operators.map((o) => o.lease), ['395.00', '100.00']);
+    assert.deepEqual(r.steps.filter((s) => s.label.startsWith('Lift lease')).map((s) => s.label), ['Lift lease — A', 'Lift lease — B']);
+    assert.equal(r.net, '3372.00');
+  });
+
+  test('operator contracted-hours override', () => {
+    const r = runOps([op('A', '30', '30', { contractedHours: '30' }), op('B', '30', '30')]);
+    assert.equal(r.operators[0].weeks[0].tierLabel, '100%+');
+    assert.equal(r.operators[1].weeks[0].tierLabel, '0% – 79.99%');
+    assert.equal(r.weeks[0].contractedHours, '70');
+  });
+
+  test('one operator gives the same result as the single-operator form', () => {
+    const a = runOps([op('A', '43.5', '38')]);
+    const b = run('43.5', '38');
+    assert.equal(a.net, b.net);
+    assert.equal(a.weeks[0].tierLabel, b.weeks[0].tierLabel);
+  });
+});

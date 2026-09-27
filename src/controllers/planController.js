@@ -8,7 +8,7 @@ import { D } from '../services/money.js';
 import { badRequest, conflict, notFound, actor } from '../services/errors.js';
 import { decimalInput } from './validate.js';
 
-function versionInput(body) {
+export function versionInput(body) {
   const tiers = (body.incentiveTiers || [])
     .map((t, i) => ({
       minimumPercentage: decimalInput(t.minimumPercentage, `Tier ${i + 1} minimum %`, { required: true }),
@@ -24,6 +24,8 @@ function versionInput(body) {
     incentiveTiers: tiers,
     bonusEnabled: Boolean(body.bonusEnabled),
     bonusRate: decimalInput(body.bonusRate, 'Bonus rate'),
+    fuelReimbursementEnabled: Boolean(body.fuelReimbursementEnabled),
+    fuelReimbursementRate: decimalInput(body.fuelReimbursementRate, 'Fuel reimbursement rate'),
     performanceHourMetric: body.performanceHourMetric || 'TOTAL_HOURS',
     performanceHourColumn: body.performanceHourMetric === 'OTHER' ? body.performanceHourColumn : null,
     effectiveFrom: body.effectiveFrom ? toDateOnly(body.effectiveFrom) : null,

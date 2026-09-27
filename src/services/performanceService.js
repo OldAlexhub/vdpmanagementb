@@ -125,7 +125,7 @@ export async function importReport({ cycleId, file, replace = false, replaceReas
   return doc;
 }
 
-export async function resolveRoute(importId, { route, action, providerId, saveToProfile, note }, user) {
+export async function resolveRoute(importId, { route, action, providerId, operatorId, saveToProfile, note }, user) {
   const doc = await PerformanceImport.findById(importId);
   if (!doc) throw notFound('Performance import');
   if (doc.status !== 'ACTIVE') throw badRequest('This report has been replaced; resolve routes on the current report.');
@@ -138,12 +138,22 @@ export async function resolveRoute(importId, { route, action, providerId, saveTo
     if (!provider) throw badRequest('Choose a provider in this division.');
     doc.routeResolutions.push({ route, action, providerId: provider._id, note, resolvedBy: actor(user) });
     if (saveToProfile) {
+      // With several operators the route has to go to one of them.
+      const active = provider.operators.filter((o) => o.status === 'ACTIVE');
+      const target = active.length > 1 ? active.find((o) => String(o._id) === String(operatorId)) : active[0];
+      if (active.length > 1 && !target) throw badRequest(`${provider.name} has several operators. Choose which one runs route ${route}.`);
       // Remove the route from other active providers' profiles so future reports match cleanly.
-      await Provider.updateMany(
-        { divisionId: doc.divisionId, _id: { $ne: provider._id }, routes: route, status: 'ACTIVE' },
-        { $pull: { routes: route } },
-      );
-      if (!provider.routes.includes(route)) {
+      const others = await Provider.find({ divisionId: doc.divisionId, _id: { $ne: provider._id }, routes: route, status: 'ACTIVE' });
+      for (const other of others) {
+        other.routes.pull(route);
+        other.operators.forEach((o) => o.routes.pull(route));
+        await other.save();
+      }
+      if (target) {
+        provider.operators.forEach((o) => o.routes.pull(route));
+        target.routes.push(route);
+        await provider.save();
+      } else if (!provider.routes.includes(route)) {
         provider.routes.push(route);
         await provider.save();
       }

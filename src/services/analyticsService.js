@@ -25,7 +25,9 @@ const tierOrder = (label) => {
 function weekFacts(v) {
   const calc = calcOf(v);
   if (!calc) return [];
-  return calc.weeks.map((w) => ({
+  // Several operators: performance % and tiers only exist per operator-week.
+  const weeks = calc.operators?.length > 1 ? calc.operators.flatMap((o) => o.weeks) : calc.weeks;
+  return weeks.map((w) => ({
     hourly: isHourly(v),
     hours: D(w.actualHours || 0),
     trips: D(w.trips || 0),
@@ -51,6 +53,7 @@ function totals(vdps) {
     lease: money(sum(calcs.map((c) => c.lease))),
     fares: money(sum(calcs.map((c) => c.fares))),
     otherDeductions: money(sum(calcs.map((c) => c.otherDeductions))),
+    fuelReimbursement: money(sum(calcs.map((c) => c.fuelReimbursement || 0))),
     hours: sum(weeks.map((w) => w.hours)).toDecimalPlaces(2).toString(),
     trips: sum(weeks.map((w) => w.trips)).toString(),
     bonusHours: sum(weeks.map((w) => w.bonusHours)).toDecimalPlaces(2).toString(),
