@@ -13,7 +13,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 export function createApp() {
   const app = express();
   app.use(helmet({ contentSecurityPolicy: false }));
-  const origins = (process.env.CLIENT_ORIGIN || 'http://localhost:3000').split(',').map((o) => o.trim()).filter(Boolean);
+  const origins = (process.env.CLIENT_ORIGIN || 'http://localhost:3000').split(',').map((o) => o.trim().replace(/\/+$/, '')).filter(Boolean);
   app.use(cors({ origin: origins, credentials: true }));
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser());
