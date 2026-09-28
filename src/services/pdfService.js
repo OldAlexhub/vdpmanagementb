@@ -491,24 +491,28 @@ export async function statementPdf(m) {
   const fa = calc.fuelAllowance;
   if (fa) {
     ensure(doc, 200);
-    sectionTitle(doc, 'Fuel allowance', 'Maximum allowed fuel = service miles ÷ MPG');
+    sectionTitle(doc, 'Fuel allowance', 'Service miles ÷ MPG × fuel price on each service date');
     const entered = fa.actualExpense !== null;
     const over = Number(calc.fuelOverspend) > 0;
     stepsTable(doc, [
       { label: 'Service miles', detail: `Week 1 ${fmtNum(fa.weekMiles[0])} + week 2 ${fmtNum(fa.weekMiles[1])}`, value: fmtNum(fa.serviceMiles), tone: 'info' },
       { label: 'Fuel efficiency', detail: fa.mpg ? 'VDP plan' : 'Each operator’s VDP plan', value: `${fa.mpg ? fmtNum(fa.mpg) : fa.mpgs.join(' / ')} MPG`, tone: 'info' },
-      { label: 'Maximum allowed fuel', detail: fa.mpg ? `${fmtNum(fa.serviceMiles)} ÷ ${fmtNum(fa.mpg)}` : 'Each operator’s miles ÷ their MPG', value: fmtMoney(fa.maxAllowed), tone: 'subtotal' },
+      { label: 'Allowed gallons', detail: fa.mpg ? `${fmtNum(fa.serviceMiles)} ÷ ${fmtNum(fa.mpg)}` : 'Each operator’s miles ÷ their MPG', value: D(fa.gallons).toFixed(4), tone: 'info' },
+      { label: 'Fuel price', detail: 'In effect on each service date', value: fa.pricesUsed.map((pr) => `${fmtRate(pr)}/gal`).join(', '), tone: 'info' },
+      { label: 'Maximum allowed fuel', detail: '', value: fmtMoney(fa.maxAllowed), tone: 'subtotal' },
       { label: 'Actual fuel expense', detail: '', value: entered ? fmtMoney(fa.actualExpense) : 'Not entered', tone: 'info' },
       { label: 'Fuel overspend deduction', detail: over ? `${fmtMoney(fa.actualExpense)} − ${fmtMoney(fa.maxAllowed)}` : 'Within the allowance', value: over ? `–${fmtMoney(calc.fuelOverspend)}` : fmtMoney(0), tone: over ? 'minus' : 'total' },
     ], L, W);
     ensure(doc, 40 + fa.days.length * 15);
     table(doc, [
-      { header: 'Date', width: W * 0.3 },
-      { header: 'Service miles', width: W * 0.25, align: 'right' },
-      { header: 'MPG', width: W * 0.2, align: 'right' },
-      { header: 'Allowed fuel', width: W * 0.25, align: 'right' },
+      { header: 'Date', width: W * 0.2 },
+      { header: 'Service miles', width: W * 0.16, align: 'right' },
+      { header: 'MPG', width: W * 0.1, align: 'right' },
+      { header: 'Allowed gallons', width: W * 0.18, align: 'right' },
+      { header: 'Fuel price', width: W * 0.16, align: 'right' },
+      { header: 'Allowed fuel', width: W * 0.2, align: 'right' },
     ], fa.days.map((d) => ({
-      cells: [shortDate(d.date), fmtNum(d.serviceMiles), fmtNum(d.mpg), D(d.allowed).toFixed(4)],
+      cells: [shortDate(d.date), fmtNum(d.serviceMiles), fmtNum(d.mpg), D(d.gallons).toFixed(6), fmtRate(d.pricePerGallon), D(d.allowed).toFixed(4)],
       labelBold: false,
     })), { fontSize: 8, rowPad: 3 });
   }
