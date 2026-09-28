@@ -2,6 +2,7 @@
 // are read as one operator built from their provider-level operator, routes and lease.
 import { str } from './money.js';
 import { isoDate } from './cycleService.js';
+import { bestRouteMatches } from './routeMatching.js';
 
 export const LEGACY_OPERATOR_ID = 'default';
 
@@ -56,7 +57,9 @@ export function activeOperators(provider, cycle) {
 
 /** Does this provider run the route on this day (per its operators' dates)? */
 export const runsRouteOn = (provider, route, day) =>
-  operatorsOf(provider).some((o) => o.status === 'ACTIVE' && o.routes.includes(route) && worksOn(o, day));
+  operatorsOf(provider).some((o) => o.status === 'ACTIVE'
+    && bestRouteMatches(route, o.routes).score > 0
+    && worksOn(o, day));
 
 /**
  * Lift-lease weeks for an operator who joined or left inside the cycle: a week is charged

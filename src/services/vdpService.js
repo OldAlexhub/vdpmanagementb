@@ -10,6 +10,7 @@ import { activeImportFor, matchRoutes, unresolvedRoutes } from './performanceSer
 import { hoursForMetric, HOUR_METRICS } from './performanceParser.js';
 import { weekOf, isoDate, endOfDayIn } from './cycleService.js';
 import { activeOperators, operatorsOf, worksOn, leaseWeeksInCycle } from './operators.js';
+import { bestRouteMatches } from './routeMatching.js';
 import { D, sum, isBlank, str, fmtMoney, fmtRate, fmtNum } from './money.js';
 import { badRequest, conflict, notFound, actor } from './errors.js';
 
@@ -79,10 +80,20 @@ function providerPerformance({ provider, cycle, importDoc, matches, metric, othe
   }
   const routes = [...mine.keys()];
   const ops = activeOperators(provider, cycle);
-  // The operator on the route that day; if none has those dates, whoever has the route; else a sole operator.
-  const operatorFor = (route, day) => (ops.find((o) => o.routes.includes(route) && worksOn(o, day))
-    ?? ops.find((o) => o.routes.includes(route))
-    ?? (ops.length === 1 ? ops[0] : null))?.id ?? null;
+  // The operator with the best route match that day. Ties stay unassigned for review rather than
+  // guessing between operators (for example a bare 1029 against separate 1029A and 1029B routes).
+  const operatorFor = (route, day) => {
+    const pick = (list) => {
+      const ranked = list
+        .map((o) => ({ o, score: bestRouteMatches(route, o.routes).score }))
+        .filter((candidate) => candidate.score > 0);
+      if (!ranked.length) return null;
+      const best = Math.max(...ranked.map((candidate) => candidate.score));
+      const candidates = ranked.filter((candidate) => candidate.score === best);
+      return candidates.length === 1 ? candidates[0].o : null;
+    };
+    return (pick(ops.filter((o) => worksOn(o, day))) ?? pick(ops) ?? (ops.length === 1 ? ops[0] : null))?.id ?? null;
+  };
   const days = importDoc.rows
     .filter((r) => mine.has(r.route))
     .filter((r) => { const part = mine.get(r.route); return !part || (r.date >= part.from && r.date <= part.to); })

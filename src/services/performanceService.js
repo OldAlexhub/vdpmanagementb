@@ -6,6 +6,7 @@ import Vdp from '../models/Vdp.js';
 import { parsePerformanceFile, ReportFormatError } from './performanceParser.js';
 import { isoDate } from './cycleService.js';
 import { runsRouteOn } from './operators.js';
+import { bestRouteMatches, routeKey } from './routeMatching.js';
 import { badRequest, conflict, notFound, actor } from './errors.js';
 
 export const activeImportFor = (cycleId) => PerformanceImport.findOne({ cycleId, status: 'ACTIVE' });
@@ -19,34 +20,66 @@ export const activeImportFor = (cycleId) => PerformanceImport.findOne({ cycleId,
 export function matchRoutes(importDoc, providers) {
   const routes = [...new Set(importDoc.rows.map((r) => r.route))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   const resolutions = new Map(importDoc.routeResolutions.map((r) => [r.route, r]));
+  const normalizedResolutions = new Map();
+  for (const resolution of importDoc.routeResolutions) {
+    const key = routeKey(resolution.route);
+    if (!key) continue;
+    if (normalizedResolutions.has(key)) normalizedResolutions.set(key, null);
+    else normalizedResolutions.set(key, resolution);
+  }
   const active = providers.filter((p) => p.status === 'ACTIVE');
   const byId = new Map(providers.map((p) => [String(p._id), p]));
 
   return routes.map((route) => {
     const rows = importDoc.rows.filter((r) => r.route === route);
     const summary = { route, days: rows.length };
-    const res = resolutions.get(route);
+    // Carry an explicit decision across corrected reports when only formatting changed. A suffix
+    // change is not carried forward because one prior route could otherwise decide several rows.
+    const res = resolutions.get(route) || normalizedResolutions.get(routeKey(route));
     if (res) {
       if (res.action === 'IGNORE') return { ...summary, status: 'IGNORED', resolution: res };
       const p = byId.get(String(res.providerId));
-      return { ...summary, status: 'ASSIGNED', providerId: res.providerId, providerName: p?.name, resolution: res };
+      const matched = bestRouteMatches(route, p?.routes);
+      return {
+        ...summary,
+        status: 'ASSIGNED',
+        providerId: res.providerId,
+        providerName: p?.name,
+        resolution: res,
+        matchType: matched.matchType,
+        profileRoutes: matched.routes,
+      };
     }
-    const listing = active.filter((p) => p.routes.includes(route));
+    const ranked = active
+      .map((p) => ({ p, ...bestRouteMatches(route, p.routes) }))
+      .filter((candidate) => candidate.score > 0);
+    const bestScore = ranked.length ? Math.max(...ranked.map((candidate) => candidate.score)) : 0;
+    // Exact/normalized profile matches take precedence over the optional trailing-letter fallback.
+    const listing = ranked.filter((candidate) => candidate.score === bestScore);
     // An operator who moved between providers leaves the route on both profiles; their dates decide.
     const days = [...new Set(rows.map((r) => r.date))].sort();
-    const owners = (p) => days.filter((d) => runsRouteOn(p, route, d));
-    const candidates = listing.length > 1 ? listing.filter((p) => owners(p).length) : listing;
+    const owners = (candidate) => days.filter((d) => runsRouteOn(candidate.p, route, d));
+    const candidates = listing.length > 1 ? listing.filter((candidate) => owners(candidate).length) : listing;
     if (candidates.length === 1) {
-      return { ...summary, status: 'MATCHED', providerId: candidates[0]._id, providerName: candidates[0].name };
+      const [{ p, matchType, routes: profileRoutes }] = candidates;
+      return { ...summary, status: 'MATCHED', providerId: p._id, providerName: p.name, matchType, profileRoutes };
     }
     if (candidates.length === 0) {
       return { ...summary, status: 'UNKNOWN', message: `Route ${route} is not assigned to any active provider.` };
     }
-    const split = candidates.map((p) => ({ p, days: owners(p) }));
+    const split = candidates.map((candidate) => ({ ...candidate, days: owners(candidate) }));
     const eachDayOnce = days.every((d) => split.filter((s) => s.days.includes(d)).length === 1);
     if (eachDayOnce) {
       const parts = split
-        .map(({ p, days: own }) => ({ providerId: p._id, providerName: p.name, from: own[0], to: own[own.length - 1], days: own.length }))
+        .map(({ p, days: own, matchType, routes: profileRoutes }) => ({
+          providerId: p._id,
+          providerName: p.name,
+          from: own[0],
+          to: own[own.length - 1],
+          days: own.length,
+          matchType,
+          profileRoutes,
+        }))
         .sort((a, b) => a.from.localeCompare(b.from));
       const last = parts[parts.length - 1];
       return {
@@ -60,8 +93,8 @@ export function matchRoutes(importDoc, providers) {
     return {
       ...summary,
       status: 'AMBIGUOUS',
-      candidates: candidates.map((p) => ({ id: p._id, name: p.name })),
-      message: `Route ${route} is assigned to ${candidates.length} active providers (${candidates.map((p) => p.name).join(', ')}).`,
+      candidates: candidates.map(({ p, matchType, routes: profileRoutes }) => ({ id: p._id, name: p.name, matchType, profileRoutes })),
+      message: `Route ${route} matches ${candidates.length} active providers (${candidates.map(({ p }) => p.name).join(', ')}).`,
     };
   });
 }
