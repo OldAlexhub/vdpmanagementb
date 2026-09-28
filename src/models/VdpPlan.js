@@ -27,8 +27,9 @@ const versionSchema = new Schema(
     bonusEnabled: { type: Boolean, default: false },
     bonusRate: dec({ default: null }),
     // Fuel arrangement. NONE; PER_TRIP = trips × rate added after Gross; SERVICE_MILE_ALLOWANCE =
-    // service miles ÷ MPG (fuelMpg, e.g. 19) is the most fuel may cost ($), and only the actual
-    // expense above it is deducted. Versions saved before fuelMethod existed: see fuelMethodOf().
+    // each day's service miles ÷ MPG (fuelMpg, e.g. 19) × that day's fuel price (plan.fuelPrices) is the
+    // most fuel may cost, and only the actual expense above it is deducted. Versions saved before
+    // fuelMethod existed: see fuelMethodOf().
     fuelMethod: { type: String, enum: ['NONE', 'PER_TRIP', 'SERVICE_MILE_ALLOWANCE', null], default: null },
     fuelReimbursementEnabled: { type: Boolean, default: false }, // = fuelMethod PER_TRIP
     fuelReimbursementRate: dec({ default: null }), // $ per trip
@@ -46,6 +47,20 @@ const versionSchema = new Schema(
   { timestamps: true, toJSON: { getters: true, versionKey: false }, toObject: { getters: true } },
 );
 
+// Fuel price per gallon by date, for the service mile allowance. Kept on the plan (not a version)
+// because it changes often; approved VDPs keep the prices they were calculated with.
+const fuelPriceSchema = new Schema(
+  {
+    pricePerGallon: dec({ required: true }),
+    effectiveFrom: { type: String, required: true }, // YYYY-MM-DD, inclusive
+    effectiveTo: { type: String, default: null }, // YYYY-MM-DD, inclusive; null = open-ended
+    notes: String,
+    updatedBy: actorSchema,
+    updatedAt: { type: Date, default: Date.now },
+  },
+  { toJSON: { getters: true, versionKey: false }, toObject: { getters: true } },
+);
+
 const planSchema = new Schema(
   {
     divisionId: { type: Schema.Types.ObjectId, ref: 'Division', required: true, index: true },
@@ -53,6 +68,7 @@ const planSchema = new Schema(
     status: { type: String, enum: ['ACTIVE', 'INACTIVE'], default: 'ACTIVE' },
     notes: String,
     versions: { type: [versionSchema], default: [] },
+    fuelPrices: { type: [fuelPriceSchema], default: [] },
   },
   jsonOptions,
 );

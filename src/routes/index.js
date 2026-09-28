@@ -57,6 +57,8 @@ api.get('/vdp-plans/:id', plans.get);
 api.put('/vdp-plans/:id', requireAdmin, plans.update);
 api.post('/vdp-plans/:id/versions', requireAdmin, plans.addVersion);
 api.put('/vdp-plans/:id/versions/:versionId', requireAdmin, plans.updateVersion);
+// Fuel prices change often and are entered by Accounting, so any staff user may edit them.
+api.put('/vdp-plans/:id/fuel-prices', plans.setFuelPrices);
 
 api.get('/providers', providers.list);
 api.post('/providers', providers.create);

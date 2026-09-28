@@ -4,7 +4,7 @@ import Provider from '../models/Provider.js';
 import VdpPlan from '../models/VdpPlan.js';
 import VdpCycle from '../models/VdpCycle.js';
 import Division from '../models/Division.js';
-import { calculateVdp, serializeResult, CalculationError, ADJUSTMENT_TYPES } from './calculationEngine.js';
+import { calculateVdp, serializeResult, CalculationError, ADJUSTMENT_TYPES, priceOn } from './calculationEngine.js';
 import { resolveVersion, resolveSettings, engineSettings, validateVersion, SERVICE_MILE_ALLOWANCE } from './planService.js';
 import { activeImportFor, matchRoutes, unresolvedRoutes } from './performanceService.js';
 import { hoursForMetric, HOUR_METRICS } from './performanceParser.js';
@@ -269,18 +269,26 @@ export async function computeVdp(vdp, preloaded = {}) {
     }
   }
 
-  // Service mile fuel allowance: service miles and the divisor are needed to calculate;
-  // the actual expense is needed before the VDP can be READY.
+  // Service mile fuel allowance: service miles, the MPG and a fuel price for every service date
+  // (from the plan) are needed to calculate; the actual expense is needed before the VDP can be READY.
   let fuel = null;
   const allowanceOps = activeOperators(provider, cycle).filter((o) => settingsOf(o.id)?.fuelMethod?.value === SERVICE_MILE_ALLOWANCE);
   if (settings && (mixedPlans ? allowanceOps.length > 0 : settings.fuelMethod?.value === SERVICE_MILE_ALLOWANCE)) {
     const mpgs = mixedPlans ? allowanceOps.map((o) => settingsOf(o.id).fuelMpg?.value) : [settings.fuelMpg?.value];
     if (mpgs.some((m) => isBlank(m) || D(m).lte(0))) exceptions.push(exception('FUEL_MPG_MISSING', 'Fuel MPG configuration is missing.'));
     if (performance) {
+      const pricesOf = (p) => (p?.fuelPrices || []).map((x) => ({ pricePerGallon: str(x.pricePerGallon), effectiveFrom: x.effectiveFrom, effectiveTo: x.effectiveTo || null }));
+      const withPrice = (d, p) => ({ ...d, pricePerGallon: priceOn(pricesOf(p), d.date)?.pricePerGallon ?? null, planName: p?.name });
       const days = mixedPlans
         ? allowanceOps.flatMap((o) => fuelDays(performance.days.filter((d) => d.operatorId === o.id))
-          .map((d) => ({ ...d, mpg: settingsOf(o.id).fuelMpg?.value ?? null, operator: o.name })))
-        : fuelDays(performance.days);
+          .map((d) => withPrice({ ...d, mpg: settingsOf(o.id).fuelMpg?.value ?? null, operator: o.name }, opPlan.get(o.id)?.plan)))
+        : fuelDays(performance.days).map((d) => withPrice(d, plan));
+      const unpriced = days.filter((d) => d.pricePerGallon === null);
+      if (unpriced.length) {
+        const plans = [...new Set(unpriced.map((d) => d.planName))].map((n) => `"${n}"`).join(', ');
+        exceptions.push(exception('FUEL_PRICE_MISSING',
+          `No fuel price configured for ${dateList([...new Set(unpriced.map((d) => d.date))])}. Add it under Fuel prices on the VDP plan ${plans}.`));
+      }
       if (importDoc && !importDoc.detectedColumns?.SERVICE_MILES) {
         exceptions.push(exception('SERVICE_MILES_MISSING',
           'Service Miles required for fuel calculation are missing. The uploaded Performance Report has no Miles → Service column — if it was uploaded before Service Miles were captured, upload it again.'));

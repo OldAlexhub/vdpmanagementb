@@ -78,18 +78,72 @@ export async function get(req, res) {
   res.json(await withUsage(plan));
 }
 
+// ---- Fuel prices (service mile allowance) ----
+
+const DAY_RX = /^\d{4}-\d{2}-\d{2}$/;
+const validDay = (d) => DAY_RX.test(d) && !Number.isNaN(Date.parse(d));
+
+function fuelPriceInput(body) {
+  const pricePerGallon = decimalInput(body.pricePerGallon, 'Fuel price per gallon', { required: true, maxDp: 6 });
+  if (Number(pricePerGallon) <= 0) throw badRequest('Fuel price per gallon must be greater than zero.');
+  const effectiveFrom = String(body.effectiveFrom || '').trim();
+  const effectiveTo = String(body.effectiveTo || '').trim() || null;
+  if (!validDay(effectiveFrom)) throw badRequest('Effective from date is required.');
+  if (effectiveTo && !validDay(effectiveTo)) throw badRequest('Effective to date is not a valid date.');
+  if (effectiveTo && effectiveTo < effectiveFrom) throw badRequest('Effective to date is before effective from.');
+  return { pricePerGallon, effectiveFrom, effectiveTo, notes: body.notes || undefined };
+}
+
+// A plan's fuel prices, replaced as a whole list (the plan form edits them as a table).
+// One price per day: periods may not overlap.
+function applyFuelPrices(plan, list, user) {
+  if (!Array.isArray(list)) throw badRequest('Fuel prices must be a list.');
+  const prices = list
+    .filter((p) => String(p?.pricePerGallon ?? '').trim() || String(p?.effectiveFrom ?? '').trim())
+    .map((p, i) => {
+      try { return { ...fuelPriceInput(p), ...(p._id ? { _id: p._id } : {}) }; } catch (e) { e.message = `Fuel price ${i + 1}: ${e.message}`; throw e; }
+    })
+    .sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
+  for (let i = 1; i < prices.length; i += 1) {
+    const prev = prices[i - 1];
+    if (!prev.effectiveTo || prev.effectiveTo >= prices[i].effectiveFrom) {
+      throw badRequest(`Fuel prices overlap: $${prev.pricePerGallon}/gal from ${prev.effectiveFrom}${prev.effectiveTo ? ` to ${prev.effectiveTo}` : ' (open-ended)'} and $${prices[i].pricePerGallon}/gal from ${prices[i].effectiveFrom}. Each day needs one price.`);
+    }
+  }
+  const before = new Map(plan.fuelPrices.map((p) => [String(p._id), p]));
+  plan.fuelPrices = prices.reverse().map((p) => {
+    const old = p._id && before.get(String(p._id));
+    const same = old && String(old.pricePerGallon) === String(p.pricePerGallon) && old.effectiveFrom === p.effectiveFrom
+      && (old.effectiveTo || null) === p.effectiveTo && (old.notes || undefined) === p.notes;
+    return same ? old.toObject() : { ...p, updatedBy: actor(user), updatedAt: new Date() };
+  });
+}
+
+// Open VDPs recalculate with new prices; approved ones keep the prices they used.
+export async function setFuelPrices(req, res) {
+  const plan = await VdpPlan.findById(req.params.id);
+  if (!plan) throw notFound('VDP plan');
+  applyFuelPrices(plan, req.body.fuelPrices, req.user);
+  await plan.save();
+  await markStale({ divisionId: plan.divisionId });
+  res.json(await withUsage(plan));
+}
+
 export async function create(req, res) {
   const { divisionId, name, notes } = req.body;
   if (!name) throw badRequest('Plan name is required.');
   if (!(await Division.exists({ _id: divisionId }))) throw badRequest('Choose a division.');
   const version = versionInput(req.body.version || req.body);
   if (!version.effectiveFrom) throw badRequest('Effective from date is required.');
-  const plan = await VdpPlan.create({
+  const plan = new VdpPlan({
     divisionId,
     name,
     notes,
     versions: [{ ...version, versionNumber: 1, createdBy: actor(req.user) }],
   });
+  const prices = req.body.fuelPrices ?? req.body.version?.fuelPrices;
+  if (prices !== undefined) applyFuelPrices(plan, prices, req.user);
+  await plan.save();
   res.status(201).json(await withUsage(plan));
 }
 
@@ -122,6 +176,7 @@ export async function addVersion(req, res) {
     createdBy: actor(req.user),
   });
   assertNoOverlap(plan);
+  if (req.body.fuelPrices !== undefined) applyFuelPrices(plan, req.body.fuelPrices, req.user);
   await plan.save();
   await markStale({ planId: plan._id });
   res.status(201).json(await withUsage(plan));
@@ -139,6 +194,7 @@ export async function updateVersion(req, res) {
   const input = versionInput({ ...req.body, effectiveFrom: req.body.effectiveFrom || v.effectiveFrom });
   Object.assign(v, input);
   assertNoOverlap(plan);
+  if (req.body.fuelPrices !== undefined) applyFuelPrices(plan, req.body.fuelPrices, req.user);
   await plan.save();
   await markStale({ planId: plan._id });
   res.json(await withUsage(plan));

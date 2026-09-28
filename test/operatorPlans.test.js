@@ -147,7 +147,9 @@ test('operators on different VDP plans', { skip }, async (t) => {
       divisionId: div10._id,
       name: 'Day allowance',
       version: { paymentType: 'PER_TRIP', basePay: '21.50', fuelMethod: 'SERVICE_MILE_ALLOWANCE', fuelMpg: '19', effectiveFrom: '2026-08-01' },
+      fuelPrices: [{ pricePerGallon: '4.794', effectiveFrom: '2026-08-01' }],
     });
+    assert.equal(r.status, 201, JSON.stringify(r.data));
     const allowancePlan = r.data;
     const p = (await call('GET', `/providers/${rimo._id}`)).data;
     r = await call('PUT', `/providers/${rimo._id}`, {
@@ -158,7 +160,7 @@ test('operators on different VDP plans', { skip }, async (t) => {
     assert.deepEqual(vdp.exceptions.map((e) => e.code), ['FUEL_EXPENSE_MISSING']);
     const a = vdp.view.calculation.fuelAllowance;
     assert.equal(a.serviceMiles, sum(rows917.map((x) => x.serviceMiles)).toString(), 'Lisa’s route 918 miles are not counted');
-    assert.equal(a.maxAllowed, sum(rows917.map((x) => D(x.serviceMiles).div(19))).toDecimalPlaces(2).toFixed(2));
+    assert.equal(a.maxAllowed, sum(rows917.map((x) => D(x.serviceMiles).div(19).times('4.794'))).toDecimalPlaces(2).toFixed(2));
     assert.ok(a.days.every((d) => d.operator === 'Verite Nitunga' && d.mpg === '19'));
 
     r = await call('POST', `/vdps/${vdp._id}/adjustments`, { type: 'FUEL', amount: '5' });

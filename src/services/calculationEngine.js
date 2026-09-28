@@ -215,14 +215,19 @@ function fuelReimbursementFor(parts) {
   };
 }
 
+// The fuel price in effect on a service date (YYYY-MM-DD strings sort as dates).
+export const priceOn = (prices, day) =>
+  (prices || []).find((p) => p.effectiveFrom <= day && (!p.effectiveTo || p.effectiveTo >= day)) || null;
+
 /**
  * Service mile fuel allowance (plan option). Per service date:
- *   allowed fuel ($) = service miles ÷ X   (X = the plan's fuel divisor, e.g. 19; provider may override)
+ *   allowed gallons = service miles ÷ MPG (e.g. 19)
+ *   allowed fuel    = allowed gallons × the fuel price per gallon in effect that day
  * Daily values keep full precision; the sum is rounded once to cents (Maximum Allowed Fuel).
  * Only the actual expense above the maximum is deducted — an unused allowance is not income.
  * @param {object} input
- * @param {string} input.mpg     the divisor X
- * @param {Array}  input.days    [{ date, week, serviceMiles }] — one per service date (routes summed)
+ * @param {string} input.mpg     the plan's MPG (a day may carry its own: operator on another plan)
+ * @param {Array}  input.days    [{ date, week, serviceMiles, pricePerGallon, mpg?, operator? }]
  * @param {string|null} input.actualExpense  null = not entered yet (no deduction until it is)
  */
 export function calculateFuelAllowance({ mpg, days, actualExpense }) {
@@ -233,28 +238,34 @@ export function calculateFuelAllowance({ mpg, days, actualExpense }) {
   if (!days.some((d) => !isBlank(d.mpg))) divisor(mpg);
   const daily = days.map((d) => {
     if (isBlank(d.serviceMiles)) throw new CalculationError(`Service Miles are missing for ${d.date}.`);
+    if (isBlank(d.pricePerGallon)) throw new CalculationError(`No fuel price configured for ${d.date}.`);
     const miles = D(d.serviceMiles);
     const m = divisor(d.mpg ?? mpg);
-    return { date: d.date, week: d.week, operator: d.operator ?? null, serviceMiles: miles, mpg: m, allowed: miles.div(m) };
+    const price = D(d.pricePerGallon);
+    const gallons = miles.div(m);
+    return { date: d.date, week: d.week, operator: d.operator ?? null, serviceMiles: miles, mpg: m, gallons, pricePerGallon: price, allowed: gallons.times(price) };
   });
   const mpgs = [...new Set(daily.map((d) => d.mpg.toString()))];
   const m = mpgs.length === 1 ? D(mpgs[0]) : isBlank(mpg) ? null : D(mpg);
   const serviceMiles = sum(daily.map((d) => d.serviceMiles));
   const weekMiles = [1, 2].map((n) => sum(daily.filter((d) => d.week === n).map((d) => d.serviceMiles)));
+  const gallons = sum(daily.map((d) => d.gallons));
+  const pricesUsed = [...new Set(daily.map((d) => d.pricePerGallon.toString()))];
   const maxAllowed = cents(sum(daily.map((d) => d.allowed)));
   const entered = !isBlank(actualExpense);
   const actual = entered ? cents(actualExpense) : null;
   if (actual && actual.isNegative()) throw new CalculationError('Actual fuel expense cannot be negative.');
   const overspend = entered ? max(actual.minus(maxAllowed), 0) : D(0);
-  const allowance = mpgs.length > 1
-    ? `${fmtNum(serviceMiles)} service miles ÷ each operator’s MPG (${mpgs.join(' / ')}) = ${fmtMoney(maxAllowed)} maximum`
-    : `${fmtNum(serviceMiles)} service miles ÷ ${fmtNum(mpgs[0] ?? mpg)} = ${fmtMoney(maxAllowed)} maximum`;
+  const allowance = `${fmtNum(serviceMiles)} service miles ÷ ${mpgs.length > 1 ? `each operator’s MPG (${mpgs.join(' / ')})` : `${fmtNum(mpgs[0] ?? mpg)} MPG`}`
+    + ` × fuel price per day (${pricesUsed.map((pr) => fmtRate(pr)).join(', ')}/gal) = ${fmtMoney(maxAllowed)} maximum`;
   return {
     enabled: true,
     mpg: mpgs.length > 1 ? null : m,
     mpgs,
     serviceMiles,
     weekMiles,
+    gallons,
+    pricesUsed,
     maxAllowed,
     actualExpense: actual,
     entered,
@@ -467,7 +478,7 @@ const serializeWeek = (w) => ({
   explanation: w.explanation,
 });
 
-// Full precision for miles and daily allowances; money at cents.
+// Full precision for miles, gallons, prices and daily allowances; money at cents.
 function serializeAllowance(a) {
   if (!a) return null;
   return {
@@ -476,11 +487,22 @@ function serializeAllowance(a) {
     mpgs: a.mpgs,
     serviceMiles: str(a.serviceMiles),
     weekMiles: a.weekMiles.map(str),
+    gallons: str(a.gallons),
+    pricesUsed: a.pricesUsed,
     maxAllowed: money(a.maxAllowed),
     actualExpense: a.actualExpense === null ? null : money(a.actualExpense),
     overspend: money(a.overspend),
     unused: a.unused === null ? null : money(a.unused),
-    days: a.days.map((d) => ({ date: d.date, week: d.week, operator: d.operator, serviceMiles: str(d.serviceMiles), mpg: str(d.mpg), allowed: str(d.allowed) })),
+    days: a.days.map((d) => ({
+      date: d.date,
+      week: d.week,
+      operator: d.operator,
+      serviceMiles: str(d.serviceMiles),
+      mpg: str(d.mpg),
+      gallons: str(d.gallons),
+      pricePerGallon: str(d.pricePerGallon),
+      allowed: str(d.allowed),
+    })),
   };
 }
 

@@ -1,5 +1,6 @@
-// Service mile fuel allowance end to end: service miles stored at import, maximum = miles ÷ MPG,
-// one actual-expense input, the overspend as the only fuel deduction, frozen on approval.
+// Service mile fuel allowance end to end: service miles stored at import, maximum = miles ÷ MPG ×
+// the plan's fuel price for each date, one actual-expense input, the overspend as the only fuel
+// deduction, frozen on approval.
 // Uses bigstar_vdp_test, dropped at the start of the run.
 import 'dotenv/config';
 import { test, before, after } from 'node:test';
@@ -93,7 +94,8 @@ test('service mile fuel allowance', { skip }, async (t) => {
   assert.ok(rows918.length > 0 && rows918.every((x) => x.serviceMiles !== null));
   assert.equal(rows918.find((x) => x.date === '2026-08-24').serviceMiles, '115.9');
 
-  const expectedMax = sum(rows918.map((x) => D(x.serviceMiles).div(19))).toDecimalPlaces(2).toFixed(2);
+  const price = (day) => (day <= '2026-08-31' ? '4.794' : '4.9249');
+  const expectedMax = sum(rows918.map((x) => D(x.serviceMiles).div(19).times(price(x.date)))).toDecimalPlaces(2).toFixed(2);
   const vdpOf = async () => {
     const { data: list } = await call('GET', `/vdps?cycleId=${cycleId}`);
     return (await call('GET', `/vdps/${list.find((v) => v.provider.name === 'Rimo Transit LLC')._id}`)).data;
@@ -101,15 +103,38 @@ test('service mile fuel allowance', { skip }, async (t) => {
   const codes = (v) => v.exceptions.map((e) => e.code).sort();
 
   let vdp;
-  await t.test('the allowance is calculated at once; the VDP waits for the actual expense', async () => {
+  await t.test('without fuel prices on the plan the VDP needs review', async () => {
     r = await call('POST', '/vdps/process', { cycleId });
     assert.equal(r.status, 200, JSON.stringify(r.data));
     vdp = await vdpOf();
+    assert.deepEqual(codes(vdp), ['FUEL_EXPENSE_MISSING', 'FUEL_PRICE_MISSING']);
+    assert.match(vdp.exceptions.find((e) => e.code === 'FUEL_PRICE_MISSING').message, /No fuel price configured for 08\/24\/2026.*Day Service \(fuel allowance\)/);
+    assert.equal(vdp.view.calculation, null);
+  });
+
+  await t.test('fuel prices are plan options, dated, and cannot overlap', async () => {
+    r = await call('PUT', `/vdp-plans/${plan._id}/fuel-prices`, { fuelPrices: [
+      { pricePerGallon: '4.794', effectiveFrom: '2026-08-01' },
+      { pricePerGallon: '4.9249', effectiveFrom: '2026-09-01' },
+    ] });
+    assert.equal(r.status, 400, 'the open-ended August price overlaps September');
+    assert.match(r.data.error, /overlap/);
+    r = await call('PUT', `/vdp-plans/${plan._id}/fuel-prices`, { fuelPrices: [
+      { pricePerGallon: '4.794', effectiveFrom: '2026-08-01', effectiveTo: '2026-08-31' },
+      { pricePerGallon: '4.9249', effectiveFrom: '2026-09-01' },
+    ] });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.deepEqual(r.data.fuelPrices.map((p) => [p.pricePerGallon, p.effectiveFrom]), [['4.9249', '2026-09-01'], ['4.794', '2026-08-01']]);
+  });
+
+  await t.test('the allowance is calculated at once; the VDP waits for the actual expense', async () => {
+    vdp = (await call('POST', `/vdps/${vdp._id}/recalculate`)).data;
     assert.deepEqual(codes(vdp), ['FUEL_EXPENSE_MISSING']);
     assert.equal(vdp.exceptions[0].message, 'Fuel expense has not been entered.');
     assert.equal(vdp.status, 'NEEDS_REVIEW');
     const a = vdp.view.calculation.fuelAllowance;
-    assert.equal(a.maxAllowed, expectedMax, 'service miles ÷ 19');
+    assert.equal(a.maxAllowed, expectedMax, 'each day: service miles ÷ 19 × that day’s price');
+    assert.deepEqual(a.pricesUsed, ['4.794', '4.9249'], 'the cycle crosses into September');
     assert.equal(a.serviceMiles, sum(rows918.map((x) => x.serviceMiles)).toString());
     assert.equal(D(a.weekMiles[0]).plus(a.weekMiles[1]).toString(), a.serviceMiles);
     assert.equal(vdp.view.calculation.fuelOverspend, '0.00');
@@ -161,13 +186,14 @@ test('service mile fuel allowance', { skip }, async (t) => {
     assert.equal(vdp.view.calculation.fuelAllowance.mpg, '19');
   });
 
-  await t.test('an approved VDP keeps its fuel figures when the MPG changes', async () => {
+  await t.test('an approved VDP keeps its fuel figures when the MPG and prices change', async () => {
     assert.equal((await call('POST', `/vdps/${vdp._id}/approve`)).status, 200);
     const frozen = (await call('GET', `/vdps/${vdp._id}`)).data.view;
     assert.equal(frozen.source, 'SNAPSHOT');
     assert.equal(frozen.fuelExpense.amount, D(expectedMax).plus('146.20').toFixed(2));
 
     await call('PUT', `/providers/${rimo._id}`, { overrides: { fuelMpg: '18' } });
+    assert.equal((await call('PUT', `/vdp-plans/${plan._id}/fuel-prices`, { fuelPrices: [{ pricePerGallon: '3.999', effectiveFrom: '2026-08-01' }] })).status, 200);
 
     const after = (await call('GET', `/vdps/${vdp._id}`)).data.view;
     assert.deepEqual(after.calculation.fuelAllowance, frozen.calculation.fuelAllowance);
