@@ -61,8 +61,8 @@ export async function cycleWorkbook(cycleId) {
     'Provider', 'Provider #', 'Operator', 'Route(s)', 'Plan', 'Status',
     'W1 Trips', 'W1 Hours', 'W1 %', 'W1 Rate', 'W1 Core', 'W1 Bonus', 'W1 Total',
     'W2 Trips', 'W2 Hours', 'W2 %', 'W2 Rate', 'W2 Core', 'W2 Bonus', 'W2 Total',
-    'Gross VDP', 'Lift Lease', 'Fares', 'Other Deductions', 'Fuel Reimbursement', 'Reimbursements', 'Other Income', 'Net VDP',
-    'Provider approval',
+    'Gross VDP', 'Lift Lease', 'Fares', 'Other Deductions', 'Fuel Overspend', 'Fuel Reimbursement', 'Reimbursements', 'Other Income', 'Net VDP',
+    'Provider approval', 'Service Miles', 'Fuel MPG', 'Max Allowed Fuel', 'Actual Fuel Expense',
   ];
   const h = ws.addRow(header);
   h.font = { bold: true };
@@ -81,9 +81,12 @@ export async function cycleWorkbook(cycleId) {
       e.provider.name, e.provider.providerNumber, e.provider.operatorName, (e.provider.routes || []).join(', '),
       e.planName, e.status,
       ...weekCols(0), ...weekCols(1),
-      num(e.calc?.gross), num(e.calc?.lease), num(e.calc?.fares), num(e.calc?.otherDeductions),
+      num(e.calc?.gross), num(e.calc?.lease), num(e.calc?.fares), num(e.calc?.otherDeductions), num(e.calc?.fuelOverspend),
       num(e.calc?.fuelReimbursement), num(e.calc?.reimbursements), num(e.calc?.otherIncome), num(e.calc?.net),
       e.approval,
+      ...(e.calc?.fuelAllowance
+        ? [num(e.calc.fuelAllowance.serviceMiles), num(e.calc.fuelAllowance.mpg), num(e.calc.fuelAllowance.maxAllowed), num(e.calc.fuelAllowance.actualExpense)]
+        : []),
     ]);
   });
 
@@ -92,15 +95,15 @@ export async function cycleWorkbook(cycleId) {
   if (entries.length) {
     const total = ws.addRow(['Total']);
     total.font = { bold: true };
-    for (let c = 21; c <= 28; c += 1) {
+    for (let c = 21; c <= 29; c += 1) {
       const col = ws.getColumn(c).letter;
       total.getCell(c).value = { formula: `SUM(${col}${first}:${col}${last})` };
     }
   }
-  [11, 12, 13, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28].forEach((c) => { ws.getColumn(c).numFmt = MONEY; });
+  [11, 12, 13, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 33, 34].forEach((c) => { ws.getColumn(c).numFmt = MONEY; });
   [10, 17].forEach((c) => { ws.getColumn(c).numFmt = '$0.00##'; });
   [9, 16].forEach((c) => { ws.getColumn(c).numFmt = '0.00%'; });
-  ws.columns.forEach((col, i) => { col.width = i < 5 || i === 28 ? 24 : 12; });
+  ws.columns.forEach((col, i) => { col.width = i < 5 || i === 29 ? 24 : 12; });
 
   const adj = wb.addWorksheet('Adjustments');
   adj.addRow(['Provider', 'Type', 'Direction', 'Amount', 'Description', 'Date', 'Entered by']).font = { bold: true };

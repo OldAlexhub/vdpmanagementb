@@ -26,9 +26,14 @@ const versionSchema = new Schema(
     incentiveTiers: { type: [tierSchema], default: [] },
     bonusEnabled: { type: Boolean, default: false },
     bonusRate: dec({ default: null }),
-    // Fuel reimbursement: trips × rate, added to the VDP after Gross. Off = nothing added.
-    fuelReimbursementEnabled: { type: Boolean, default: false },
+    // Fuel arrangement. NONE; PER_TRIP = trips × rate added after Gross; SERVICE_MILE_ALLOWANCE =
+    // service miles ÷ MPG (fuelMpg, e.g. 19) is the most fuel may cost ($), and only the actual
+    // expense above it is deducted. Versions saved before fuelMethod existed: see fuelMethodOf().
+    fuelMethod: { type: String, enum: ['NONE', 'PER_TRIP', 'SERVICE_MILE_ALLOWANCE', null], default: null },
+    fuelReimbursementEnabled: { type: Boolean, default: false }, // = fuelMethod PER_TRIP
     fuelReimbursementRate: dec({ default: null }), // $ per trip
+    fuelMpg: dec({ default: null }), // miles per gallon for SERVICE_MILE_ALLOWANCE
+    fuelMileageSource: { type: String, enum: ['SERVICE_MILES'], default: 'SERVICE_MILES' },
     performanceHourMetric: {
       type: String,
       enum: ['TOTAL_HOURS', 'SERVICE_HOURS', 'REVENUE_HOURS', 'OTHER'],

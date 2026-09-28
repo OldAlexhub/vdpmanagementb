@@ -3,10 +3,13 @@
 import PDFDocument from 'pdfkit';
 import { loadRegister } from './exportService.js';
 import { isoDate, localDate } from './cycleService.js';
-import { fmtMoney, fmtNum, fmtRate, sum, money } from './money.js';
+import { D, fmtMoney, fmtNum, fmtRate, sum, money } from './money.js';
 import { ISSUE_AREAS } from '../models/Vdp.js';
 import VdpCycle from '../models/VdpCycle.js';
 import Division from '../models/Division.js';
+
+// Register "Other" column: other deductions plus any fuel overspend (both are deductions).
+const otherOf = (c) => money(sum([c?.otherDeductions ?? 0, c?.fuelOverspend ?? 0]));
 
 const C = {
   navy: '#0f2a4a',
@@ -354,6 +357,7 @@ export async function statementPdf(m) {
     [perTrip ? 'Base rate' : 'Base rate', s?.basePay?.value ? `${fmtRate(s.basePay.value)}${perTrip ? ' / trip' : ' / h'}` : '—'],
     ['Bonus rate', s?.bonusEnabled?.value ? `${fmtRate(s.bonusRate.value)} / h above contract` : 'None'],
     ...(s?.fuelReimbursementEnabled?.value ? [['Fuel reimbursement', `${fmtRate(s.fuelReimbursementRate.value)} / trip`]] : []),
+    ...(s?.fuelMethod?.value === 'SERVICE_MILE_ALLOWANCE' ? [['Fuel', `Service mile allowance · ${fmtNum(s.fuelMpg.value)} MPG`]] : []),
   ], L, top, W - boxW - 16, 2);
   netBox(doc, calc, L + W - boxW, top - 2, boxW, 92);
   doc.y = Math.max(endY, top + 92) + 10;
@@ -406,9 +410,9 @@ export async function statementPdf(m) {
       { header: 'Lease', width: opW[3 + weeks.length], align: 'right' },
     ], ops.map((o) => ({
       cells: [
-        o.name,
+        o.plan ? `${o.name} (${o.plan.name})` : o.name,
         (o.routes || []).join(', ') || '—',
-        ...o.weeks.map((w) => (perTrip
+        ...o.weeks.map((w) => ((o.paymentType ? o.paymentType === 'PER_TRIP' : perTrip)
           ? `${fmtNum(w.trips)} trips · ${fmtMoney(w.weeklyEarnings)}`
           : `${fmtNum(w.actualHours)} h · ${pctText(w.performancePercentage)} · ${fmtMoney(w.weeklyEarnings)}`)),
         fmtMoney(o.earnings),
@@ -481,6 +485,32 @@ export async function statementPdf(m) {
       colors: [C.ink, C.text, C.muted, ADD.has(a.type) ? C.green : C.red],
       boldCols: [3],
     })));
+  }
+
+  // Service mile fuel allowance
+  const fa = calc.fuelAllowance;
+  if (fa) {
+    ensure(doc, 200);
+    sectionTitle(doc, 'Fuel allowance', 'Maximum allowed fuel = service miles ÷ MPG');
+    const entered = fa.actualExpense !== null;
+    const over = Number(calc.fuelOverspend) > 0;
+    stepsTable(doc, [
+      { label: 'Service miles', detail: `Week 1 ${fmtNum(fa.weekMiles[0])} + week 2 ${fmtNum(fa.weekMiles[1])}`, value: fmtNum(fa.serviceMiles), tone: 'info' },
+      { label: 'Fuel efficiency', detail: fa.mpg ? 'VDP plan' : 'Each operator’s VDP plan', value: `${fa.mpg ? fmtNum(fa.mpg) : fa.mpgs.join(' / ')} MPG`, tone: 'info' },
+      { label: 'Maximum allowed fuel', detail: fa.mpg ? `${fmtNum(fa.serviceMiles)} ÷ ${fmtNum(fa.mpg)}` : 'Each operator’s miles ÷ their MPG', value: fmtMoney(fa.maxAllowed), tone: 'subtotal' },
+      { label: 'Actual fuel expense', detail: '', value: entered ? fmtMoney(fa.actualExpense) : 'Not entered', tone: 'info' },
+      { label: 'Fuel overspend deduction', detail: over ? `${fmtMoney(fa.actualExpense)} − ${fmtMoney(fa.maxAllowed)}` : 'Within the allowance', value: over ? `–${fmtMoney(calc.fuelOverspend)}` : fmtMoney(0), tone: over ? 'minus' : 'total' },
+    ], L, W);
+    ensure(doc, 40 + fa.days.length * 15);
+    table(doc, [
+      { header: 'Date', width: W * 0.3 },
+      { header: 'Service miles', width: W * 0.25, align: 'right' },
+      { header: 'MPG', width: W * 0.2, align: 'right' },
+      { header: 'Allowed fuel', width: W * 0.25, align: 'right' },
+    ], fa.days.map((d) => ({
+      cells: [shortDate(d.date), fmtNum(d.serviceMiles), fmtNum(d.mpg), D(d.allowed).toFixed(4)],
+      labelBold: false,
+    })), { fontSize: 8, rowPad: 3 });
   }
 
   // Issues reported by the provider
@@ -605,7 +635,7 @@ export async function registerPdf(cycleId) {
         w(0) ? fmtNum(w(0).actualHours) : '—',
         w(1) ? fmtNum(w(1).actualHours) : '—',
         mny(c?.gross), c ? `–${fmtMoney(c.lease)}` : '—', c && c.fares !== '0.00' ? `–${fmtMoney(c.fares)}` : '—',
-        c && c.otherDeductions !== '0.00' ? `–${fmtMoney(c.otherDeductions)}` : '—',
+        c && otherOf(c) !== '0.00' ? `–${fmtMoney(otherOf(c))}` : '—',
         c && c.totalAdditions !== '0.00' ? `+${fmtMoney(c.totalAdditions)}` : '—',
         mny(c?.net),
         STATUS_LABEL[e.status] || e.status,
@@ -619,6 +649,10 @@ export async function registerPdf(cycleId) {
       boldCols: [9, 10],
     };
   });
+  const otherTotal = () => {
+    const v = money(sum(calcs.map(otherOf)));
+    return v === '0.00' ? '—' : `–${fmtMoney(v)}`;
+  };
   const total = (key, sign) => {
     const v = money(sum(calcs.map((c) => c[key])));
     return v === '0.00' ? '—' : `${sign}${fmtMoney(v)}`;
@@ -626,7 +660,7 @@ export async function registerPdf(cycleId) {
   rows.push({
     cells: [
       'Total', '', '', '',
-      total('gross', ''), total('lease', '–'), total('fares', '–'), total('otherDeductions', '–'), total('totalAdditions', '+'),
+      total('gross', ''), total('lease', '–'), total('fares', '–'), otherTotal(), total('totalAdditions', '+'),
       total('net', ''), '',
     ],
     style: 'total',

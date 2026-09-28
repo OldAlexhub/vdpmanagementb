@@ -103,6 +103,14 @@ const vdpSchema = new Schema(
     adjustments: { type: [adjustmentSchema], default: [] },
     leaseWeeksCharged: dec({ default: null }), // null = all weeks in the cycle
     leaseNote: String,
+    // Service mile fuel allowance: Accounting enters the actual fuel expense for the cycle; the
+    // engine deducts only what exceeds the allowance. An input, never itself a deduction.
+    fuelExpense: {
+      amount: dec({ default: null }),
+      note: String,
+      enteredBy: actorSchema,
+      enteredAt: Date,
+    },
     acknowledgements: { type: [acknowledgementSchema], default: [] },
 
     // Latest calculation (live until approval). Strings keep decimals exact.

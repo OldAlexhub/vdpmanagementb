@@ -93,6 +93,7 @@ api.post('/vdps/:id/recalculate', vdps.recalculate);
 api.post('/vdps/:id/adjustments', vdps.addAdjustment);
 api.delete('/vdps/:id/adjustments/:adjustmentId', vdps.removeAdjustment);
 api.patch('/vdps/:id/lease', vdps.setLease);
+api.patch('/vdps/:id/fuel-expense', vdps.setFuelExpense);
 api.post('/vdps/:id/acknowledge', vdps.acknowledge);
 api.post('/vdps/:id/approve', vdps.approve);
 api.post('/vdps/:id/reopen', vdps.reopen);

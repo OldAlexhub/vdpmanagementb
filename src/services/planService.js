@@ -4,6 +4,12 @@ import { D, isBlank, str } from './money.js';
 import { validateTiers } from './tiers.js';
 import { toDateOnly, addDays } from './cycleService.js';
 
+export const FUEL_METHODS = ['NONE', 'PER_TRIP', 'SERVICE_MILE_ALLOWANCE'];
+export const SERVICE_MILE_ALLOWANCE = 'SERVICE_MILE_ALLOWANCE';
+
+// Versions saved before fuelMethod existed only had the per-trip switch.
+export const fuelMethodOf = (v) => v?.fuelMethod || (v?.fuelReimbursementEnabled ? 'PER_TRIP' : 'NONE');
+
 export function validateVersion(v) {
   const errors = [];
   if (!['HOURLY', 'PER_TRIP'].includes(v.paymentType)) errors.push('Payment type must be Hourly or Per Trip.');
@@ -19,8 +25,13 @@ export function validateVersion(v) {
     if (v.paymentType !== 'HOURLY') errors.push('Bonus hours apply to hourly plans only.');
     if (isBlank(v.bonusRate) || D(v.bonusRate).lte(0)) errors.push('Bonus rate must be greater than zero.');
   }
-  if (v.fuelReimbursementEnabled && (isBlank(v.fuelReimbursementRate) || D(v.fuelReimbursementRate).lte(0))) {
+  const fuel = fuelMethodOf(v);
+  if (!FUEL_METHODS.includes(fuel)) errors.push('Choose a fuel method.');
+  if (fuel === 'PER_TRIP' && (isBlank(v.fuelReimbursementRate) || D(v.fuelReimbursementRate).lte(0))) {
     errors.push('Fuel reimbursement rate (per trip) must be greater than zero.');
+  }
+  if (fuel === SERVICE_MILE_ALLOWANCE && (isBlank(v.fuelMpg) || D(v.fuelMpg).lte(0))) {
+    errors.push('Fuel efficiency (MPG) must be greater than zero for the service mile allowance.');
   }
   if (v.incentiveEnabled) {
     if (isBlank(v.contractedHours) || D(v.contractedHours).lte(0)) {
@@ -99,8 +110,11 @@ export function resolveSettings(provider, plan, version) {
     bonusEnabled: { value: Boolean(version.bonusEnabled), source: 'PLAN' },
     bonusRate: pick(o.bonusRate, version.bonusRate),
     tuiEligible: { value: tuiEligible, source: tuiSource },
-    fuelReimbursementEnabled: { value: Boolean(version.fuelReimbursementEnabled), source: 'PLAN' },
-    fuelReimbursementRate: { value: version.fuelReimbursementEnabled ? str(version.fuelReimbursementRate) : null, source: 'PLAN' },
+    fuelMethod: { value: fuelMethodOf(version), source: 'PLAN' },
+    fuelReimbursementEnabled: { value: fuelMethodOf(version) === 'PER_TRIP', source: 'PLAN' },
+    fuelReimbursementRate: { value: fuelMethodOf(version) === 'PER_TRIP' ? str(version.fuelReimbursementRate) : null, source: 'PLAN' },
+    fuelMpg: fuelMethodOf(version) === SERVICE_MILE_ALLOWANCE ? pick(o.fuelMpg, version.fuelMpg) : { value: null, source: 'PLAN' },
+    fuelMileageSource: { value: fuelMethodOf(version) === SERVICE_MILE_ALLOWANCE ? version.fuelMileageSource || 'SERVICE_MILES' : null, source: 'PLAN' },
     incentiveTiers: {
       value: (version.incentiveTiers || []).map((t) => ({
         minimumPercentage: str(t.minimumPercentage),
@@ -125,4 +139,6 @@ export const engineSettings = (s) => ({
   bonusRate: s.bonusRate.value,
   fuelReimbursementEnabled: Boolean(s.fuelReimbursementEnabled?.value),
   fuelReimbursementRate: s.fuelReimbursementRate?.value ?? null,
+  fuelMethod: s.fuelMethod?.value || (s.fuelReimbursementEnabled?.value ? 'PER_TRIP' : 'NONE'),
+  fuelMpg: s.fuelMpg?.value ?? null,
 });

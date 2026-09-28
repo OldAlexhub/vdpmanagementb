@@ -67,6 +67,7 @@ export const addAdjustment = async (req, res) => respond(res, await svc.addAdjus
 export const removeAdjustment = async (req, res) =>
   respond(res, await svc.removeAdjustment(req.params.id, req.params.adjustmentId, req.user));
 export const setLease = async (req, res) => respond(res, await svc.setLeaseWeeks(req.params.id, req.body, req.user));
+export const setFuelExpense = async (req, res) => respond(res, await svc.setFuelExpense(req.params.id, req.body, req.user));
 export const acknowledge = async (req, res) => respond(res, await svc.acknowledge(req.params.id, req.body, req.user));
 export const approve = async (req, res) => respond(res, await svc.approve(req.params.id, req.user));
 export const reopen = async (req, res) => respond(res, await svc.reopen(req.params.id, req.body, req.user));

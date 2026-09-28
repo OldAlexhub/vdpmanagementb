@@ -38,6 +38,7 @@ function operatorInput(o, i) {
     status,
     contractedHours: hours,
     liftLease: leaseInput(o.liftLease, label),
+    planId: o.planId || null,
     notes: o.notes || undefined,
   };
 }
@@ -101,6 +102,14 @@ export async function applyInput(provider, body) {
       if (body.liftLease) provider.liftLease = leaseInput(body.liftLease, 'Lift lease');
     }
   }
+  // An operator's own plan must be a plan of the provider's division; the same plan as the provider = none.
+  const opPlans = [...new Set(provider.operators.map((o) => o.planId && String(o.planId)).filter(Boolean))];
+  for (const planId of opPlans) {
+    const plan = await VdpPlan.findById(planId);
+    if (!plan || String(plan.divisionId) !== String(body.divisionId ?? provider.divisionId)) {
+      throw badRequest('An operator’s VDP plan must belong to the provider’s division.');
+    }
+  }
   if (body.planId !== undefined) {
     if (!body.planId) provider.planId = null;
     else {
@@ -117,14 +126,18 @@ export async function applyInput(provider, body) {
     if (!['INHERIT', 'ON', 'OFF'].includes(tui)) throw badRequest('Invalid TUI eligibility.');
     const hours = decimalInput(o.contractedHours, 'Contracted hours override');
     if (hours !== null && Number(hours) <= 0) throw badRequest('Contracted hours override must be greater than zero.');
+    const mpg = decimalInput(o.fuelMpg, 'Fuel MPG override');
+    if (mpg !== null && Number(mpg) <= 0) throw badRequest('Fuel MPG override must be greater than zero.');
     provider.overrides = {
       contractedHours: hours,
       basePay: decimalInput(o.basePay, 'Base pay override'),
       bonusRate: decimalInput(o.bonusRate, 'Bonus rate override'),
       tuiEligibility: tui,
+      fuelMpg: mpg,
     };
   }
   if (body.contact) provider.contact = pick(body.contact, ['email', 'phone', 'address']);
+  provider.operators.forEach((o) => { if (o.planId && String(o.planId) === String(provider.planId)) o.planId = null; });
 }
 
 async function withPayment(provider) {
@@ -255,6 +268,7 @@ export async function transferOperator(req, res) {
     status: 'ACTIVE',
     contractedHours: op.contractedHours,
     liftLease: op.liftLease,
+    planId: op.planId && String(op.planId) !== String(target.planId) ? op.planId : null,
     notes: op.notes,
     startDate: effectiveDate,
     transferredFrom: { providerId: source._id, providerName: source.name, effectiveDate, note: text, by },

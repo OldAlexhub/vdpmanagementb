@@ -16,6 +16,8 @@ export function versionInput(body) {
       rate: decimalInput(t.rate, `Tier ${i + 1} rate`, { required: true }),
     }))
     .sort((a, b) => D(a.minimumPercentage).cmp(D(b.minimumPercentage)));
+  // Older clients and the bulk import send only the per-trip switch.
+  const fuelMethod = body.fuelMethod || (body.fuelReimbursementEnabled ? 'PER_TRIP' : 'NONE');
   const v = {
     paymentType: body.paymentType,
     basePay: decimalInput(body.basePay, 'Base pay', { required: true }),
@@ -24,8 +26,11 @@ export function versionInput(body) {
     incentiveTiers: tiers,
     bonusEnabled: Boolean(body.bonusEnabled),
     bonusRate: decimalInput(body.bonusRate, 'Bonus rate'),
-    fuelReimbursementEnabled: Boolean(body.fuelReimbursementEnabled),
-    fuelReimbursementRate: decimalInput(body.fuelReimbursementRate, 'Fuel reimbursement rate'),
+    fuelMethod,
+    fuelReimbursementEnabled: fuelMethod === 'PER_TRIP',
+    fuelReimbursementRate: fuelMethod === 'PER_TRIP' ? decimalInput(body.fuelReimbursementRate, 'Fuel reimbursement rate') : null,
+    fuelMpg: fuelMethod === 'SERVICE_MILE_ALLOWANCE' ? decimalInput(body.fuelMpg, 'Fuel efficiency (MPG)') : null,
+    fuelMileageSource: 'SERVICE_MILES',
     performanceHourMetric: body.performanceHourMetric || 'TOTAL_HOURS',
     performanceHourColumn: body.performanceHourMetric === 'OTHER' ? body.performanceHourColumn : null,
     effectiveFrom: body.effectiveFrom ? toDateOnly(body.effectiveFrom) : null,

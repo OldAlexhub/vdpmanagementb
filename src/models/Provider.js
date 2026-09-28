@@ -29,6 +29,8 @@ const operatorSchema = new Schema(
     status: { type: String, enum: ['ACTIVE', 'INACTIVE'], default: 'ACTIVE' },
     contractedHours: dec({ default: null }), // null = provider override, else plan
     liftLease: leaseSchema, // per operator (vehicle)
+    // A different VDP plan for this operator only; null = the provider's plan.
+    planId: { type: Schema.Types.ObjectId, ref: 'VdpPlan', default: null },
     notes: String,
     // Dates this operator works for this provider (YYYY-MM-DD, inclusive; null = open).
     // Set by a transfer between providers so report days before/after it go to the right one.
@@ -60,6 +62,7 @@ const providerSchema = new Schema(
       basePay: dec({ default: null }),
       bonusRate: dec({ default: null }),
       tuiEligibility: { type: String, enum: ['INHERIT', 'ON', 'OFF'], default: 'INHERIT' },
+      fuelMpg: dec({ default: null }), // only used when the plan's fuel method is the service mile allowance
     },
     contact: {
       email: String,

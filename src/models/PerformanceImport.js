@@ -12,6 +12,7 @@ const rowSchema = new Schema(
     totalHours: dec({ default: null }),
     serviceHours: dec({ default: null }),
     revenueHours: dec({ default: null }),
+    serviceMiles: dec({ default: null }), // Miles → Service; null = not in the report or blank
     otherHours: { type: Map, of: String, default: {} },
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } },

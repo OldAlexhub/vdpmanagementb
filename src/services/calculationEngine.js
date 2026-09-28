@@ -185,26 +185,97 @@ export function calculateLease(lease, weeksInCycle) {
 // Fuel reimbursement (plan option): every trip in the cycle × the plan's per-trip rate,
 // rounded once to the cent. Added after Gross — it is not earnings. Off = $0 and no line.
 export function calculateFuelReimbursement(settings, weekResults) {
-  if (!settings.fuelReimbursementEnabled) return { enabled: false, amount: D(0) };
-  if (isBlank(settings.fuelReimbursementRate) || D(settings.fuelReimbursementRate).lte(0)) {
-    throw new CalculationError('Fuel reimbursement is on, but the per-trip rate is missing.');
+  return fuelReimbursementFor([{ settings, trips: sum(weekResults.map((w) => w.trips)) }]);
+}
+
+// Operators on different plans: each plan's rate applies to its own operators' trips. Trips are
+// summed per rate and rounded once per rate, so operators on one plan round exactly as before.
+function fuelReimbursementFor(parts) {
+  const paid = parts.filter((p) => p.settings.fuelReimbursementEnabled);
+  if (!paid.length) return { enabled: false, amount: D(0) };
+  const byRate = new Map();
+  for (const p of paid) {
+    if (isBlank(p.settings.fuelReimbursementRate) || D(p.settings.fuelReimbursementRate).lte(0)) {
+      throw new CalculationError('Fuel reimbursement is on, but the per-trip rate is missing.');
+    }
+    const key = D(p.settings.fuelReimbursementRate).toString();
+    byRate.set(key, (byRate.get(key) || D(0)).plus(p.trips));
   }
-  const rate = D(settings.fuelReimbursementRate);
-  const trips = sum(weekResults.map((w) => w.trips));
-  const amount = cents(trips.times(rate));
+  const lines = [...byRate.entries()].map(([r, trips]) => ({ rate: D(r), trips, amount: cents(trips.times(D(r))) }));
+  const amount = sum(lines.map((l) => l.amount));
+  const trips = sum(lines.map((l) => l.trips));
+  const detail = lines.map((l) => `${fmtNum(l.trips)} trips × ${fmtRate(l.rate)}`).join(' + ');
   return {
     enabled: true,
     trips,
-    rate,
+    rate: lines.length === 1 ? lines[0].rate : null,
     amount,
-    explanation: `Fuel reimbursement: ${fmtNum(trips)} trips × ${fmtRate(rate)} = ${fmtMoney(amount)}`,
-    detail: `${fmtNum(trips)} trips × ${fmtRate(rate)}`,
+    explanation: `Fuel reimbursement: ${detail} = ${fmtMoney(amount)}`,
+    detail,
+  };
+}
+
+/**
+ * Service mile fuel allowance (plan option). Per service date:
+ *   allowed fuel ($) = service miles ÷ X   (X = the plan's fuel divisor, e.g. 19; provider may override)
+ * Daily values keep full precision; the sum is rounded once to cents (Maximum Allowed Fuel).
+ * Only the actual expense above the maximum is deducted — an unused allowance is not income.
+ * @param {object} input
+ * @param {string} input.mpg     the divisor X
+ * @param {Array}  input.days    [{ date, week, serviceMiles }] — one per service date (routes summed)
+ * @param {string|null} input.actualExpense  null = not entered yet (no deduction until it is)
+ */
+export function calculateFuelAllowance({ mpg, days, actualExpense }) {
+  const divisor = (value) => {
+    if (isBlank(value) || D(value).lte(0)) throw new CalculationError('Fuel MPG configuration is missing.');
+    return D(value);
+  };
+  if (!days.some((d) => !isBlank(d.mpg))) divisor(mpg);
+  const daily = days.map((d) => {
+    if (isBlank(d.serviceMiles)) throw new CalculationError(`Service Miles are missing for ${d.date}.`);
+    const miles = D(d.serviceMiles);
+    const m = divisor(d.mpg ?? mpg);
+    return { date: d.date, week: d.week, operator: d.operator ?? null, serviceMiles: miles, mpg: m, allowed: miles.div(m) };
+  });
+  const mpgs = [...new Set(daily.map((d) => d.mpg.toString()))];
+  const m = mpgs.length === 1 ? D(mpgs[0]) : isBlank(mpg) ? null : D(mpg);
+  const serviceMiles = sum(daily.map((d) => d.serviceMiles));
+  const weekMiles = [1, 2].map((n) => sum(daily.filter((d) => d.week === n).map((d) => d.serviceMiles)));
+  const maxAllowed = cents(sum(daily.map((d) => d.allowed)));
+  const entered = !isBlank(actualExpense);
+  const actual = entered ? cents(actualExpense) : null;
+  if (actual && actual.isNegative()) throw new CalculationError('Actual fuel expense cannot be negative.');
+  const overspend = entered ? max(actual.minus(maxAllowed), 0) : D(0);
+  const allowance = mpgs.length > 1
+    ? `${fmtNum(serviceMiles)} service miles ÷ each operator’s MPG (${mpgs.join(' / ')}) = ${fmtMoney(maxAllowed)} maximum`
+    : `${fmtNum(serviceMiles)} service miles ÷ ${fmtNum(mpgs[0] ?? mpg)} = ${fmtMoney(maxAllowed)} maximum`;
+  return {
+    enabled: true,
+    mpg: mpgs.length > 1 ? null : m,
+    mpgs,
+    serviceMiles,
+    weekMiles,
+    maxAllowed,
+    actualExpense: actual,
+    entered,
+    overspend,
+    unused: entered ? max(maxAllowed.minus(actual), 0) : null,
+    days: daily,
+    detail: entered
+      ? `${fmtMoney(actual)} actual − ${fmtMoney(maxAllowed)} allowed`
+      : 'Actual fuel expense not entered yet',
+    explanation: entered
+      ? `Fuel allowance: ${allowance}; actual ${fmtMoney(actual)} → overspend ${fmtMoney(overspend)}`
+      : `Fuel allowance: ${allowance}; actual fuel expense not entered`,
   };
 }
 
 // One operator: every week measured against this operator's own contract.
 function calculateOperator(settings, unit) {
-  const s = isBlank(unit.contractedHours) ? settings : { ...settings, contractedHours: unit.contractedHours };
+  // An operator on a different VDP plan than the provider brings that plan's settings.
+  const base = unit.settings || settings;
+  if (!PAYMENT_TYPES.includes(base.paymentType)) throw new CalculationError(`Unsupported payment type "${base.paymentType}".`);
+  const s = isBlank(unit.contractedHours) ? base : { ...base, contractedHours: unit.contractedHours };
   const weekFn = s.paymentType === 'HOURLY' ? calculateHourlyWeek : calculatePerTripWeek;
   const weeks = unit.weeks.map((w) => ({
     weekNumber: w.weekNumber,
@@ -218,6 +289,8 @@ function calculateOperator(settings, unit) {
   return {
     name: unit.name ?? null,
     routes: unit.routes || [],
+    plan: unit.plan ?? null,
+    settings: base,
     weeks,
     earnings: sum(weeks.map((w) => w.weeklyEarnings)),
     lease: calculateLease(unit.lease, unit.weeks.length),
@@ -226,13 +299,13 @@ function calculateOperator(settings, unit) {
 
 // Several operators: the provider's week is the sum of its operators' weeks.
 // Tier, rate and % stay per operator (they would be meaningless summed).
-function combineWeeks(ops, perTrip) {
+function combineWeeks(ops) {
   return ops[0].weeks.map((first, i) => {
     const parts = ops.map((o) => ({ o, w: o.weeks[i] }));
     const total = (k) => sum(parts.map(({ w }) => w[k] ?? 0));
     const contracted = parts.every(({ w }) => w.contractedHours === null) ? null : total('contractedHours');
     const weeklyEarnings = total('weeklyEarnings');
-    const line = ({ o, w }) => (perTrip
+    const line = ({ o, w }) => (o.settings.paymentType === 'PER_TRIP'
       ? `${fmtNum(w.trips)} trips × ${fmtRate(w.incentiveRate)}`
       : `${fmtNum(w.actualHours)} h of ${fmtNum(w.contractedHours)} (${w.performancePercentage.toFixed(1)}%) · ${w.tierLabel}`);
     return {
@@ -271,15 +344,16 @@ function combineWeeks(ops, perTrip) {
  * @param {Array}  input.weeks      single-operator shorthand: [{ weekNumber, start, end, trips, actualHours }]
  * @param {object} input.lease      single-operator shorthand: { amount, frequency, weeksCharged? }
  * @param {Array}  input.adjustments [{ type, amount, description }]
+ * @param {object} input.fuel       service mile allowance only: { days, actualExpense } (see calculateFuelAllowance)
  */
-export function calculateVdp({ settings, weeks, lease, operators, adjustments = [] }) {
+export function calculateVdp({ settings, weeks, lease, operators, adjustments = [], fuel: fuelInput }) {
   if (!PAYMENT_TYPES.includes(settings.paymentType)) {
     throw new CalculationError(`Unsupported payment type "${settings.paymentType}".`);
   }
   const units = operators?.length ? operators : [{ name: null, weeks, lease }];
   const ops = units.map((u) => calculateOperator(settings, u));
   const many = ops.length > 1;
-  const weekResults = many ? combineWeeks(ops, settings.paymentType === 'PER_TRIP') : ops[0].weeks;
+  const weekResults = many ? combineWeeks(ops) : ops[0].weeks;
 
   const gross = sum(weekResults.map((w) => w.weeklyEarnings));
   const leaseResult = many
@@ -289,7 +363,11 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
       explanation: ops.map((o) => `${o.name} — ${o.lease.explanation}`).join('; '),
     }
     : ops[0].lease;
-  const fuel = calculateFuelReimbursement(settings, weekResults);
+  const fuel = fuelReimbursementFor(ops.map((o) => ({ settings: o.settings, trips: sum(o.weeks.map((w) => w.trips)) })));
+  const allowance = ops.some((o) => o.settings.fuelMethod === 'SERVICE_MILE_ALLOWANCE')
+    ? calculateFuelAllowance({ mpg: settings.fuelMpg, days: fuelInput?.days || [], actualExpense: fuelInput?.actualExpense })
+    : null;
+  const fuelOverspend = allowance ? allowance.overspend : D(0);
 
   const groups = { fares: D(0), otherDeductions: D(0), reimbursements: D(0), otherIncome: D(0) };
   for (const adj of adjustments) {
@@ -300,7 +378,8 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
     groups[def.group] = groups[def.group].plus(amount);
   }
 
-  const totalDeductions = leaseResult.amount.plus(groups.fares).plus(groups.otherDeductions);
+  // The overspend is the only fuel deduction; the actual expense itself is never deducted.
+  const totalDeductions = leaseResult.amount.plus(groups.fares).plus(groups.otherDeductions).plus(fuelOverspend);
   const totalAdditions = fuel.amount.plus(groups.reimbursements).plus(groups.otherIncome);
   const net = gross.minus(totalDeductions).plus(totalAdditions);
 
@@ -309,6 +388,7 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
     `Gross VDP: ${weekResults.map((w) => fmtMoney(w.weeklyEarnings)).join(' + ')} = ${fmtMoney(gross)}`,
     leaseResult.explanation,
     ...(fuel.enabled ? [fuel.explanation] : []),
+    ...(allowance ? [allowance.explanation] : []),
     `Fares collected: ${fmtMoney(groups.fares)}`,
     `Other deductions: ${fmtMoney(groups.otherDeductions)}`,
     `Reimbursements: ${fmtMoney(groups.reimbursements)}`,
@@ -331,6 +411,11 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
   ];
   if (groups.fares.gt(0)) steps.push(step('Fares collected', entries('fares'), `−${fmtMoney(groups.fares)}`, 'minus'));
   if (groups.otherDeductions.gt(0)) steps.push(step('Other deductions', entries('otherDeductions'), `−${fmtMoney(groups.otherDeductions)}`, 'minus'));
+  if (allowance) {
+    steps.push(allowance.overspend.gt(0)
+      ? step('Fuel overspend', allowance.detail, `−${fmtMoney(allowance.overspend)}`, 'minus')
+      : step('Fuel overspend', allowance.entered ? `${allowance.detail} — within allowance` : allowance.detail, fmtMoney(0)));
+  }
   if (fuel.enabled) steps.push(step('Fuel reimbursement', fuel.detail, `+${fmtMoney(fuel.amount)}`, 'plus'));
   if (groups.reimbursements.gt(0)) steps.push(step('Reimbursements', entries('reimbursements'), `+${fmtMoney(groups.reimbursements)}`, 'plus'));
   if (groups.otherIncome.gt(0)) steps.push(step('Other income', entries('otherIncome'), `+${fmtMoney(groups.otherIncome)}`, 'plus'));
@@ -340,13 +425,16 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
     weeks: weekResults,
     gross,
     lease: leaseResult.amount,
-    operators: ops.map((o) => ({ name: o.name, routes: o.routes, weeks: o.weeks, earnings: o.earnings, lease: o.lease.amount, leaseDetail: o.lease.detail })),
+    operators: ops.map((o) => ({ name: o.name, routes: o.routes, plan: o.plan, paymentType: o.settings.paymentType, weeks: o.weeks, earnings: o.earnings, lease: o.lease.amount, leaseDetail: o.lease.detail })),
     leaseWeeksCharged: leaseResult.weeksCharged ?? null,
     fares: groups.fares,
     otherDeductions: groups.otherDeductions,
     fuelReimbursement: fuel.amount,
     fuelTrips: fuel.enabled ? fuel.trips : null,
     fuelReimbursementRate: fuel.enabled ? fuel.rate : null,
+    fuelReimbursementDetail: fuel.enabled ? fuel.detail : null,
+    fuelAllowance: allowance,
+    fuelOverspend,
     reimbursements: groups.reimbursements,
     otherIncome: groups.otherIncome,
     totalDeductions,
@@ -379,12 +467,31 @@ const serializeWeek = (w) => ({
   explanation: w.explanation,
 });
 
+// Full precision for miles and daily allowances; money at cents.
+function serializeAllowance(a) {
+  if (!a) return null;
+  return {
+    method: 'SERVICE_MILE_ALLOWANCE',
+    mpg: str(a.mpg),
+    mpgs: a.mpgs,
+    serviceMiles: str(a.serviceMiles),
+    weekMiles: a.weekMiles.map(str),
+    maxAllowed: money(a.maxAllowed),
+    actualExpense: a.actualExpense === null ? null : money(a.actualExpense),
+    overspend: money(a.overspend),
+    unused: a.unused === null ? null : money(a.unused),
+    days: a.days.map((d) => ({ date: d.date, week: d.week, operator: d.operator, serviceMiles: str(d.serviceMiles), mpg: str(d.mpg), allowed: str(d.allowed) })),
+  };
+}
+
 export function serializeResult(r) {
   return {
     weeks: r.weeks.map(serializeWeek),
     operators: (r.operators || []).map((o) => ({
       name: o.name,
       routes: o.routes,
+      plan: o.plan ?? null,
+      paymentType: o.paymentType,
       earnings: money(o.earnings),
       lease: money(o.lease),
       leaseDetail: o.leaseDetail,
@@ -398,6 +505,9 @@ export function serializeResult(r) {
     fuelReimbursement: money(r.fuelReimbursement),
     fuelTrips: str(r.fuelTrips),
     fuelReimbursementRate: str(r.fuelReimbursementRate),
+    fuelReimbursementDetail: r.fuelReimbursementDetail ?? null,
+    fuelAllowance: serializeAllowance(r.fuelAllowance),
+    fuelOverspend: money(r.fuelOverspend ?? 0),
     reimbursements: money(r.reimbursements),
     otherIncome: money(r.otherIncome),
     totalDeductions: money(r.totalDeductions),

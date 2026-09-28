@@ -5,7 +5,7 @@ import VdpPlan from '../models/VdpPlan.js';
 import VdpCycle from '../models/VdpCycle.js';
 import Division from '../models/Division.js';
 import { calculateVdp, serializeResult, CalculationError, ADJUSTMENT_TYPES } from './calculationEngine.js';
-import { resolveVersion, resolveSettings, engineSettings, validateVersion } from './planService.js';
+import { resolveVersion, resolveSettings, engineSettings, validateVersion, SERVICE_MILE_ALLOWANCE } from './planService.js';
 import { activeImportFor, matchRoutes, unresolvedRoutes } from './performanceService.js';
 import { hoursForMetric, HOUR_METRICS } from './performanceParser.js';
 import { weekOf, isoDate, endOfDayIn } from './cycleService.js';
@@ -15,6 +15,14 @@ import { badRequest, conflict, notFound, actor } from './errors.js';
 
 const EDITABLE = ['DRAFT', 'NEEDS_REVIEW', 'READY'];
 const ACKNOWLEDGEABLE = new Set(['NO_PERFORMANCE_DATA', 'PLAN_CHANGES_MID_CYCLE']);
+// Still calculated (so the fuel allowance is visible), but the VDP cannot be READY.
+const NON_BLOCKING = new Set(['NO_PERFORMANCE_DATA', 'PLAN_CHANGES_MID_CYCLE', 'FUEL_EXPENSE_MISSING']);
+const usDate = (day) => `${day.slice(5, 7)}/${day.slice(8, 10)}/${day.slice(0, 4)}`;
+const dateList = (days) => (days.length > 4 ? `${days.slice(0, 4).map(usDate).join(', ')} and ${days.length - 4} more` : days.map(usDate).join(', '));
+
+// The VDP uses the service mile fuel allowance (provider's plan, or any operator's own plan).
+const usesAllowance = (vdp) => vdp.settings?.fuelMethod?.value === SERVICE_MILE_ALLOWANCE
+  || (vdp.settings?.operatorPlans || []).some((o) => o.fuelMethod === SERVICE_MILE_ALLOWANCE);
 
 const exception = (code, message) => ({ code, message, acknowledgeable: ACKNOWLEDGEABLE.has(code) });
 
@@ -39,13 +47,27 @@ const weekTotals = (days, cycle) => [1, 2].map((n) => {
     days: rows.length,
     trips: sum(rows.map((d) => d.trips)).toString(),
     actualHours: sum(rows.map((d) => d.hours ?? 0)).toString(),
+    serviceMiles: rows.some((d) => d.serviceMiles === null) ? null : sum(rows.map((d) => d.serviceMiles)).toString(),
   };
 });
+
+// Service miles per service date (routes summed) for the fuel allowance. null = missing that day.
+function fuelDays(days) {
+  const byDate = new Map();
+  for (const d of days) {
+    const e = byDate.get(d.date) || { date: d.date, week: d.week, miles: [], missing: false };
+    if (d.serviceMiles === null) e.missing = true; else e.miles.push(d.serviceMiles);
+    byDate.set(d.date, e);
+  }
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date))
+    .map((e) => ({ date: e.date, week: e.week, serviceMiles: e.missing ? null : sum(e.miles).toString() }));
+}
+
 
 // Gather this provider's report rows and total them by week — overall and per operator.
 // A route matched to the provider but on none of its operators is reported, not guessed
 // (unless the provider has a single operator, who then runs every route).
-function providerPerformance({ provider, cycle, importDoc, matches, metric, otherColumn }) {
+function providerPerformance({ provider, cycle, importDoc, matches, metric, otherColumn, metricOf = () => null }) {
   const me = String(provider._id);
   // A route split between providers by an operator transfer: only this provider's dates.
   const mine = new Map();
@@ -64,14 +86,20 @@ function providerPerformance({ provider, cycle, importDoc, matches, metric, othe
   const days = importDoc.rows
     .filter((r) => mine.has(r.route))
     .filter((r) => { const part = mine.get(r.route); return !part || (r.date >= part.from && r.date <= part.to); })
-    .map((r) => ({
-      date: r.date,
-      route: r.route,
-      operatorId: operatorFor(r.route, r.date),
-      week: weekOf(r.date, cycle),
-      trips: str(r.trips) ?? '0',
-      hours: str(hoursForMetric(r, metric, otherColumn)),
-    }))
+    .map((r) => {
+      const operatorId = operatorFor(r.route, r.date);
+      // An operator on another plan counts the hours column that plan pays on.
+      const m = metricOf(operatorId) || { metric, otherColumn };
+      return {
+        date: r.date,
+        route: r.route,
+        operatorId,
+        week: weekOf(r.date, cycle),
+        trips: str(r.trips) ?? '0',
+        hours: str(hoursForMetric(r, m.metric, m.otherColumn)),
+        serviceMiles: str(r.serviceMiles),
+      };
+    })
     .filter((d) => d.week);
   const operators = ops.map((o) => {
     const own = days.filter((d) => d.operatorId === o.id);
@@ -130,13 +158,75 @@ export async function computeVdp(vdp, preloaded = {}) {
           exceptions.push(exception('TUI_WITHOUT_TIERS',
             `TUI is switched on for ${provider.name}, but plan "${plan.name}" has no incentive tiers.`));
         }
-        const noContract = activeOperators(provider, cycle).filter((o) => isBlank(o.contractedHours))
-          .filter(() => isBlank(s.contractedHours) || D(s.contractedHours).lte(0));
-        if (s.paymentType === 'HOURLY' && noContract.length) {
-          exceptions.push(exception('MISSING_CONTRACTED_HOURS', `Contracted hours are missing for ${provider.name}${noContract.length < activeOperators(provider, cycle).length ? ` (operator ${noContract.map((o) => o.name).join(', ')})` : ''}.`));
-        }
       }
     }
+  }
+
+  // Operators on their own VDP plan are paid under that plan. Provider overrides adjust the
+  // provider's plan only — they do not carry over to a plan an operator was explicitly put on.
+  const opPlan = new Map(); // operatorId → { settings, plan, version, own }
+  if (settings) {
+    for (const o of activeOperators(provider, cycle)) {
+      if (!o.planId || o.planId === String(provider.planId)) {
+        opPlan.set(o.id, { settings, plan, version, own: false });
+        continue;
+      }
+      const p = preloaded.plans?.get(o.planId) || (await VdpPlan.findById(o.planId));
+      if (!p) {
+        exceptions.push(exception('NO_PLAN', `The VDP plan assigned to operator ${o.name} no longer exists. Choose another on the provider profile.`));
+        continue;
+      }
+      const res = resolveVersion(p, cycle);
+      if (!res.version) {
+        exceptions.push(exception('PLAN_NOT_EFFECTIVE', `Plan "${p.name}" (operator ${o.name}) has no version effective on ${isoDate(cycle.cycleStart)}. Add or extend a plan version.`));
+        continue;
+      }
+      if (res.changesMidCycle) {
+        exceptions.push(exception('PLAN_CHANGES_MID_CYCLE',
+          `Plan "${p.name}" (operator ${o.name}) changes rates inside this cycle. Version ${res.version.versionNumber} (effective on the cycle start) was used.`));
+      }
+      const errs = validateVersion(res.version);
+      if (errs.length) {
+        exceptions.push(exception(errs.some((e) => /tier/i.test(e)) ? 'INVALID_INCENTIVE_TIERS' : 'INVALID_PLAN',
+          `Plan "${p.name}" v${res.version.versionNumber} (operator ${o.name}) is not valid: ${errs.join(' ')}`));
+      }
+      const own = resolveSettings({ overrides: {} }, p, res.version);
+      if (own.tuiEligible.value && !own.incentiveTiers.value.length) {
+        exceptions.push(exception('TUI_WITHOUT_TIERS', `Plan "${p.name}" (operator ${o.name}) has TUI on but no incentive tiers.`));
+      }
+      opPlan.set(o.id, { settings: own, plan: p, version: res.version, own: true });
+    }
+    const noContract = activeOperators(provider, cycle).filter((o) => opPlan.has(o.id)).filter((o) => {
+      const s = engineSettings(opPlan.get(o.id).settings);
+      return s.paymentType === 'HOURLY' && isBlank(o.contractedHours) && (isBlank(s.contractedHours) || D(s.contractedHours).lte(0));
+    });
+    if (noContract.length) {
+      exceptions.push(exception('MISSING_CONTRACTED_HOURS', `Contracted hours are missing for ${provider.name}${noContract.length < activeOperators(provider, cycle).length ? ` (operator ${noContract.map((o) => o.name).join(', ')})` : ''}.`));
+    }
+  }
+  const mixedPlans = [...opPlan.values()].some((x) => x.own);
+  const settingsOf = (operatorId) => opPlan.get(operatorId)?.settings || settings;
+  if (mixedPlans) {
+    // Shown on the VDP and frozen with it: which plan each operator was paid under.
+    settings = {
+      ...settings,
+      operatorPlans: activeOperators(provider, cycle).filter((o) => opPlan.has(o.id)).map((o) => {
+        const x = opPlan.get(o.id);
+        return {
+          operatorId: o.id,
+          name: o.name,
+          planId: x.plan._id,
+          planName: x.plan.name,
+          versionNumber: x.version.versionNumber,
+          source: x.own ? 'OPERATOR' : 'PROVIDER',
+          paymentType: x.settings.paymentType.value,
+          basePay: x.settings.basePay.value,
+          fuelMethod: x.settings.fuelMethod.value,
+          fuelMpg: x.settings.fuelMpg.value,
+          performanceHourMetric: x.settings.performanceHourMetric.value,
+        };
+      }),
+    };
   }
 
   for (const o of activeOperators(provider, cycle)) {
@@ -155,15 +245,19 @@ export async function computeVdp(vdp, preloaded = {}) {
   } else if (settings) {
     const metric = settings.performanceHourMetric.value;
     const otherColumn = settings.performanceHourColumn.value;
-    const available = metric === 'OTHER'
-      ? (importDoc.detectedColumns?.otherHourColumns || []).includes(otherColumn)
-      : importDoc.detectedColumns?.[metric];
-    if (!available) {
-      exceptions.push(exception('METRIC_NOT_IN_REPORT',
-        `The plan pays on "${HOUR_METRICS[metric]?.label || otherColumn}", which is not in the uploaded report.`));
+    const metricOf = (operatorId) => {
+      const x = settingsOf(operatorId);
+      return { metric: x.performanceHourMetric.value, otherColumn: x.performanceHourColumn.value };
+    };
+    const inPlay = [{ metric, otherColumn }, ...[...opPlan.keys()].map(metricOf)];
+    const missingMetrics = new Set(inPlay.filter((m) => !(m.metric === 'OTHER'
+      ? (importDoc.detectedColumns?.otherHourColumns || []).includes(m.otherColumn)
+      : importDoc.detectedColumns?.[m.metric])).map((m) => HOUR_METRICS[m.metric]?.label || m.otherColumn));
+    for (const label of missingMetrics) {
+      exceptions.push(exception('METRIC_NOT_IN_REPORT', `The plan pays on "${label}", which is not in the uploaded report.`));
     }
     const matches = preloaded.matches || matchRoutes(importDoc, await Provider.find({ divisionId: provider.divisionId }));
-    performance = providerPerformance({ provider, cycle, importDoc, matches, metric, otherColumn });
+    performance = providerPerformance({ provider, cycle, importDoc, matches, metric, otherColumn, metricOf: mixedPlans ? metricOf : undefined });
     if (performance.unassignedRoutes.length) {
       exceptions.push(exception('ROUTE_WITHOUT_OPERATOR',
         `Route ${performance.unassignedRoutes.join(', ')} is matched to ${provider.name} but not to any of its operators. Add it to an operator on the provider profile.`));
@@ -175,8 +269,35 @@ export async function computeVdp(vdp, preloaded = {}) {
     }
   }
 
+  // Service mile fuel allowance: service miles and the divisor are needed to calculate;
+  // the actual expense is needed before the VDP can be READY.
+  let fuel = null;
+  const allowanceOps = activeOperators(provider, cycle).filter((o) => settingsOf(o.id)?.fuelMethod?.value === SERVICE_MILE_ALLOWANCE);
+  if (settings && (mixedPlans ? allowanceOps.length > 0 : settings.fuelMethod?.value === SERVICE_MILE_ALLOWANCE)) {
+    const mpgs = mixedPlans ? allowanceOps.map((o) => settingsOf(o.id).fuelMpg?.value) : [settings.fuelMpg?.value];
+    if (mpgs.some((m) => isBlank(m) || D(m).lte(0))) exceptions.push(exception('FUEL_MPG_MISSING', 'Fuel MPG configuration is missing.'));
+    if (performance) {
+      const days = mixedPlans
+        ? allowanceOps.flatMap((o) => fuelDays(performance.days.filter((d) => d.operatorId === o.id))
+          .map((d) => ({ ...d, mpg: settingsOf(o.id).fuelMpg?.value ?? null, operator: o.name })))
+        : fuelDays(performance.days);
+      if (importDoc && !importDoc.detectedColumns?.SERVICE_MILES) {
+        exceptions.push(exception('SERVICE_MILES_MISSING',
+          'Service Miles required for fuel calculation are missing. The uploaded Performance Report has no Miles → Service column — if it was uploaded before Service Miles were captured, upload it again.'));
+      } else {
+        const missing = days.filter((d) => d.serviceMiles === null).map((d) => d.date);
+        if (missing.length) {
+          exceptions.push(exception('SERVICE_MILES_MISSING', `Service Miles are missing from the Performance Report for ${dateList(missing)}.`));
+        }
+      }
+      const amount = str(vdp.fuelExpense?.amount);
+      if (amount === null) exceptions.push(exception('FUEL_EXPENSE_MISSING', 'Fuel expense has not been entered.'));
+      fuel = { days, actualExpense: amount };
+    }
+  }
+
   let calculation = null;
-  const blocking = exceptions.filter((e) => !['NO_PERFORMANCE_DATA', 'PLAN_CHANGES_MID_CYCLE'].includes(e.code));
+  const blocking = exceptions.filter((e) => !NON_BLOCKING.has(e.code));
   if (settings && performance && blocking.length === 0) {
     try {
       calculation = serializeResult(calculateVdp({
@@ -184,12 +305,17 @@ export async function computeVdp(vdp, preloaded = {}) {
         operators: performance.operators.map((o) => ({
           name: o.name,
           routes: o.routes,
+          ...(opPlan.get(o.id)?.own ? {
+            settings: engineSettings(opPlan.get(o.id).settings),
+            plan: { id: String(opPlan.get(o.id).plan._id), name: opPlan.get(o.id).plan.name, versionNumber: opPlan.get(o.id).version.versionNumber },
+          } : {}),
           contractedHours: o.contractedHours,
           weeks: o.weeks,
           // A reviewer's weeks-charged wins; otherwise a transfer inside the cycle limits the weeks.
           lease: { ...o.liftLease, weeksCharged: str(vdp.leaseWeeksCharged) ?? o.leaseWeeks },
         })),
         adjustments: vdp.adjustments.map((a) => ({ type: a.type, amount: str(a.amount) })),
+        fuel,
       }));
     } catch (err) {
       if (!(err instanceof CalculationError)) throw err;
@@ -282,6 +408,10 @@ export async function recalculate(id, user) {
 export async function addAdjustment(id, input, user) {
   const vdp = await loadEditable(id);
   if (!ADJUSTMENT_TYPES[input.type]) throw badRequest('Choose an adjustment type.');
+  if (input.type === 'FUEL' && usesAllowance(vdp)) {
+    // Would deduct fuel twice: the overspend is already calculated from the actual expense.
+    throw badRequest('Fuel on this plan is calculated from service miles. Enter the actual fuel expense instead — any overspend is deducted automatically.');
+  }
   if (isBlank(input.amount) || !/^\d+(\.\d+)?$/.test(String(input.amount).trim()) || D(input.amount).lte(0)) {
     throw badRequest('Enter a positive amount. The type decides whether it is deducted or added.');
   }
@@ -304,6 +434,24 @@ export async function removeAdjustment(id, adjustmentId, user) {
   const text = `${ADJUSTMENT_TYPES[adj.type].label} $${D(adj.amount).toFixed(2)}`;
   adj.deleteOne();
   return recalcAndSave(vdp, user, 'ADJUSTMENT_REMOVED', text);
+}
+
+// Service mile allowance: the one number Accounting enters. Blank clears it.
+export async function setFuelExpense(id, { amount, note }, user) {
+  const vdp = await loadEditable(id);
+  if (!usesAllowance(vdp)) {
+    throw badRequest('This VDP’s plan does not use the service mile fuel allowance.');
+  }
+  const text = String(amount ?? '').trim().replace(/[$,]/g, '');
+  if (text === '') {
+    vdp.fuelExpense = { amount: null, note: undefined, enteredBy: actor(user), enteredAt: new Date() };
+    return recalcAndSave(vdp, user, 'FUEL_EXPENSE_SET', 'Actual fuel expense cleared');
+  }
+  if (!/^\d+(\.\d{1,2})?$/.test(text)) throw badRequest('Enter the actual fuel expense in dollars and cents, e.g. 507.89.');
+  const before = str(vdp.fuelExpense?.amount);
+  vdp.fuelExpense = { amount: text, note: String(note || '').trim() || undefined, enteredBy: actor(user), enteredAt: new Date() };
+  return recalcAndSave(vdp, user, 'FUEL_EXPENSE_SET',
+    `Actual fuel expense ${before === null ? '' : `changed from $${D(before).toFixed(2)} `}set to $${D(text).toFixed(2)}${note ? ` — ${note}` : ''}`);
 }
 
 export async function setLeaseWeeks(id, { weeksCharged, note }, user) {
@@ -384,6 +532,8 @@ async function buildSnapshot(vdp, c, user) {
       type: a.type, amount: str(a.amount), description: a.description, date: a.date, createdBy: a.createdBy, createdAt: a.createdAt,
     })),
     acknowledgements: vdp.acknowledgements,
+    fuelExpense: vdp.fuelExpense?.amount == null ? null
+      : { amount: str(vdp.fuelExpense.amount), note: vdp.fuelExpense.note, enteredBy: vdp.fuelExpense.enteredBy, enteredAt: vdp.fuelExpense.enteredAt },
     calculation: c.calculation,
     gross: c.calculation.gross,
     net: c.calculation.net,
@@ -641,6 +791,7 @@ export async function vdpView(vdp) {
       lease: provider ? leaseView(provider, vdp, cycle) : null,
       performance: vdp.performance,
       adjustments: json.adjustments,
+      fuelExpense: json.fuelExpense?.amount == null ? null : json.fuelExpense,
       calculation: vdp.calculation,
       gross: vdp.calculation?.gross ?? null,
       net: vdp.calculation?.net ?? null,

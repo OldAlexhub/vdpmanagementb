@@ -114,6 +114,11 @@ function detectColumns(grid) {
       : find((h) => h === 'revenue hours'),
   };
   if (cols.totalHours === -1) cols.totalHours = findLast((h) => h === 'total hours');
+  // Service miles = "Service" under the Miles group (not "Service" under Hours). Merged header
+  // cells repeat across columns, so the first matching column is the source.
+  cols.serviceMiles = groups.length
+    ? find((h, c) => (h === 'service' || h === 'service miles') && groupOf(c) === 'miles')
+    : find((h) => h === 'service miles');
 
   const other = {};
   header.forEach((h, c) => {
@@ -183,11 +188,20 @@ export function parsePerformanceGrid(grid, { from, to } = {}) {
       return r.value;
     };
     const key = `${date}|${route}`;
-    const entry = agg.get(key) || { date, route, trips: [], totalHours: [], serviceHours: [], revenueHours: [], otherHours: {} };
+    const entry = agg.get(key) || { date, route, trips: [], totalHours: [], serviceHours: [], revenueHours: [], serviceMiles: [], milesMissing: false, otherHours: {} };
     entry.trips.push(num(cols.trips, 'Total Prov'));
     for (const f of ['totalHours', 'serviceHours', 'revenueHours']) {
       const v = num(cols[f], f);
       if (v !== null) entry[f].push(v);
+    }
+    if (cols.serviceMiles >= 0) {
+      // A blank or unreadable mileage is missing, never a silent zero (it would shrink the fuel allowance).
+      const raw = row[cols.serviceMiles];
+      const r = parseNumber(raw);
+      if (raw === null || raw === undefined || String(raw).trim() === '' || !r.ok) {
+        entry.milesMissing = true;
+        warnings.push(`Row ${i + 1}: Service Miles is ${r.ok ? 'blank' : `"${raw}" (not a number)`} for route ${route} on ${date} — marked missing.`);
+      } else entry.serviceMiles.push(r.value);
     }
     for (const [name, col] of Object.entries(other)) {
       const v = parseNumber(row[col]);
@@ -205,6 +219,7 @@ export function parsePerformanceGrid(grid, { from, to } = {}) {
       totalHours: e.totalHours.length ? sum(e.totalHours).toString() : null,
       serviceHours: e.serviceHours.length ? sum(e.serviceHours).toString() : null,
       revenueHours: e.revenueHours.length ? sum(e.revenueHours).toString() : null,
+      serviceMiles: e.milesMissing || !e.serviceMiles.length ? null : sum(e.serviceMiles).toString(),
       otherHours: Object.fromEntries(Object.entries(e.otherHours).map(([k, v]) => [k, sum(v).toString()])),
     }));
 
@@ -215,6 +230,7 @@ export function parsePerformanceGrid(grid, { from, to } = {}) {
     TOTAL_HOURS: cols.totalHours >= 0,
     SERVICE_HOURS: cols.serviceHours >= 0,
     REVENUE_HOURS: cols.revenueHours >= 0,
+    SERVICE_MILES: cols.serviceMiles >= 0,
     otherHourColumns: Object.keys(other),
   };
 
