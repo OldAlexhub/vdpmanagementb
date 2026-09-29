@@ -27,7 +27,7 @@ Settings are read from `server/.env`, which is git-ignored.
 | `JWT_SECRET` | dev-only value | Signs session cookies. **Required in production** |
 | `PORT` | `5000` | API port |
 | `NODE_ENV` | — | `production` requires `JWT_SECRET` and sends the session cookie over HTTPS only |
-| `CLIENT_ORIGIN` | `http://localhost:3000` | Client address(es) allowed by CORS, comma-separated, e.g. `http://localhost:3000,https://vdp.example.com` |
+| `CLIENT_ORIGIN` | Built-in localhost and production origins | Additional client address(es) allowed by CORS, comma-separated, e.g. `https://admin.example.com,https://vdp.example.com` |
 | `COOKIE_SAME_SITE` | `lax` | Set to `none` when the client is hosted on a different site than the API. This also makes the cookie HTTPS-only |
 
 When the client is served by this API (same origin), the defaults are enough.

@@ -10,11 +10,22 @@ import { errorHandler, notFoundHandler } from './middleware/errors.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
+const defaultClientOrigins = [
+  'http://localhost:3000',
+  'https://vdpmanagementf.onrender.com',
+];
+
+function clientOrigins() {
+  const configured = (process.env.CLIENT_ORIGIN || '').split(',');
+  return [...new Set([...defaultClientOrigins, ...configured]
+    .map((origin) => origin.trim().replace(/\/+$/, ''))
+    .filter(Boolean))];
+}
+
 export function createApp() {
   const app = express();
   app.use(helmet({ contentSecurityPolicy: false }));
-  const origins = (process.env.CLIENT_ORIGIN || 'http://localhost:3000').split(',').map((o) => o.trim().replace(/\/+$/, '')).filter(Boolean);
-  app.use(cors({ origin: origins, credentials: true }));
+  app.use(cors({ origin: clientOrigins(), credentials: true }));
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser());
 
