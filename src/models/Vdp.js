@@ -31,8 +31,40 @@ const adjustmentSchema = new Schema(
     amount: dec({ required: true }), // positive; the type sets the direction
     description: String,
     date: { type: Date, default: Date.now },
+    // Uber toll pass-throughs are provider-level adjustments financially, but
+    // retain the provider-profile operator and week for audit/reporting.
+    operatorId: { type: Schema.Types.ObjectId, default: null },
+    operatorName: { type: String, default: null },
+    week: { type: String, default: null },
+    // Uber tolls can either reimburse the provider or bill the provider.
+    // Null preserves the original Uber behavior (credit) for existing records.
+    tollDirection: { type: String, enum: ['CREDIT', 'DEDUCTION'], default: null },
     createdBy: actorSchema,
     createdAt: { type: Date, default: Date.now },
+  },
+  { toJSON: { getters: true, versionKey: false }, toObject: { getters: true } },
+);
+
+const uberPassThroughSchema = new Schema(
+  {
+    type: { type: String, required: true, trim: true, uppercase: true },
+    amount: dec({ required: true }),
+    description: String,
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
+const uberWeeklyAdjustmentSchema = new Schema(
+  {
+    // calculationUnitId is used for shared vehicles. driverUuid is retained for
+    // existing per-driver adjustments and independent operators.
+    calculationUnitId: { type: String, default: null, trim: true, lowercase: true },
+    driverUuid: { type: String, default: null, trim: true, lowercase: true },
+    week: { type: String, required: true },
+    approvedExtraHours: dec({ default: null }), // null = use the plan version default
+    passThroughs: { type: [uberPassThroughSchema], default: [] },
+    updatedBy: actorSchema,
+    updatedAt: { type: Date, default: Date.now },
   },
   { toJSON: { getters: true, versionKey: false }, toObject: { getters: true } },
 );
@@ -97,10 +129,12 @@ const vdpSchema = new Schema(
     planId: { type: Schema.Types.ObjectId, ref: 'VdpPlan', default: null },
     planVersionId: { type: Schema.Types.ObjectId, default: null },
     performanceImportId: { type: Schema.Types.ObjectId, ref: 'PerformanceImport', default: null },
+    uberPerformanceImportIds: { type: [{ type: Schema.Types.ObjectId, ref: 'PerformanceImport' }], default: [] },
     status: { type: String, enum: VDP_STATUSES, default: 'DRAFT' },
 
     // Reviewer choices that are inputs, not results.
     adjustments: { type: [adjustmentSchema], default: [] },
+    uberWeeklyAdjustments: { type: [uberWeeklyAdjustmentSchema], default: [] },
     leaseWeeksCharged: dec({ default: null }), // null = all weeks in the cycle
     leaseNote: String,
     // Service mile fuel allowance: Accounting enters the actual fuel expense for the cycle; the

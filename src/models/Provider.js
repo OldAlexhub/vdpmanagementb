@@ -27,7 +27,11 @@ const operatorSchema = new Schema(
     name: { type: String, required: true, trim: true },
     routes: { type: [String], default: [] }, // run/route numbers as they appear on the Performance Report
     status: { type: String, enum: ['ACTIVE', 'INACTIVE'], default: 'ACTIVE' },
-    contractedHours: dec({ default: null }), // null = provider override, else plan
+    // Operators with the same non-blank unit share one Uber compensation contract
+    // and one vehicle lease. Blank keeps the operator as an independent pay unit.
+    vehicleUnit: { type: String, trim: true, default: null },
+    basePay: dec({ default: null }), // optional Uber override of the provider profile's base rate
+    contractedHours: dec({ default: null }), // required on the operator profile for Uber; standard plans may inherit
     liftLease: leaseSchema, // per operator (vehicle)
     // A different VDP plan for this operator only; null = the provider's plan.
     planId: { type: Schema.Types.ObjectId, ref: 'VdpPlan', default: null },

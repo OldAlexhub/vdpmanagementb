@@ -1,7 +1,7 @@
 import VdpPlan from '../models/VdpPlan.js';
 import Division from '../models/Division.js';
 import Provider from '../models/Provider.js';
-import { validateVersion, closePreviousVersion, currentVersion } from '../services/planService.js';
+import { validateVersion, closePreviousVersion, currentVersion, DEFAULT_UBER_CONFIG } from '../services/planService.js';
 import { vdpUsesVersion, markStale } from '../services/vdpService.js';
 import { toDateOnly } from '../services/cycleService.js';
 import { D } from '../services/money.js';
@@ -9,6 +9,7 @@ import { badRequest, conflict, notFound, actor } from '../services/errors.js';
 import { decimalInput } from './validate.js';
 
 export function versionInput(body) {
+  const calculationType = body.calculationType || 'STANDARD';
   const tiers = (body.incentiveTiers || [])
     .map((t, i) => ({
       minimumPercentage: decimalInput(t.minimumPercentage, `Tier ${i + 1} minimum %`, { required: true }),
@@ -18,21 +19,50 @@ export function versionInput(body) {
     .sort((a, b) => D(a.minimumPercentage).cmp(D(b.minimumPercentage)));
   // Older clients and the bulk import send only the per-trip switch.
   const fuelMethod = body.fuelMethod || (body.fuelReimbursementEnabled ? 'PER_TRIP' : 'NONE');
+  const uberSource = calculationType === 'UBER' ? { ...DEFAULT_UBER_CONFIG, ...(body.uberConfig || {}) } : null;
+  const minimumTiers = (list, label) => (list || [])
+    .map((t, i) => ({
+      minimum: decimalInput(t.minimum, `${label} tier ${i + 1} minimum`, { required: true, maxDp: 8 }),
+      rate: decimalInput(t.rate, `${label} tier ${i + 1} rate`, { required: true, maxDp: 8 }),
+    }))
+    .sort((a, b) => D(a.minimum).cmp(D(b.minimum)));
+  const maximumTiers = (list, label) => (list || [])
+    .map((t, i) => ({
+      maximum: decimalInput(t.maximum, `${label} tier ${i + 1} maximum`, { required: true, maxDp: 8 }),
+      rate: decimalInput(t.rate, `${label} tier ${i + 1} rate`, { required: true, maxDp: 8 }),
+    }))
+    .sort((a, b) => D(a.maximum).cmp(D(b.maximum)));
   const v = {
-    paymentType: body.paymentType,
-    basePay: decimalInput(body.basePay, 'Base pay', { required: true }),
-    contractedHours: decimalInput(body.contractedHours, 'Contracted hours'),
-    incentiveEnabled: Boolean(body.incentiveEnabled),
-    incentiveTiers: tiers,
-    bonusEnabled: Boolean(body.bonusEnabled),
-    bonusRate: decimalInput(body.bonusRate, 'Bonus rate'),
-    fuelMethod,
-    fuelReimbursementEnabled: fuelMethod === 'PER_TRIP',
-    fuelReimbursementRate: fuelMethod === 'PER_TRIP' ? decimalInput(body.fuelReimbursementRate, 'Fuel reimbursement rate') : null,
-    fuelMpg: fuelMethod === 'SERVICE_MILE_ALLOWANCE' ? decimalInput(body.fuelMpg, 'Fuel efficiency (MPG)') : null,
+    calculationType,
+    paymentType: calculationType === 'UBER' ? 'HOURLY' : body.paymentType,
+    // Uber rates and hours are operator profile data, not plan-version data.
+    basePay: calculationType === 'UBER' ? null : decimalInput(body.basePay, 'Base pay', { required: true }),
+    // Uber contract hours belong to each operator on the provider profile. They
+    // are deliberately not stored as a plan rule or used as a fallback.
+    contractedHours: calculationType === 'UBER' ? null : decimalInput(body.contractedHours, 'Contracted hours'),
+    incentiveEnabled: calculationType === 'UBER' ? false : Boolean(body.incentiveEnabled),
+    incentiveTiers: calculationType === 'UBER' ? [] : tiers,
+    bonusEnabled: calculationType === 'UBER' ? false : Boolean(body.bonusEnabled),
+    bonusRate: calculationType === 'UBER' ? null : decimalInput(body.bonusRate, 'Bonus rate'),
+    fuelMethod: calculationType === 'UBER' ? 'NONE' : fuelMethod,
+    fuelReimbursementEnabled: calculationType === 'STANDARD' && fuelMethod === 'PER_TRIP',
+    fuelReimbursementRate: calculationType === 'STANDARD' && fuelMethod === 'PER_TRIP' ? decimalInput(body.fuelReimbursementRate, 'Fuel reimbursement rate') : null,
+    fuelMpg: calculationType === 'STANDARD' && fuelMethod === 'SERVICE_MILE_ALLOWANCE' ? decimalInput(body.fuelMpg, 'Fuel efficiency (MPG)') : null,
     fuelMileageSource: 'SERVICE_MILES',
     performanceHourMetric: body.performanceHourMetric || 'TOTAL_HOURS',
     performanceHourColumn: body.performanceHourMetric === 'OTHER' ? body.performanceHourColumn : null,
+    uberConfig: uberSource
+      ? {
+          coreRatePct: decimalInput(uberSource.coreRatePct, 'Uber core rate percentage', { required: true, maxDp: 8 }),
+          approvedExtraHours: decimalInput(uberSource.approvedExtraHours, 'Uber approved extra hours', { required: true, maxDp: 8 }),
+          contractHoursIncentiveTiers: minimumTiers(uberSource.contractHoursIncentiveTiers, 'Contract-hours incentive'),
+          acceptanceIncentiveTiers: minimumTiers(uberSource.acceptanceIncentiveTiers, 'Acceptance incentive'),
+          cancellationIncentiveTiers: maximumTiers(uberSource.cancellationIncentiveTiers, 'Cancellation incentive'),
+          utilizationTarget: decimalInput(uberSource.utilizationTarget, 'Uber utilization target', { required: true, maxDp: 8 }),
+          utilizationIncentivePct: decimalInput(uberSource.utilizationIncentivePct, 'Uber utilization incentive percentage', { required: true, maxDp: 8 }),
+          coreHoursRequirement: decimalInput(uberSource.coreHoursRequirement, 'Uber core-hours requirement', { required: true, maxDp: 8 }),
+        }
+      : undefined,
     effectiveFrom: body.effectiveFrom ? toDateOnly(body.effectiveFrom) : null,
     effectiveTo: body.effectiveTo ? toDateOnly(body.effectiveTo) : null,
     notes: body.notes,

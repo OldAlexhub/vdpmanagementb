@@ -5,8 +5,10 @@ import VdpPlan from '../models/VdpPlan.js';
 import VdpCycle from '../models/VdpCycle.js';
 import Division from '../models/Division.js';
 import { calculateVdp, serializeResult, CalculationError, ADJUSTMENT_TYPES, priceOn } from './calculationEngine.js';
-import { resolveVersion, resolveSettings, engineSettings, validateVersion, SERVICE_MILE_ALLOWANCE } from './planService.js';
+import { calculateUberVdp, serializeUberResult, UberCalculationError } from './uberCalculationEngine.js';
+import { resolveVersion, resolveSettings, engineSettings, uberEngineSettings, validateVersion, SERVICE_MILE_ALLOWANCE } from './planService.js';
 import { activeImportFor, matchRoutes, unresolvedRoutes } from './performanceService.js';
+import { activeUberImportsFor, matchUberDrivers, uberRowsForCycle } from './uberPerformanceService.js';
 import { hoursForMetric, HOUR_METRICS } from './performanceParser.js';
 import { weekOf, isoDate, endOfDayIn } from './cycleService.js';
 import { activeOperators, operatorsOf, worksOn, leaseWeeksInCycle } from './operators.js';
@@ -26,6 +28,58 @@ const usesAllowance = (vdp) => vdp.settings?.fuelMethod?.value === SERVICE_MILE_
   || (vdp.settings?.operatorPlans || []).some((o) => o.fuelMethod === SERVICE_MILE_ALLOWANCE);
 
 const exception = (code, message) => ({ code, message, acknowledgeable: ACKNOWLEDGEABLE.has(code) });
+
+// Uber's hourly rate belongs to the provider profile. A provider-level rate is the
+// default for every operator; an operator rate is only needed when that person differs.
+const uberBasePayFor = (provider, operator) => {
+  if (!isBlank(operator.basePay)) return { value: operator.basePay, source: 'OPERATOR_PROFILE' };
+  if (!isBlank(provider.overrides?.basePay)) return { value: provider.overrides.basePay, source: 'PROVIDER_PROFILE' };
+  return { value: null, source: null };
+};
+
+const vehicleKey = (operator) => operator.vehicleUnit
+  ? `vehicle:${operator.vehicleUnit.trim().toLowerCase()}`
+  : `operator:${operator.id}`;
+
+function uberPaymentUnits(operators) {
+  const units = new Map();
+  for (const operator of operators) {
+    const key = vehicleKey(operator);
+    const unit = units.get(key) || {
+      id: key,
+      vehicleUnit: operator.vehicleUnit || null,
+      label: operator.vehicleUnit ? `Vehicle ${operator.vehicleUnit}` : operator.name,
+      operators: [],
+    };
+    unit.operators.push(operator);
+    units.set(key, unit);
+  }
+  return [...units.values()];
+}
+
+function leaseWeeksForUnit(unit, cycle) {
+  const starts = [cycle.week1Start, cycle.week2Start].map(isoDate);
+  const charged = starts.filter((day) => unit.operators.some((operator) => worksOn(operator, day))).length;
+  return charged === starts.length ? null : String(charged);
+}
+
+function uberUnitLeases(operators, cycle, overrideWeeks) {
+  return uberPaymentUnits(operators).map((unit) => {
+    const configured = unit.operators.map((operator) => operator.liftLease).filter((lease) => lease.frequency !== 'NONE');
+    const distinct = new Set(configured.map((lease) => `${lease.frequency}|${lease.amount ?? ''}`));
+    if (distinct.size > 1) {
+      throw new UberCalculationError(`${unit.label} has conflicting lift-lease settings. Enter the same lease for the shared vehicle, or keep it on one operator only.`);
+    }
+    const charged = configured[0] || { amount: null, frequency: 'NONE' };
+    return {
+      ...charged,
+      calculationUnitId: unit.id,
+      vehicleUnit: unit.vehicleUnit,
+      operatorNames: unit.operators.map((operator) => operator.name),
+      weeksCharged: overrideWeeks ?? leaseWeeksForUnit(unit, cycle),
+    };
+  });
+}
 
 function cycleInfo(cycle) {
   return {
@@ -230,6 +284,7 @@ export async function computeVdp(vdp, preloaded = {}) {
           planName: x.plan.name,
           versionNumber: x.version.versionNumber,
           source: x.own ? 'OPERATOR' : 'PROVIDER',
+          calculationType: x.settings.calculationType?.value || 'STANDARD',
           paymentType: x.settings.paymentType.value,
           basePay: x.settings.basePay.value,
           fuelMethod: x.settings.fuelMethod.value,
@@ -239,6 +294,12 @@ export async function computeVdp(vdp, preloaded = {}) {
       }),
     };
   }
+  const calculationTypes = new Set([...opPlan.values()].map((x) => x.settings.calculationType?.value || 'STANDARD'));
+  if (calculationTypes.size > 1) {
+    exceptions.push(exception('MIXED_CALCULATION_TYPES',
+      'A provider cannot combine Uber and standard calculation types in one VDP. Put all active operators on plans with the same calculation type.'));
+  }
+  const isUber = settings?.calculationType?.value === 'UBER';
 
   for (const o of activeOperators(provider, cycle)) {
     const lease = o.liftLease;
@@ -251,32 +312,79 @@ export async function computeVdp(vdp, preloaded = {}) {
   }
 
   let performance = null;
-  if (!importDoc) {
-    exceptions.push(exception('NO_PERFORMANCE_IMPORT', 'No Performance Report has been uploaded for this cycle.'));
-  } else if (settings) {
-    const metric = settings.performanceHourMetric.value;
-    const otherColumn = settings.performanceHourColumn.value;
-    const metricOf = (operatorId) => {
-      const x = settingsOf(operatorId);
-      return { metric: x.performanceHourMetric.value, otherColumn: x.performanceHourColumn.value };
-    };
-    const inPlay = [{ metric, otherColumn }, ...[...opPlan.keys()].map(metricOf)];
-    const missingMetrics = new Set(inPlay.filter((m) => !(m.metric === 'OTHER'
-      ? (importDoc.detectedColumns?.otherHourColumns || []).includes(m.otherColumn)
-      : importDoc.detectedColumns?.[m.metric])).map((m) => HOUR_METRICS[m.metric]?.label || m.otherColumn));
-    for (const label of missingMetrics) {
-      exceptions.push(exception('METRIC_NOT_IN_REPORT', `The plan pays on "${label}", which is not in the uploaded report.`));
+  let uberImports = [];
+  if (isUber && settings) {
+    const operators = activeOperators(provider, cycle);
+    const missingBasePay = operators.filter((operator) => isBlank(uberBasePayFor(provider, operator).value));
+    if (missingBasePay.length) {
+      exceptions.push(exception('MISSING_UBER_BASE_PAY',
+        `Uber base hourly rate is missing for operator${missingBasePay.length === 1 ? '' : 's'} ${missingBasePay.map((operator) => operator.name).join(', ')}. Add one provider-level rate, or an operator-specific rate when someone differs.`));
     }
-    const matches = preloaded.matches || matchRoutes(importDoc, await Provider.find({ divisionId: provider.divisionId }));
-    performance = providerPerformance({ provider, cycle, importDoc, matches, metric, otherColumn, metricOf: mixedPlans ? metricOf : undefined });
-    if (performance.unassignedRoutes.length) {
-      exceptions.push(exception('ROUTE_WITHOUT_OPERATOR',
-        `Route ${performance.unassignedRoutes.join(', ')} is matched to ${provider.name} but not to any of its operators. Add it to an operator on the provider profile.`));
+    const missingContractedHours = operators.filter((operator) => isBlank(operator.contractedHours));
+    if (missingContractedHours.length) {
+      exceptions.push(exception('MISSING_UBER_CONTRACTED_HOURS',
+        `Uber contracted hours are missing for operator${missingContractedHours.length === 1 ? '' : 's'} ${missingContractedHours.map((operator) => operator.name).join(', ')}. Add weekly contracted hours to each operator on the provider profile.`));
     }
-    if (performance.days.length === 0) {
-      const routeText = provider.routes.length ? `route ${provider.routes.join(', ')}` : 'no routes on the profile';
-      exceptions.push(exception('NO_PERFORMANCE_DATA',
-        `No Performance Report rows for ${provider.name} (${routeText}) in this cycle.`));
+    uberImports = preloaded.uberImports !== undefined ? preloaded.uberImports : await activeUberImportsFor(cycle._id);
+    if (!uberImports.length) {
+      exceptions.push(exception('NO_UBER_PERFORMANCE_IMPORT', 'No valid Uber weekly data has been uploaded for this cycle.'));
+    } else {
+      const byId = new Map(operators.map((operator) => [operator.id, operator]));
+      const allRows = preloaded.uberRows !== undefined ? preloaded.uberRows : await uberRowsForCycle(cycle._id);
+      const rows = allRows.filter((row) => String(row.providerId) === String(provider._id) && byId.has(String(row.operatorId))).map((row) => {
+        const operator = byId.get(String(row.operatorId));
+        const basePay = uberBasePayFor(provider, operator);
+        const effective = uberEngineSettings(settingsOf(operator.id), operator.contractedHours, basePay.value, basePay.source);
+        const calculationUnitId = operator.vehicleUnit ? vehicleKey(operator) : `driver:${String(row.driverUuid).toLowerCase()}`;
+        return {
+          ...row,
+          operatorId: operator.id,
+          operatorName: operator.name,
+          vehicleUnit: operator.vehicleUnit,
+          calculationUnitId,
+          calculationUnitLabel: operator.vehicleUnit ? `Vehicle ${operator.vehicleUnit}` : operator.name,
+          settings: effective,
+        };
+      });
+      performance = {
+        kind: 'UBER',
+        rows,
+        imports: uberImports.map((doc) => ({ id: doc._id, fileName: doc.originalFileName, fileHash: doc.fileHash, uploadedAt: doc.uploadedAt })),
+        drivers: [...new Set(rows.map((row) => row.driverUuid))],
+        weeks: [...new Set(rows.map((row) => row.week))].sort(),
+      };
+      if (!rows.length) {
+        exceptions.push(exception('NO_UBER_PERFORMANCE_DATA', `No uploaded Uber rows are matched to ${provider.name}'s operators.`));
+      }
+    }
+  } else if (!isUber) {
+    if (!importDoc) {
+      exceptions.push(exception('NO_PERFORMANCE_IMPORT', 'No Performance Report has been uploaded for this cycle.'));
+    } else if (settings) {
+      const metric = settings.performanceHourMetric.value;
+      const otherColumn = settings.performanceHourColumn.value;
+      const metricOf = (operatorId) => {
+        const x = settingsOf(operatorId);
+        return { metric: x.performanceHourMetric.value, otherColumn: x.performanceHourColumn.value };
+      };
+      const inPlay = [{ metric, otherColumn }, ...[...opPlan.keys()].map(metricOf)];
+      const missingMetrics = new Set(inPlay.filter((m) => !(m.metric === 'OTHER'
+        ? (importDoc.detectedColumns?.otherHourColumns || []).includes(m.otherColumn)
+        : importDoc.detectedColumns?.[m.metric])).map((m) => HOUR_METRICS[m.metric]?.label || m.otherColumn));
+      for (const label of missingMetrics) {
+        exceptions.push(exception('METRIC_NOT_IN_REPORT', `The plan pays on "${label}", which is not in the uploaded report.`));
+      }
+      const matches = preloaded.matches || matchRoutes(importDoc, await Provider.find({ divisionId: provider.divisionId }));
+      performance = providerPerformance({ provider, cycle, importDoc, matches, metric, otherColumn, metricOf: mixedPlans ? metricOf : undefined });
+      if (performance.unassignedRoutes.length) {
+        exceptions.push(exception('ROUTE_WITHOUT_OPERATOR',
+          `Route ${performance.unassignedRoutes.join(', ')} is matched to ${provider.name} but not to any of its operators. Add it to an operator on the provider profile.`));
+      }
+      if (performance.days.length === 0) {
+        const routeText = provider.routes.length ? `route ${provider.routes.join(', ')}` : 'no routes on the profile';
+        exceptions.push(exception('NO_PERFORMANCE_DATA',
+          `No Performance Report rows for ${provider.name} (${routeText}) in this cycle.`));
+      }
     }
   }
 
@@ -319,25 +427,49 @@ export async function computeVdp(vdp, preloaded = {}) {
   const blocking = exceptions.filter((e) => !NON_BLOCKING.has(e.code));
   if (settings && performance && blocking.length === 0) {
     try {
-      calculation = serializeResult(calculateVdp({
-        settings: engineSettings(settings),
-        operators: performance.operators.map((o) => ({
-          name: o.name,
-          routes: o.routes,
-          ...(opPlan.get(o.id)?.own ? {
-            settings: engineSettings(opPlan.get(o.id).settings),
-            plan: { id: String(opPlan.get(o.id).plan._id), name: opPlan.get(o.id).plan.name, versionNumber: opPlan.get(o.id).version.versionNumber },
-          } : {}),
-          contractedHours: o.contractedHours,
-          weeks: o.weeks,
-          // A reviewer's weeks-charged wins; otherwise a transfer inside the cycle limits the weeks.
-          lease: { ...o.liftLease, weeksCharged: str(vdp.leaseWeeksCharged) ?? o.leaseWeeks },
-        })),
-        adjustments: vdp.adjustments.map((a) => ({ type: a.type, amount: str(a.amount) })),
-        fuel,
-      }));
+      if (isUber) {
+        calculation = serializeUberResult(calculateUberVdp({
+          settings: uberEngineSettings(settings),
+          rows: performance.rows,
+          weeklyAdjustments: vdp.uberWeeklyAdjustments.map((entry) => ({
+            driverUuid: entry.driverUuid,
+            calculationUnitId: entry.calculationUnitId,
+            week: entry.week,
+            approvedExtraHours: str(entry.approvedExtraHours),
+            passThroughs: entry.passThroughs.map((p) => ({ type: p.type, amount: str(p.amount), description: p.description })),
+          })),
+          leases: uberUnitLeases(activeOperators(provider, cycle), cycle, str(vdp.leaseWeeksCharged)),
+          adjustments: vdp.adjustments.map((a) => ({
+            type: a.type,
+            amount: str(a.amount),
+            operatorId: a.operatorId ? String(a.operatorId) : null,
+            operatorName: a.operatorName || null,
+            week: a.week || null,
+            tollDirection: a.tollDirection || null,
+            description: a.description || '',
+          })),
+        }));
+      } else {
+        calculation = serializeResult(calculateVdp({
+          settings: engineSettings(settings),
+          operators: performance.operators.map((o) => ({
+            name: o.name,
+            routes: o.routes,
+            ...(opPlan.get(o.id)?.own ? {
+              settings: engineSettings(opPlan.get(o.id).settings),
+              plan: { id: String(opPlan.get(o.id).plan._id), name: opPlan.get(o.id).plan.name, versionNumber: opPlan.get(o.id).version.versionNumber },
+            } : {}),
+            contractedHours: o.contractedHours,
+            weeks: o.weeks,
+            // A reviewer's weeks-charged wins; otherwise a transfer inside the cycle limits the weeks.
+            lease: { ...o.liftLease, weeksCharged: str(vdp.leaseWeeksCharged) ?? o.leaseWeeks },
+          })),
+          adjustments: vdp.adjustments.map((a) => ({ type: a.type, amount: str(a.amount) })),
+          fuel,
+        }));
+      }
     } catch (err) {
-      if (!(err instanceof CalculationError)) throw err;
+      if (!(err instanceof CalculationError) && !(err instanceof UberCalculationError)) throw err;
       exceptions.push(exception('CALCULATION_ERROR', err.message));
     }
   }
@@ -346,13 +478,14 @@ export async function computeVdp(vdp, preloaded = {}) {
   const open = exceptions.filter((e) => !(e.acknowledgeable && acknowledged.has(e.code)));
   const status = open.length || !calculation ? 'NEEDS_REVIEW' : 'READY';
 
-  return { provider, plan, version, cycle, settings, performance, calculation, exceptions, status, importDoc };
+  return { provider, plan, version, cycle, settings, performance, calculation, exceptions, status, importDoc: isUber ? null : importDoc, uberImports };
 }
 
 function applyComputation(vdp, c) {
   vdp.planId = c.plan?._id ?? null;
   vdp.planVersionId = c.version?._id ?? null;
   vdp.performanceImportId = c.importDoc?._id ?? null;
+  vdp.uberPerformanceImportIds = (c.uberImports || []).map((doc) => doc._id);
   vdp.settings = c.settings;
   vdp.performance = c.performance;
   vdp.calculation = c.calculation;
@@ -367,11 +500,22 @@ function applyComputation(vdp, c) {
 export async function processCycle(cycleId, user) {
   const cycle = await VdpCycle.findById(cycleId);
   if (!cycle) throw notFound('VDP cycle');
-  const importDoc = await activeImportFor(cycle._id);
-  if (!importDoc) throw badRequest('Upload the Performance Report for this cycle before processing VDPs.');
-
   const providers = await Provider.find({ divisionId: cycle.divisionId });
-  const matches = matchRoutes(importDoc, providers);
+  const plans = new Map((await VdpPlan.find({ divisionId: cycle.divisionId })).map((p) => [String(p._id), p]));
+  const expected = providers.filter((p) => p.status === 'ACTIVE');
+  const typeFor = (provider) => {
+    const plan = plans.get(String(provider.planId));
+    return plan ? (resolveVersion(plan, cycle).version?.calculationType || 'STANDARD') : null;
+  };
+  const needsStandard = expected.some((provider) => typeFor(provider) !== 'UBER');
+  const needsUber = expected.some((provider) => typeFor(provider) === 'UBER');
+  const [importDoc, uberImports] = await Promise.all([
+    needsStandard ? activeImportFor(cycle._id) : Promise.resolve(null),
+    needsUber ? activeUberImportsFor(cycle._id) : Promise.resolve([]),
+  ]);
+  if (needsStandard && !importDoc) throw badRequest('Upload the Performance Report for this cycle before processing standard VDP plans.');
+  if (needsUber && !uberImports.length) throw badRequest('Upload valid Uber weekly data for this cycle before processing Uber VDP plans.');
+  const matches = importDoc ? matchRoutes(importDoc, providers) : [];
   const unresolved = unresolvedRoutes(matches);
   if (unresolved.length) {
     throw conflict(
@@ -379,9 +523,15 @@ export async function processCycle(cycleId, user) {
       { code: 'UNRESOLVED_ROUTES', routes: unresolved },
     );
   }
-
-  const plans = new Map((await VdpPlan.find({ divisionId: cycle.divisionId })).map((p) => [String(p._id), p]));
-  const expected = providers.filter((p) => p.status === 'ACTIVE');
+  const driverMatches = needsUber ? matchUberDrivers(uberImports, providers, cycle) : [];
+  const unmatchedDrivers = driverMatches.filter((match) => match.status !== 'MATCHED');
+  if (unmatchedDrivers.length) {
+    throw conflict(
+      `${unmatchedDrivers.length} Uber driver(s) need to be matched to provider operators before VDPs can be processed.`,
+      { code: 'UNRESOLVED_UBER_DRIVERS', drivers: unmatchedDrivers },
+    );
+  }
+  const uberRows = needsUber ? await uberRowsForCycle(cycle._id) : [];
   const counts = { processed: 0, ready: 0, needsReview: 0, skippedLocked: 0 };
 
   for (const provider of expected) {
@@ -392,7 +542,7 @@ export async function processCycle(cycleId, user) {
     }
     const isNew = !vdp;
     vdp ||= new Vdp({ providerId: provider._id, divisionId: cycle.divisionId, cycleId: cycle._id });
-    const c = await computeVdp(vdp, { provider, cycle, importDoc, matches, plans });
+    const c = await computeVdp(vdp, { provider, cycle, importDoc, matches, plans, uberImports, uberRows });
     applyComputation(vdp, c);
     vdp.history.push({ action: isNew ? 'PROCESSED' : 'RECALCULATED', by: actor(user) });
     await vdp.save();
@@ -435,15 +585,28 @@ export async function addAdjustment(id, input, user) {
     throw badRequest('Enter a positive amount. The type decides whether it is deducted or added.');
   }
   if (D(input.amount).decimalPlaces() > 2) throw badRequest('Amounts are in dollars and cents (max 2 decimals).');
+  let tollAssignment = {};
+  if (input.type === 'TOLL' && vdp.settings?.calculationType?.value === 'UBER') {
+    const operatorId = String(input.operatorId || '').trim();
+    const week = String(input.week || '').trim();
+    const tollDirection = String(input.tollDirection || 'CREDIT').trim().toUpperCase();
+    if (!operatorId) throw badRequest('Choose the provider driver for this toll.');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) throw badRequest('Choose the Uber week for this toll.');
+    if (!['CREDIT', 'DEDUCTION'].includes(tollDirection)) throw badRequest('Choose whether the toll is a provider credit or deduction.');
+    const source = vdp.performance?.rows?.find((row) => String(row.operatorId) === operatorId && row.week === week);
+    if (!source) throw badRequest('That driver did not have matched Uber data in the selected week.');
+    tollAssignment = { operatorId, operatorName: source.operatorName, week, tollDirection };
+  }
   vdp.adjustments.push({
     type: input.type,
     amount: String(input.amount).trim(),
     description: input.description,
     date: input.date || new Date(),
+    ...tollAssignment,
     createdBy: actor(user),
   });
   return recalcAndSave(vdp, user, 'ADJUSTMENT_ADDED',
-    `${ADJUSTMENT_TYPES[input.type].label} $${D(input.amount).toFixed(2)}${input.description ? ` — ${input.description}` : ''}`);
+    `${ADJUSTMENT_TYPES[input.type].label} $${D(input.amount).toFixed(2)}${tollAssignment.tollDirection ? ` (${tollAssignment.tollDirection.toLowerCase()})` : ''}${input.description ? ` — ${input.description}` : ''}`);
 }
 
 export async function removeAdjustment(id, adjustmentId, user) {
@@ -489,6 +652,61 @@ export async function setLeaseWeeks(id, { weeksCharged, note }, user) {
     isBlank(weeksCharged) ? 'Lease reset to all weeks in the cycle' : `Lease weeks charged: ${weeksCharged}. ${note}`);
 }
 
+// Per pay-unit/week Uber review input. Approved tolls belong in Adjustments;
+// this endpoint only changes the payable-hour cap.
+export async function setUberWeeklyAdjustment(id, input, user) {
+  const vdp = await loadEditable(id);
+  if (vdp.settings?.calculationType?.value !== 'UBER') throw badRequest('This VDP does not use an Uber plan.');
+  const driverUuid = String(input.driverUuid || '').trim().toLowerCase();
+  const calculationUnitId = String(input.calculationUnitId || '').trim().toLowerCase();
+  const week = String(input.week || '').trim();
+  if ((!driverUuid && !calculationUnitId) || !/^\d{4}-\d{2}-\d{2}$/.test(week)) throw badRequest('Choose a valid Uber pay unit and week.');
+  if (!vdp.performance?.rows?.some((row) => row.week === week && (
+    (calculationUnitId && String(row.calculationUnitId).toLowerCase() === calculationUnitId)
+    || (driverUuid && row.driverUuid.toLowerCase() === driverUuid)
+  ))) {
+    throw badRequest('That pay unit/week is not part of this VDP.');
+  }
+  const decimal = (value, label, { blank = false } = {}) => {
+    const text = String(value ?? '').trim().replace(/[$,]/g, '');
+    if (blank && text === '') return null;
+    if (!/^\d+(\.\d+)?$/.test(text)) throw badRequest(`${label} must be zero or a positive number.`);
+    if (D(text).decimalPlaces() > 8) throw badRequest(`${label} allows at most 8 decimal places.`);
+    return text;
+  };
+  const approvedExtraHours = decimal(input.approvedExtraHours, 'Approved extra hours', { blank: true });
+  let passThroughs;
+  if (Array.isArray(input.passThroughs)) {
+    passThroughs = input.passThroughs.map((p, i) => ({
+      type: String(p.type || '').trim().toUpperCase(),
+      amount: decimal(p.amount, `Pass-through ${i + 1} amount`),
+      description: String(p.description || '').trim() || undefined,
+    })).filter((p) => D(p.amount).gt(0));
+    if (passThroughs.some((p) => !/^[A-Z][A-Z0-9_]*$/.test(p.type))) throw badRequest('Pass-through type must use letters, numbers, and underscores.');
+    if (passThroughs.some((p) => p.type === 'TOLL')) {
+      throw badRequest('Enter Uber tolls in Adjustments and assign each toll to a provider driver and week.');
+    }
+  } else {
+    passThroughs = [];
+  }
+  let entry = vdp.uberWeeklyAdjustments.find((item) => item.week === week && (
+    (calculationUnitId && item.calculationUnitId === calculationUnitId)
+    || (!calculationUnitId && item.driverUuid === driverUuid)
+  ));
+  if (!entry) {
+    vdp.uberWeeklyAdjustments.push({ calculationUnitId: calculationUnitId || null, driverUuid: driverUuid || null, week });
+    entry = vdp.uberWeeklyAdjustments[vdp.uberWeeklyAdjustments.length - 1];
+  }
+  entry.calculationUnitId = calculationUnitId || null;
+  entry.driverUuid = driverUuid || null;
+  entry.approvedExtraHours = approvedExtraHours;
+  entry.passThroughs = passThroughs;
+  entry.updatedBy = actor(user);
+  entry.updatedAt = new Date();
+  return recalcAndSave(vdp, user, 'UBER_WEEKLY_ADJUSTMENT_SET',
+    `${calculationUnitId || driverUuid} / ${week}: approved extra hours ${approvedExtraHours ?? 'plan default'}`);
+}
+
 export async function acknowledge(id, { code, note }, user) {
   const vdp = await loadEditable(id);
   if (!ACKNOWLEDGEABLE.has(code)) throw badRequest('This issue must be fixed at its source, not acknowledged.');
@@ -498,26 +716,37 @@ export async function acknowledge(id, { code, note }, user) {
   return recalcAndSave(vdp, user, 'EXCEPTION_ACKNOWLEDGED', `${code}: ${note}`);
 }
 
-// Lift lease as shown on the VDP: one entry per active operator. amount/frequency are kept
-// for single-operator providers (and older screens).
+// Lift lease as shown on the VDP: one entry per distinct vehicle/pay unit.
 function leaseView(provider, vdp, cycle) {
-  const operators = activeOperators(provider, cycle).map((o) => ({
-    name: o.name,
-    amount: o.liftLease.amount,
-    frequency: o.liftLease.frequency,
-    weeksCharged: str(vdp.leaseWeeksCharged) ?? (cycle ? leaseWeeksInCycle(o, cycle) : null),
-    transfer: o.transferredTo?.effectiveDate && cycle && o.endDate <= isoDate(cycle.cycleEnd)
-      ? `moved to ${o.transferredTo.providerName} from ${o.transferredTo.effectiveDate}`
-      : o.transferredFrom?.effectiveDate && cycle && o.startDate >= isoDate(cycle.cycleStart)
-        ? `joined from ${o.transferredFrom.providerName} on ${o.transferredFrom.effectiveDate}`
-        : null,
-  }));
-  const only = operators.length === 1 ? operators[0] : null;
-  const transfers = operators.filter((o) => o.transfer).map((o) => `${o.name} ${o.transfer}`);
+  const units = uberPaymentUnits(activeOperators(provider, cycle)).map((unit) => {
+    const lease = unit.operators.map((operator) => operator.liftLease)
+      .find((entry) => entry.frequency !== 'NONE') || { amount: null, frequency: 'NONE' };
+    const transfers = unit.operators.flatMap((operator) => {
+      if (operator.transferredTo?.effectiveDate && cycle && operator.endDate <= isoDate(cycle.cycleEnd)) {
+        return [`${operator.name} moved to ${operator.transferredTo.providerName} from ${operator.transferredTo.effectiveDate}`];
+      }
+      if (operator.transferredFrom?.effectiveDate && cycle && operator.startDate >= isoDate(cycle.cycleStart)) {
+        return [`${operator.name} joined from ${operator.transferredFrom.providerName} on ${operator.transferredFrom.effectiveDate}`];
+      }
+      return [];
+    });
+    return {
+      id: unit.id,
+      name: unit.label,
+      vehicleUnit: unit.vehicleUnit,
+      operatorNames: unit.operators.map((operator) => operator.name),
+      amount: lease.amount,
+      frequency: lease.frequency,
+      weeksCharged: str(vdp.leaseWeeksCharged) ?? (cycle ? leaseWeeksForUnit(unit, cycle) : null),
+      transfer: transfers.join(' · ') || null,
+    };
+  });
+  const only = units.length === 1 ? units[0] : null;
+  const transfers = units.filter((unit) => unit.transfer).map((unit) => unit.transfer);
   return {
     amount: only ? only.amount : null,
-    frequency: only ? only.frequency : operators.some((o) => o.frequency !== 'NONE') ? 'PER_OPERATOR' : 'NONE',
-    operators,
+    frequency: only ? only.frequency : units.some((unit) => unit.frequency !== 'NONE') ? 'PER_VEHICLE' : 'NONE',
+    operators: units,
     weeksCharged: str(vdp.leaseWeeksCharged) ?? only?.weeksCharged ?? null,
     note: [vdp.leaseNote, ...transfers].filter(Boolean).join(' · ') || null,
   };
@@ -530,7 +759,15 @@ const providerView = (p, routes) => ({
   operatorName: p.operatorName,
   routes: routes?.length ? routes : p.routes,
   serviceType: p.serviceType,
-  operators: operatorsOf(p).map((o) => ({ name: o.name, routes: o.routes, status: o.status })),
+  operators: operatorsOf(p).map((o) => ({
+    id: o.id,
+    name: o.name,
+    vehicleUnit: o.vehicleUnit,
+    routes: o.routes,
+    status: o.status,
+    basePay: o.basePay,
+    contractedHours: o.contractedHours,
+  })),
 });
 
 async function buildSnapshot(vdp, c, user) {
@@ -547,8 +784,22 @@ async function buildSnapshot(vdp, c, user) {
     performanceImport: c.importDoc
       ? { id: c.importDoc._id, fileName: c.importDoc.originalFileName, fileHash: c.importDoc.fileHash, uploadedAt: c.importDoc.uploadedAt }
       : null,
+    uberPerformanceImports: (c.uberImports || []).map((doc) => ({
+      id: doc._id, fileName: doc.originalFileName, fileHash: doc.fileHash, uploadedAt: doc.uploadedAt,
+      rowCount: doc.rowCount, weeksDetected: doc.weeksDetected,
+    })),
     adjustments: vdp.adjustments.map((a) => ({
-      type: a.type, amount: str(a.amount), description: a.description, date: a.date, createdBy: a.createdBy, createdAt: a.createdAt,
+      type: a.type, amount: str(a.amount), description: a.description, date: a.date,
+      operatorId: a.operatorId ? String(a.operatorId) : null, operatorName: a.operatorName, week: a.week,
+      tollDirection: a.tollDirection || null, createdBy: a.createdBy, createdAt: a.createdAt,
+    })),
+    uberWeeklyAdjustments: vdp.uberWeeklyAdjustments.map((entry) => ({
+      driverUuid: entry.driverUuid,
+      week: entry.week,
+      approvedExtraHours: str(entry.approvedExtraHours),
+      passThroughs: entry.passThroughs.map((p) => ({ type: p.type, amount: str(p.amount), description: p.description })),
+      updatedBy: entry.updatedBy,
+      updatedAt: entry.updatedAt,
     })),
     acknowledgements: vdp.acknowledgements,
     fuelExpense: vdp.fuelExpense?.amount == null ? null

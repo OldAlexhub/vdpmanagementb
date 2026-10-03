@@ -105,13 +105,20 @@ function tierDistribution(vdps) {
 function deductionBreakdown(vdps) {
   const byType = {};
   vdps.forEach((v) => adjustmentsOf(v).forEach((a) => {
-    byType[a.type] = (byType[a.type] || D(0)).plus(D(a.amount));
+    const definition = ADJUSTMENT_TYPES[a.type];
+    const uberToll = calcOf(v)?.calculationType === 'UBER' && a.type === 'TOLL';
+    const direction = uberToll
+      ? (a.tollDirection === 'DEDUCTION' ? 'DEDUCTION' : 'ADDITION')
+      : definition?.direction;
+    const key = uberToll ? `TOLL_${direction}` : a.type;
+    const label = uberToll ? (direction === 'DEDUCTION' ? 'Toll bill' : 'Toll credit') : (definition?.label || a.type);
+    const current = byType[key] || { key, label, direction, amount: D(0) };
+    current.amount = current.amount.plus(D(a.amount));
+    byType[key] = current;
   }));
   const calcs = vdps.map(calcOf).filter(Boolean);
   const rows = [{ key: 'LIFT_LEASE', label: 'Lift lease', direction: 'DEDUCTION', amount: money(sum(calcs.map((c) => c.lease))) }];
-  Object.entries(ADJUSTMENT_TYPES).forEach(([key, def]) => {
-    if (byType[key]) rows.push({ key, label: def.label, direction: def.direction, amount: money(byType[key]) });
-  });
+  Object.values(byType).forEach((item) => rows.push({ ...item, amount: money(item.amount) }));
   return rows.filter((r) => r.amount !== '0.00');
 }
 

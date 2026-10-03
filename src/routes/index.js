@@ -7,6 +7,7 @@ import * as plans from '../controllers/planController.js';
 import * as providers from '../controllers/providerController.js';
 import * as cycles from '../controllers/cycleController.js';
 import * as performance from '../controllers/performanceController.js';
+import * as uberPerformance from '../controllers/uberPerformanceController.js';
 import * as vdps from '../controllers/vdpController.js';
 import * as portal from '../controllers/portalController.js';
 import * as imports from '../controllers/importController.js';
@@ -86,6 +87,12 @@ api.post('/performance-imports', upload.single('file'), performance.upload);
 api.get('/performance-imports/:id', performance.get);
 api.post('/performance-imports/:id/routes', performance.resolve);
 
+api.get('/uber-performance-imports', uberPerformance.list);
+api.post('/uber-performance-imports', upload.array('files', 20), uberPerformance.upload);
+api.delete('/uber-performance-imports/invalid', uberPerformance.clearInvalid);
+api.delete('/uber-performance-imports/:id', uberPerformance.remove);
+api.post('/uber-driver-matches', uberPerformance.assignDriver);
+
 api.get('/vdps', vdps.list);
 api.get('/vdps/adjustment-types', vdps.adjustmentTypes);
 api.post('/vdps/process', vdps.process);
@@ -96,6 +103,7 @@ api.post('/vdps/:id/adjustments', vdps.addAdjustment);
 api.delete('/vdps/:id/adjustments/:adjustmentId', vdps.removeAdjustment);
 api.patch('/vdps/:id/lease', vdps.setLease);
 api.patch('/vdps/:id/fuel-expense', vdps.setFuelExpense);
+api.put('/vdps/:id/uber-weekly-adjustment', vdps.setUberWeeklyAdjustment);
 api.post('/vdps/:id/acknowledge', vdps.acknowledge);
 api.post('/vdps/:id/approve', vdps.approve);
 api.post('/vdps/:id/reopen', vdps.reopen);

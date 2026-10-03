@@ -29,6 +29,8 @@ function operatorInput(o, i) {
   if (!name) throw badRequest(`${label}: name is required.`);
   const status = o.status || 'ACTIVE';
   if (!['ACTIVE', 'INACTIVE'].includes(status)) throw badRequest(`${label}: invalid status.`);
+  const basePay = decimalInput(o.basePay, `${label}: base hourly rate`);
+  if (basePay !== null && Number(basePay) <= 0) throw badRequest(`${label}: base hourly rate must be greater than zero.`);
   const hours = decimalInput(o.contractedHours, `${label}: contracted hours`);
   if (hours !== null && Number(hours) <= 0) throw badRequest(`${label}: contracted hours must be greater than zero.`);
   return {
@@ -36,6 +38,8 @@ function operatorInput(o, i) {
     name,
     routes: normRoutes(o.routes),
     status,
+    vehicleUnit: String(o.vehicleUnit || '').trim() || null,
+    basePay,
     contractedHours: hours,
     liftLease: leaseInput(o.liftLease, label),
     planId: o.planId || null,
@@ -126,11 +130,13 @@ export async function applyInput(provider, body) {
     if (!['INHERIT', 'ON', 'OFF'].includes(tui)) throw badRequest('Invalid TUI eligibility.');
     const hours = decimalInput(o.contractedHours, 'Contracted hours override');
     if (hours !== null && Number(hours) <= 0) throw badRequest('Contracted hours override must be greater than zero.');
+    const basePay = decimalInput(o.basePay, 'Base pay override');
+    if (basePay !== null && Number(basePay) <= 0) throw badRequest('Base pay must be greater than zero.');
     const mpg = decimalInput(o.fuelMpg, 'Fuel MPG override');
     if (mpg !== null && Number(mpg) <= 0) throw badRequest('Fuel MPG override must be greater than zero.');
     provider.overrides = {
       contractedHours: hours,
-      basePay: decimalInput(o.basePay, 'Base pay override'),
+      basePay,
       bonusRate: decimalInput(o.bonusRate, 'Bonus rate override'),
       tuiEligibility: tui,
       fuelMpg: mpg,
@@ -266,6 +272,8 @@ export async function transferOperator(req, res) {
     name: op.name,
     routes: op.routes,
     status: 'ACTIVE',
+    vehicleUnit: op.vehicleUnit,
+    basePay: op.basePay,
     contractedHours: op.contractedHours,
     liftLease: op.liftLease,
     planId: op.planId && String(op.planId) !== String(target.planId) ? op.planId : null,

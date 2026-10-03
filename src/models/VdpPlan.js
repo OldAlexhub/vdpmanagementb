@@ -12,6 +12,40 @@ const tierSchema = new Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
 );
 
+// Uber incentives use ratios (0.94 = 94%) rather than the legacy plan tier's
+// percentage points. Minimum tiers are used for fulfillment/acceptance;
+// maximum tiers are used for cancellation. The version owns every threshold
+// so a historical VDP can always be reproduced from its snapshot.
+const uberMinimumTierSchema = new Schema(
+  {
+    minimum: dec({ required: true }),
+    rate: dec({ required: true }),
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
+const uberMaximumTierSchema = new Schema(
+  {
+    maximum: dec({ required: true }),
+    rate: dec({ required: true }),
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
+const uberConfigSchema = new Schema(
+  {
+    coreRatePct: dec({ default: null }),
+    approvedExtraHours: dec({ default: 0 }),
+    contractHoursIncentiveTiers: { type: [uberMinimumTierSchema], default: [] },
+    acceptanceIncentiveTiers: { type: [uberMinimumTierSchema], default: [] },
+    cancellationIncentiveTiers: { type: [uberMaximumTierSchema], default: [] },
+    utilizationTarget: dec({ default: null }),
+    utilizationIncentivePct: dec({ default: null }),
+    coreHoursRequirement: dec({ default: null }),
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
 // A version holds the compensation rules for a date range. Rules are never edited
 // once an approved VDP has used them — a new version is created instead.
 const versionSchema = new Schema(
@@ -19,8 +53,10 @@ const versionSchema = new Schema(
     versionNumber: { type: Number, required: true },
     effectiveFrom: { type: Date, required: true },
     effectiveTo: { type: Date, default: null },
+    calculationType: { type: String, enum: ['STANDARD', 'UBER'], default: 'STANDARD' },
     paymentType: { type: String, enum: ['HOURLY', 'PER_TRIP'], required: true },
-    basePay: dec({ required: true }),
+    // Standard plans own base pay. Uber rates live on each operator profile.
+    basePay: dec({ default: null }),
     contractedHours: dec({ default: null }),
     incentiveEnabled: { type: Boolean, default: false }, // TUI eligibility for everyone on the plan
     incentiveTiers: { type: [tierSchema], default: [] },
@@ -41,6 +77,7 @@ const versionSchema = new Schema(
       default: 'TOTAL_HOURS',
     },
     performanceHourColumn: { type: String, default: null }, // only for OTHER
+    uberConfig: { type: uberConfigSchema, default: undefined },
     notes: String,
     createdBy: actorSchema,
   },

@@ -158,7 +158,7 @@ test('bulk import', { skip }, async (t) => {
     const planList = wb.getWorksheet('Lists').getColumn(2).values;
     assert.ok(planList.includes('DIV 20 | Salem Hourly'), 'plans imported earlier appear in a fresh template');
     fill(wb, 'Providers', [
-      { Division: 'DIV 10 – Portland', 'Provider name': 'New Co LLC', 'Provider number': '20001', 'Route / run': '950', 'VDP plan': 'DIV 10 | Night Service', 'Lift lease frequency': 'Weekly', 'Lift lease amount ($)': 197.5 },
+      { Division: 'DIV 10 – Portland', 'Provider name': 'New Co LLC', 'Provider number': '20001', 'Route / run': '950', 'VDP plan': 'DIV 10 | Night Service', 'Base pay override ($)': 29.75, 'Lift lease frequency': 'Weekly', 'Lift lease amount ($)': 197.5 },
       { Division: 'DIV 10 – Portland', 'Provider name': 'Rimo Transit LLC', 'Provider number': '10063', 'Route / run': '999' },
       { Division: 'DIV 10 – Portland', 'Provider name': 'New Co LLC', 'Provider number': '20001' },
       { Division: 'DIV 10 – Portland', 'Provider name': 'Wrong Plan LLC', 'VDP plan': 'DIV 20 | Salem Hourly' },
@@ -191,6 +191,7 @@ test('bulk import', { skip }, async (t) => {
     assert.deepEqual(rimo.routes, ['918'], 'existing provider untouched');
     const created = (await Provider.findOne({ providerNumber: '20001' })).toJSON();
     assert.deepEqual([created.routes, created.operators[0].liftLease.frequency, created.operators[0].liftLease.amount], [['950'], 'WEEKLY', '197.5']);
+    assert.equal(created.overrides.basePay, '29.75');
     assert.equal((await Provider.findOne({ name: 'Shares 918 LLC' })).overrides.tuiEligibility, 'OFF');
 
     r = await upload('providers', 'commit', wb);

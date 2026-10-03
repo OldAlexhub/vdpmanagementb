@@ -70,10 +70,17 @@ export async function cycleWorkbook(cycleId) {
 
   const adjRows = [];
   entries.forEach((e) => {
-    e.adjustments.forEach((a) => adjRows.push([
-      e.provider.name, ADJUSTMENT_TYPES[a.type]?.label || a.type, ADJUSTMENT_TYPES[a.type]?.direction, num(a.amount?.toString()),
-      a.description || '', a.date ? isoDate(a.date) : '', a.createdBy?.name || '',
-    ]));
+    e.adjustments.forEach((a) => {
+      const uberToll = e.calc?.calculationType === 'UBER' && a.type === 'TOLL';
+      const direction = uberToll
+        ? (a.tollDirection === 'DEDUCTION' ? 'DEDUCTION' : 'ADDITION')
+        : ADJUSTMENT_TYPES[a.type]?.direction;
+      const label = uberToll ? (direction === 'DEDUCTION' ? 'Toll bill' : 'Toll credit') : (ADJUSTMENT_TYPES[a.type]?.label || a.type);
+      adjRows.push([
+        e.provider.name, label, direction, num(a.amount?.toString()),
+        a.description || '', a.date ? isoDate(a.date) : '', a.createdBy?.name || '',
+      ]);
+    });
     const w = (i) => e.calc?.weeks?.[i] || {};
     const weekCols = (i) => [num(w(i).trips), num(w(i).actualHours), num(w(i).performancePercentage) / 100 || null,
       num(w(i).incentiveRate), num(w(i).coreEarnings), num(w(i).bonusEarnings), num(w(i).weeklyEarnings)];

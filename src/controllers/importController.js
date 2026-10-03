@@ -335,15 +335,17 @@ const PROVIDER_COLUMNS = [
   { key: 'name', header: 'Provider name', level: 'required', width: 28, help: 'Legal / business name of the provider — the one who gets paid. Repeat it on each of its operators’ rows.', example: 'Rimo Transit LLC' },
   { key: 'providerNumber', header: 'Provider number', level: 'recommended', text: true, width: 16, help: 'Big Star vendor number. Used to spot providers that already exist and to group operators.', example: '10452' },
   { key: 'operatorName', header: 'Operator', level: 'recommended', width: 20, help: 'Driver / operator name. One row per operator; a provider with 3 operators has 3 rows. Blank = the provider’s name (single-operator provider).', example: 'Lisa Moore' },
+  { key: 'vehicleUnit', header: 'Vehicle / pay unit', level: 'optional', text: true, width: 18, help: 'Uber: give operators sharing one vehicle the same unit. Their weekly metrics are combined and that vehicle lease is charged once.', example: '4548' },
   { key: 'routes', header: 'Route / run', level: 'recommended', text: true, width: 16, help: 'This operator’s run(s) as shown in the Performance Report “Run/Route” column. Several: separate with commas. Without a route, performance cannot be matched.', example: '918' },
-  { key: 'contractedHours', header: 'Operator contracted hours', level: 'optional', type: 'decimal', width: 16, help: 'Only if this operator’s weekly contract differs from the plan. Blank = plan.' },
+  { key: 'operatorBasePay', header: 'Operator base hourly rate ($)', level: 'optional', type: 'decimal', width: 18, help: 'Uber only: fill this when this operator has a different rate from the provider base hourly rate.' },
+  { key: 'contractedHours', header: 'Operator contracted hours', level: 'recommended', type: 'decimal', width: 16, help: 'Required for Uber operators. Standard operators may leave this blank to inherit from the provider or plan.' },
   { key: 'liftLeaseFrequency', header: 'Lift lease frequency', level: 'recommended', list: labels(LEASE), width: 16, help: 'This operator’s vehicle lease. Blank = None.', example: 'Weekly' },
   { key: 'liftLeaseAmount', header: 'Lift lease amount ($)', level: 'optional', type: 'decimal', width: 16, help: 'Required when the frequency is Weekly or Per VDP cycle. Weekly is charged for each week in the cycle.', example: '197.50' },
   { key: 'status', header: 'Provider status', level: 'recommended', list: labels(STATUS), width: 12, help: 'Blank = Active.', example: 'Active' },
   { key: 'serviceType', header: 'Service type', level: 'optional', listKey: 'serviceTypes', loose: true, width: 16, help: 'Pick an existing service type, or type a new one.', example: 'TDEV Night' },
   { key: 'plan', header: 'VDP plan', level: 'recommended', listKey: 'plans', width: 32, help: 'Must be a plan in the same division. Without a plan, VDPs will need review.', example: 'DIV 10 | DIV 10 TDEV Hourly' },
   { key: 'tuiEligibility', header: 'TUI eligibility', level: 'recommended', list: labels(TUI), width: 18, help: 'Blank = Inherit from plan.', example: 'Inherit from plan' },
-  { key: 'basePay', header: 'Base pay override ($)', level: 'optional', type: 'decimal', width: 16, help: 'Only if different from the plan. Blank = inherit.' },
+  { key: 'basePay', header: 'Base pay override ($)', level: 'recommended', type: 'decimal', width: 18, help: 'For Uber, this is the provider-profile base hourly rate used by all operators unless an operator rate is entered. For standard plans, blank = inherit from the plan.' },
   { key: 'bonusRate', header: 'Bonus rate override ($)', level: 'optional', type: 'decimal', width: 16, help: 'Only if different from the plan. Blank = inherit.' },
   { key: 'email', header: 'Email', level: 'optional', width: 26 },
   { key: 'phone', header: 'Phone', level: 'optional', text: true, width: 16 },
@@ -378,7 +380,9 @@ function operatorFromRow(r, v, providerName) {
   if (frequency && frequency !== 'NONE' && amount === null) r.errors.push('Enter the lift lease amount, or set the frequency to None.');
   return {
     name: v.operatorName || providerName,
+    vehicleUnit: v.vehicleUnit || null,
     routes: normRoutes(v.routes),
+    basePay: decimal(r, v.operatorBasePay, 'Operator base hourly rate'),
     contractedHours: decimal(r, v.contractedHours, 'Operator contracted hours'),
     liftLease: { amount, frequency },
   };
@@ -446,8 +450,10 @@ const providers = {
           ['Status', v.status, labelOf(STATUS, existing.status)],
           ['Service type', v.serviceType, existing.serviceType],
           ['VDP plan', v.plan && String(v.plan).split(' | ').pop(), planById.get(String(existing.planId))?.name],
+          ['Provider base pay', numText(v.basePay), str(existing.overrides?.basePay)],
           ...(op ? [
             ['Route / run', v.routes && normRoutes(v.routes).join(', '), op.routes.join(', ')],
+            ['Operator base hourly rate', numText(v.operatorBasePay), op.basePay],
             ['Operator contracted hours', numText(v.contractedHours), op.contractedHours],
             ['Lift lease', fileLeaseText(v), leaseText(op.liftLease)],
           ] : []),
@@ -483,6 +489,7 @@ const providers = {
       };
       if (fv.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(fv.email)) fr.errors.push(`Email “${fv.email}” is not a valid address.`);
       const plan = findPlan(fr, fv, d, ctx);
+      const uber = Boolean(plan && currentVersion(plan)?.calculationType === 'UBER');
 
       const operators = [];
       const opRow = new Map();
@@ -499,6 +506,12 @@ const providers = {
           }
         }
         const op = operatorFromRow(m.r, m.v, fv.name);
+        if (uber && op.basePay === null && overrides.basePay === null) {
+          m.r.errors.push(`Uber base hourly rate is required for ${op.name}. Enter the provider rate in Base pay override, or an operator-specific rate.`);
+        }
+        if (uber && op.contractedHours === null) {
+          m.r.errors.push(`Uber contracted hours are required for ${op.name}.`);
+        }
         if (opRow.has(ci(op.name))) {
           m.r.status = 'DUPLICATE';
           m.r.errors = [];

@@ -9,7 +9,8 @@ import { runsRouteOn } from './operators.js';
 import { bestRouteMatches, routeKey } from './routeMatching.js';
 import { badRequest, conflict, notFound, actor } from './errors.js';
 
-export const activeImportFor = (cycleId) => PerformanceImport.findOne({ cycleId, status: 'ACTIVE' });
+// Existing records predate `kind`, so STANDARD includes a missing kind value.
+export const activeImportFor = (cycleId) => PerformanceImport.findOne({ cycleId, status: 'ACTIVE', kind: { $ne: 'UBER' } });
 
 /**
  * Route → provider association for an import.
@@ -113,7 +114,7 @@ export async function importReport({ cycleId, file, replace = false, replaceReas
   const fileHash = crypto.createHash('sha256').update(file.buffer).digest('hex');
   const current = await activeImportFor(cycle._id);
 
-  const sameFile = await PerformanceImport.findOne({ cycleId: cycle._id, fileHash, status: 'ACTIVE' });
+  const sameFile = await PerformanceImport.findOne({ cycleId: cycle._id, fileHash, status: 'ACTIVE', kind: { $ne: 'UBER' } });
   if (sameFile) {
     throw conflict(
       `This exact file (${sameFile.originalFileName}) is already loaded for this cycle. Nothing was imported.`,
@@ -148,6 +149,7 @@ export async function importReport({ cycleId, file, replace = false, replaceReas
   const doc = new PerformanceImport({
     divisionId: cycle.divisionId,
     cycleId: cycle._id,
+    kind: 'STANDARD',
     originalFileName: file.originalname,
     fileHash,
     fileSize: file.size ?? file.buffer.length,

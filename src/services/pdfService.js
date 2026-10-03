@@ -278,6 +278,137 @@ function stepsTable(doc, steps, x0, width) {
   })), { x0, fontSize: 8.6, rowPad: 5.5 });
 }
 
+const ratio = (value, digits = 2) => (value === null || value === undefined
+  ? '-'
+  : `${(Number(value) * 100).toFixed(digits).replace(/\.?0+$/, '')}%`);
+
+function uberStatementSections(doc, v, calc, left, width) {
+  const rows = calc.uberRows || [];
+
+  sectionTitle(doc, 'Cycle earnings summary', 'Weekly vehicle/pay-unit results with toll credits and provider bills shown separately');
+  table(doc, [
+    { header: 'Week', width: width * 0.22 },
+    { header: 'Pay units', width: width * 0.14, align: 'right' },
+    { header: 'Drivers', width: width * 0.14, align: 'right' },
+    { header: 'Calculated pay', width: width * 0.18, align: 'right' },
+    { header: 'Toll + / bill -', width: width * 0.15, align: 'right' },
+    { header: 'Week Gross', width: width * 0.17, align: 'right' },
+  ], (calc.weeks || []).map((week) => ({
+    cells: [
+      shortDate(week.week), week.calculationUnitCount, week.driverCount, fmtMoney(week.calculatedEarnings),
+      `+${fmtMoney(week.adjustmentTolls)} / -${fmtMoney(week.adjustmentTollDeductions)}`,
+      fmtMoney(week.weeklyEarnings),
+    ],
+    boldCols: [5],
+    colors: [C.ink, C.text, C.text, C.text, Number(week.adjustmentTolls) || Number(week.adjustmentTollDeductions) ? C.ink : C.muted, C.navy],
+  })), { fontSize: 8.4, rowPad: 5 });
+
+  ensure(doc, 90);
+  sectionTitle(doc, 'Weekly contract evaluation', 'Hours are qualifying / contracted / payable. Rates show measured result and earned tier.');
+  table(doc, [
+    { header: 'Week', width: 46 },
+    { header: 'Unit', width: 66 },
+    { header: 'Drivers', width: 92 },
+    { header: 'Hours Q / C / P', width: 72, align: 'right' },
+    { header: 'Fulfill.', width: 56, align: 'right' },
+    { header: 'Accept / cancel', width: 68, align: 'right' },
+    { header: 'Util / core', width: 60, align: 'right' },
+    { header: 'Pay', width: width - 460, align: 'right' },
+  ], rows.map((row) => ({
+    cells: [
+      md(row.week),
+      row.vehicleUnit ? `Vehicle ${row.vehicleUnit}` : row.calculationUnitLabel,
+      (row.operatorNames || [row.operatorName]).filter(Boolean).join(', '),
+      `${fmtNum(row.qualifyingSupplyHours)} / ${fmtNum(row.contractedHours)} / ${fmtNum(row.payableHours)}`,
+      ratio(row.fulfillment),
+      `${ratio(row.acceptanceRate)} / ${ratio(row.cancellationRate)}`,
+      `${ratio(row.utilizationRate)} / ${ratio(row.coreHoursPct)}`,
+      fmtMoney(row.grossVdp),
+    ],
+    sub: [
+      '', '', row.vehicleUnit && (row.operatorNames || []).length > 1 ? 'Shared vehicle' : '', '',
+      row.qualified ? `Qualified - hours tier ${ratio(row.hourIncentivePct)}` : 'Fallback earnings rule',
+      `Final incentive ${ratio(row.acceptanceCancellationPct)}`,
+      `Util tier ${ratio(row.utilizationIncentivePct)} - core ${row.coreHoursPassed ? 'pass' : 'below target'}`,
+      '',
+    ],
+    fill: row.qualified ? C.greenSoft : C.amberSoft,
+    boldCols: [4, 7],
+  })), { fontSize: 7.5, rowPad: 4 });
+
+  ensure(doc, 90);
+  sectionTitle(doc, 'Earnings components', 'Driver earnings excluding tips are shown for fallback audit and are not added to qualified pay');
+  table(doc, [
+    { header: 'Week / pay unit', width: 122 },
+    { header: 'Core', width: 64, align: 'right' },
+    { header: 'Hours inc.', width: 72, align: 'right' },
+    { header: 'A/C inc.', width: 74, align: 'right' },
+    { header: 'Util inc.', width: 66, align: 'right' },
+    { header: 'Tips', width: 52, align: 'right' },
+    { header: 'Calc. pay', width: width - 450, align: 'right' },
+  ], rows.map((row) => ({
+    cells: [
+      `${md(row.week)} - ${row.vehicleUnit ? `vehicle ${row.vehicleUnit}` : row.calculationUnitLabel}`,
+      fmtMoney(row.coreCompensation), fmtMoney(row.contractHoursIncentive), fmtMoney(row.acceptanceCancellationIncentive),
+      fmtMoney(row.utilizationIncentive), fmtMoney(row.tips), fmtMoney(row.grossVdp),
+    ],
+    sub: [`Fallback source: ${fmtMoney(row.driverEarningsExclTips)} earnings excl. tips`, '', ratio(row.hourIncentivePct), ratio(row.acceptanceCancellationPct), ratio(row.utilizationIncentivePct), '', ''],
+    boldCols: [6],
+  })), { fontSize: 7.8, rowPad: 4 });
+
+  const sourceRows = rows.flatMap((row) => (row.raw?.sourceRows || []).map((source) => ({ ...source, vehicleUnit: row.vehicleUnit })));
+  if (sourceRows.length) {
+    ensure(doc, 90);
+    sectionTitle(doc, 'Driver source detail', 'Matched provider operators; Uber UUIDs are retained internally for audit, not used as provider joins');
+    table(doc, [
+      { header: 'Week', width: 44 },
+      { header: 'Driver', width: 96 },
+      { header: 'Ctr h', width: 52, align: 'right' },
+      { header: 'Supply', width: 50, align: 'right' },
+      { header: 'Paused', width: 48, align: 'right' },
+      { header: 'Qual.', width: 48, align: 'right' },
+      { header: 'A/R/E/C', width: 70, align: 'right' },
+      { header: 'Earn. excl.', width: 76, align: 'right' },
+      { header: 'Tips', width: width - 484, align: 'right' },
+    ], sourceRows.map((source) => ({
+      cells: [
+        md(source.week), source.operatorName || 'Operator', fmtNum(source.contractedHours), fmtNum(source.totalSupplyHours), fmtNum(source.pausedHours),
+        fmtNum(D(source.totalSupplyHours).minus(source.pausedHours)),
+        `${fmtNum(source.totalAccepts)} / ${fmtNum(source.totalRejects)} / ${fmtNum(source.totalExpiredOffers)} / ${fmtNum(source.totalCancels)}`,
+        fmtMoney(source.driverEarningsExclTips), fmtMoney(source.driverTips),
+      ],
+      labelBold: false,
+    })), { fontSize: 7.4, rowPad: 3.5 });
+  }
+
+  const leases = v.lease?.operators || [];
+  if (leases.length) {
+    ensure(doc, 80);
+    sectionTitle(doc, 'Vehicle lease', 'One charge per distinct vehicle/pay unit, even when operators share it');
+    table(doc, [
+      { header: 'Vehicle / pay unit', width: width * 0.22 },
+      { header: 'Operators', width: width * 0.38 },
+      { header: 'Rate', width: width * 0.16, align: 'right' },
+      { header: 'Weeks', width: width * 0.1, align: 'right' },
+      { header: 'Deduction', width: width * 0.14, align: 'right' },
+    ], leases.map((lease) => {
+      const weeks = lease.frequency === 'WEEKLY' ? Number(lease.weeksCharged || 2) : lease.frequency === 'NONE' ? 0 : 1;
+      const deduction = lease.frequency === 'NONE' || !lease.amount ? D(0) : D(lease.amount).times(weeks);
+      return {
+        cells: [lease.name, (lease.operatorNames || []).join(', ') || lease.name, lease.frequency === 'NONE' ? '-' : fmtMoney(lease.amount), weeks || '-', deduction.isZero() ? '-' : `-${fmtMoney(deduction)}`],
+        colors: [C.ink, C.text, C.text, C.text, deduction.isZero() ? C.muted : C.red],
+        boldCols: deduction.isZero() ? [] : [4],
+      };
+    }), { fontSize: 8.2, rowPad: 4 });
+  }
+
+  if (calc.steps?.length) {
+    ensure(doc, 110 + calc.steps.length * 34);
+    sectionTitle(doc, 'Payment summary');
+    stepsTable(doc, calc.steps, left, width);
+  }
+}
+
 function weekExplainCard(doc, w, x, y, width, perTrip) {
   // compact card with the week's steps
   const steps = w.steps || [];
@@ -321,6 +452,7 @@ export async function statementPdf(m) {
   const tz = v.division?.timezone || 'America/Los_Angeles';
   const stamp = (x) => localDate(x, tz, 'long');
   const calc = v.calculation;
+  const uber = calc?.calculationType === 'UBER';
   const perTrip = v.settings?.paymentType?.value === 'PER_TRIP';
   const doc = newDoc('portrait', { Title: `VDP statement ${v.provider?.name || ''} ${cycleText(v.cycle)}` });
   const L = doc.content.left;
@@ -352,8 +484,8 @@ export async function statementPdf(m) {
   const endY = infoGrid(doc, [
     ['Division', v.division ? `DIV ${v.division.divisionNumber} – ${v.division.name}` : '—'],
     ['Service plan', v.plan?.name || '—'],
-    ['Payment type', perTrip ? 'Per trip' : 'Hourly'],
-    ['Contracted hours', s?.contractedHours?.value ? `${fmtNum(s.contractedHours.value)} h / week` : '—'],
+    ['Payment type', uber ? 'Uber vehicle / pay unit' : perTrip ? 'Per trip' : 'Hourly'],
+    ['Contracted hours', uber ? 'Provider profile by vehicle / pay unit' : s?.contractedHours?.value ? `${fmtNum(s.contractedHours.value)} h / week` : '—'],
     [perTrip ? 'Base rate' : 'Base rate', s?.basePay?.value ? `${fmtRate(s.basePay.value)}${perTrip ? ' / trip' : ' / h'}` : '—'],
     ['Bonus rate', s?.bonusEnabled?.value ? `${fmtRate(s.bonusRate.value)} / h above contract` : 'None'],
     ...(s?.fuelReimbursementEnabled?.value ? [['Fuel reimbursement', `${fmtRate(s.fuelReimbursementRate.value)} / trip`]] : []),
@@ -370,6 +502,9 @@ export async function statementPdf(m) {
     return toBuffer(doc);
   }
 
+  if (uber) {
+    uberStatementSections(doc, v, calc, L, W);
+  } else {
   // Performance & earnings
   const weeks = calc.weeks;
   sectionTitle(doc, 'Performance & earnings', 'Trips = Total Prov · Hours = Performance Report');
@@ -466,25 +601,31 @@ export async function statementPdf(m) {
     }
   }
 
+  }
+
   // Adjustments detail
   if (v.adjustments?.length) {
-    sectionTitle(doc, 'Deductions & additions detail');
+    sectionTitle(doc, uber ? 'Adjustments, toll credits and toll bills' : 'Deductions & additions detail');
     const ADD = new Set(['REIMBURSEMENT', 'OTHER_INCOME']);
     table(doc, [
-      { header: 'Type', width: W * 0.24 },
-      { header: 'Description', width: W * 0.46 },
-      { header: 'Date', width: W * 0.13 },
-      { header: 'Amount', width: W * 0.17, align: 'right' },
-    ], v.adjustments.map((a) => ({
-      cells: [
-        a.type.replace(/_/g, ' ').toLowerCase().replace(/^\w/, (c) => c.toUpperCase()),
-        a.description || '—',
-        shortDate(a.date),
-        `${ADD.has(a.type) ? '+' : '–'}${fmtMoney(a.amount)}`,
-      ],
-      colors: [C.ink, C.text, C.muted, ADD.has(a.type) ? C.green : C.red],
-      boldCols: [3],
-    })));
+      { header: 'Type', width: W * 0.13 },
+      { header: 'Description', width: W * 0.6 },
+      { header: 'Date', width: W * 0.12 },
+      { header: 'Amount', width: W * 0.15, align: 'right' },
+    ], v.adjustments.map((a) => {
+      const addition = ADD.has(a.type) || (uber && a.type === 'TOLL' && a.tollDirection !== 'DEDUCTION');
+      const assignment = a.operatorName ? `${a.operatorName}${a.week ? ` - week of ${shortDate(a.week)}` : ''}` : '';
+      return {
+        cells: [
+          uber && a.type === 'TOLL' ? (addition ? 'Toll credit' : 'Toll bill') : a.type.replace(/_/g, ' ').toLowerCase().replace(/^\w/, (c) => c.toUpperCase()),
+          [assignment, a.description].filter(Boolean).join(' - ') || '—',
+          uber && a.type === 'TOLL' ? md(a.date) : shortDate(a.date),
+          `${addition ? '+' : '-'}${fmtMoney(a.amount)}`,
+        ],
+        colors: [C.ink, C.text, C.muted, addition ? C.green : C.red],
+        boldCols: [3],
+      };
+    }));
   }
 
   // Service mile fuel allowance

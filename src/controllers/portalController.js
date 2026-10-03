@@ -50,7 +50,10 @@ function portalView(vdp) {
       settings: s.settings,
       performance: s.performance,
       lease: s.lease && { amount: s.lease.amount, frequency: s.lease.frequency, weeksCharged: s.lease.weeksCharged },
-      adjustments: (s.adjustments || []).map((a) => ({ type: a.type, amount: a.amount, description: a.description, date: a.date })),
+      adjustments: (s.adjustments || []).map((a) => ({
+        type: a.type, amount: a.amount, description: a.description, date: a.date,
+        operatorName: a.operatorName, week: a.week, tollDirection: a.tollDirection,
+      })),
       calculation: s.calculation,
       gross: s.gross,
       net: s.net,
