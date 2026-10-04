@@ -4,7 +4,6 @@ export const REQUIRED_UBER_COLUMNS = [
   'Total Supply Hours',
   'Paused Hours',
   'Core Hours_Total Supply Hours',
-  'Utilized Hours',
   'Total_Accepts',
   'Total_Rejects',
   'Total_Expired_Offers',
@@ -15,6 +14,7 @@ export const REQUIRED_UBER_COLUMNS = [
   'Week',
 ];
 
+export const OPTIONAL_UBER_COLUMNS = ['Utilized Hours'];
 const NUMERIC_COLUMNS = REQUIRED_UBER_COLUMNS.filter((column) => !['Driver_UUID', 'Week'].includes(column));
 const FIELD_NAMES = {
   'Total Supply Hours': 'totalSupplyHours',
@@ -136,6 +136,24 @@ export async function parseUberPerformanceFile(buffer, fileName) {
     const sourceZeroFields = [];
     for (const column of NUMERIC_COLUMNS) {
       const value = valueFor(column);
+      const sourceNull = isUberNull(value);
+      const parsedNumber = sourceNull ? '0' : exactNumber(value);
+      if (parsedNumber === null) errors.push(`Row ${rowNumber}, ${column}: expected a numeric value, found "${String(value ?? '')}".`);
+      else {
+        numeric[FIELD_NAMES[column]] = parsedNumber;
+        if (sourceNull) sourceZeroFields.push(column);
+      }
+    }
+    for (const column of OPTIONAL_UBER_COLUMNS) {
+      if (!byNormalized.has(normalizedHeader(column))) {
+        numeric[FIELD_NAMES[column]] = null;
+        continue;
+      }
+      const value = valueFor(column);
+      if (value === null || String(value).trim() === '') {
+        numeric[FIELD_NAMES[column]] = null;
+        continue;
+      }
       const sourceNull = isUberNull(value);
       const parsedNumber = sourceNull ? '0' : exactNumber(value);
       if (parsedNumber === null) errors.push(`Row ${rowNumber}, ${column}: expected a numeric value, found "${String(value ?? '')}".`);

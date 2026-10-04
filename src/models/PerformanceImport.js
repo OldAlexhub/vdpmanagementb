@@ -46,7 +46,9 @@ const uberRowSchema = new Schema(
     totalSupplyHours: dec({ required: true }),
     pausedHours: dec({ required: true }),
     coreHoursTotalSupplyHours: dec({ required: true }),
-    utilizedHours: dec({ required: true }),
+    // Optional at import time. The selected VDP Plan determines whether the
+    // calculation requires this metric.
+    utilizedHours: dec({ default: null }),
     totalAccepts: dec({ required: true }),
     totalRejects: dec({ required: true }),
     totalExpiredOffers: dec({ required: true }),

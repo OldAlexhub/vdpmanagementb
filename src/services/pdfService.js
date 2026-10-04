@@ -284,6 +284,42 @@ const ratio = (value, digits = 2) => (value === null || value === undefined
 
 function uberStatementSections(doc, v, calc, left, width) {
   const rows = calc.uberRows || [];
+  const first = rows[0];
+
+  if (first) {
+    sectionTitle(doc, 'Uber plan configuration', 'The same calculation engine applies the plan rules frozen with this VDP');
+    table(doc, [
+      { header: 'Rate structure', width: width * 0.22 },
+      { header: 'Min. fulfillment', width: width * 0.2 },
+      { header: 'Below threshold', width: width * 0.2 },
+      { header: 'Utilization', width: width * 0.18 },
+      { header: 'Core-hours rule', width: width * 0.2 },
+    ], [{ cells: [
+      first.rateStructureType === 'HOURLY_BANDS' ? 'Hourly bands' : 'Flat hourly rate',
+      ratio(first.qualificationThreshold),
+      first.belowThresholdBehavior === 'CORE_ONLY' ? 'Core only' : 'Fares only',
+      first.utilizationEnabled === false ? 'Disabled' : 'Enabled',
+      first.coreHoursRuleType === 'CONTINUOUS_COVERAGE' ? 'Continuous coverage - validate' : first.coreHoursRuleType === 'NONE' ? 'None' : 'Percentage',
+    ] }], { fontSize: 8, rowPad: 4 });
+
+    const bandRows = rows.flatMap((row) => row.rateStructureType === 'HOURLY_BANDS'
+      ? (row.baseCompensationBreakdown || []).map((band) => ({ row, band }))
+      : []);
+    if (bandRows.length) {
+      ensure(doc, 70);
+      sectionTitle(doc, 'Hourly-band compensation', 'Payable hours priced by the configured plan bands');
+      table(doc, [
+        { header: 'Week / pay unit', width: width * 0.34 },
+        { header: 'Band', width: width * 0.2 },
+        { header: 'Hours', width: width * 0.14, align: 'right' },
+        { header: 'Rate', width: width * 0.14, align: 'right' },
+        { header: 'Amount', width: width * 0.18, align: 'right' },
+      ], bandRows.map(({ row, band }) => ({
+        cells: [`${md(row.week)} - ${row.calculationUnitLabel}`, `${fmtNum(band.fromHour)}-${fmtNum(band.toHour)} h`, fmtNum(band.hours), fmtMoney(band.hourlyRate), fmtMoney(band.amount)],
+        boldCols: [4],
+      })), { fontSize: 7.8, rowPad: 3.5 });
+    }
+  }
 
   sectionTitle(doc, 'Cycle earnings summary', 'Weekly vehicle/pay-unit results with toll credits and provider bills shown separately');
   table(doc, [
@@ -309,11 +345,11 @@ function uberStatementSections(doc, v, calc, left, width) {
     { header: 'Week', width: 46 },
     { header: 'Unit', width: 66 },
     { header: 'Drivers', width: 92 },
-    { header: 'Hours Q / C / P', width: 72, align: 'right' },
+    { header: 'Q / C / P', width: 72, align: 'right' },
     { header: 'Fulfill.', width: 56, align: 'right' },
-    { header: 'Accept / cancel', width: 68, align: 'right' },
-    { header: 'Util / core', width: 60, align: 'right' },
-    { header: 'Pay', width: width - 460, align: 'right' },
+    { header: 'A / C rates', width: 68, align: 'right' },
+    { header: 'Util / core', width: 72, align: 'right' },
+    { header: 'Pay', width: width - 472, align: 'right' },
   ], rows.map((row) => ({
     cells: [
       md(row.week),
@@ -322,14 +358,14 @@ function uberStatementSections(doc, v, calc, left, width) {
       `${fmtNum(row.qualifyingSupplyHours)} / ${fmtNum(row.contractedHours)} / ${fmtNum(row.payableHours)}`,
       ratio(row.fulfillment),
       `${ratio(row.acceptanceRate)} / ${ratio(row.cancellationRate)}`,
-      `${ratio(row.utilizationRate)} / ${ratio(row.coreHoursPct)}`,
+      `${row.utilizationEnabled === false ? 'disabled' : ratio(row.utilizationRate)} / ${row.coreHoursRuleType === 'PERCENTAGE' ? ratio(row.coreHoursPct) : row.coreHoursRuleType === 'CONTINUOUS_COVERAGE' ? 'validate' : 'n/a'}`,
       fmtMoney(row.grossVdp),
     ],
     sub: [
       '', '', row.vehicleUnit && (row.operatorNames || []).length > 1 ? 'Shared vehicle' : '', '',
-      row.qualified ? `Qualified - hours tier ${ratio(row.hourIncentivePct)}` : 'Fallback earnings rule',
-      `Final incentive ${ratio(row.acceptanceCancellationPct)}`,
-      `Util tier ${ratio(row.utilizationIncentivePct)} - core ${row.coreHoursPassed ? 'pass' : 'below target'}`,
+      row.qualified ? `Tier ${ratio(row.hourIncentivePct)}` : `${row.belowThresholdBehavior === 'CORE_ONLY' ? 'Core-only' : 'Fares-only'} rule`,
+      `Earned ${ratio(row.acceptanceCancellationPct)}`,
+      `${row.utilizationEnabled === false ? 'Off' : ratio(row.utilizationIncentivePct)} / ${row.coreHoursValidationStatus === 'REQUIRES_COVERAGE_VALIDATION' ? 'validate' : row.coreHoursValidationStatus === 'NOT_APPLICABLE' ? 'n/a' : row.coreHoursPassed ? 'pass' : 'below'}`,
       '',
     ],
     fill: row.qualified ? C.greenSoft : C.amberSoft,
@@ -352,7 +388,7 @@ function uberStatementSections(doc, v, calc, left, width) {
       fmtMoney(row.coreCompensation), fmtMoney(row.contractHoursIncentive), fmtMoney(row.acceptanceCancellationIncentive),
       fmtMoney(row.utilizationIncentive), fmtMoney(row.tips), fmtMoney(row.grossVdp),
     ],
-    sub: [`Fallback source: ${fmtMoney(row.driverEarningsExclTips)} earnings excl. tips`, '', ratio(row.hourIncentivePct), ratio(row.acceptanceCancellationPct), ratio(row.utilizationIncentivePct), '', ''],
+    sub: [`${row.belowThresholdBehavior === 'CORE_ONLY' ? 'Core fallback' : 'Fares fallback'} ${row.belowThresholdBehavior === 'CORE_ONLY' ? fmtMoney(row.coreCompensation) : fmtMoney(row.driverEarningsExclTips)}`, '', ratio(row.hourIncentivePct), ratio(row.acceptanceCancellationPct), row.utilizationEnabled === false ? 'Disabled' : ratio(row.utilizationIncentivePct), '', ''],
     boldCols: [6],
   })), { fontSize: 7.8, rowPad: 4 });
 
@@ -481,12 +517,13 @@ export async function statementPdf(m) {
   const boxW = 208;
   doc.moveTo(L, top - 8).lineTo(L + W, top - 8).lineWidth(0.6).strokeColor(C.line).stroke();
   const s = v.settings;
+  const uberRateStructure = s?.uberConfig?.value?.rateStructureType || 'FLAT';
   const endY = infoGrid(doc, [
     ['Division', v.division ? `DIV ${v.division.divisionNumber} – ${v.division.name}` : '—'],
     ['Service plan', v.plan?.name || '—'],
     ['Payment type', uber ? 'Uber vehicle / pay unit' : perTrip ? 'Per trip' : 'Hourly'],
     ['Contracted hours', uber ? 'Provider profile by vehicle / pay unit' : s?.contractedHours?.value ? `${fmtNum(s.contractedHours.value)} h / week` : '—'],
-    [perTrip ? 'Base rate' : 'Base rate', s?.basePay?.value ? `${fmtRate(s.basePay.value)}${perTrip ? ' / trip' : ' / h'}` : '—'],
+    ['Base rate', uber && uberRateStructure === 'HOURLY_BANDS' ? 'VDP plan hourly bands' : s?.basePay?.value ? `${fmtRate(s.basePay.value)}${perTrip ? ' / trip' : ' / h'}` : '—'],
     ['Bonus rate', s?.bonusEnabled?.value ? `${fmtRate(s.bonusRate.value)} / h above contract` : 'None'],
     ...(s?.fuelReimbursementEnabled?.value ? [['Fuel reimbursement', `${fmtRate(s.fuelReimbursementRate.value)} / trip`]] : []),
     ...(s?.fuelMethod?.value === 'SERVICE_MILE_ALLOWANCE' ? [['Fuel', `Service mile allowance · ${fmtNum(s.fuelMpg.value)} MPG`]] : []),

@@ -55,12 +55,24 @@ export function versionInput(body) {
       ? {
           coreRatePct: decimalInput(uberSource.coreRatePct, 'Uber core rate percentage', { required: true, maxDp: 8 }),
           approvedExtraHours: decimalInput(uberSource.approvedExtraHours, 'Uber approved extra hours', { required: true, maxDp: 8 }),
+          minimumFulfillmentForIncentives: decimalInput(uberSource.minimumFulfillmentForIncentives, 'Uber minimum fulfillment for incentives', { required: true, maxDp: 8 }),
+          belowThresholdBehavior: uberSource.belowThresholdBehavior || 'FARES_ONLY',
+          rateStructureType: uberSource.rateStructureType || 'FLAT',
+          hourlyRateBands: (uberSource.hourlyRateBands || [])
+            .map((band, i) => ({
+              fromHour: decimalInput(band.fromHour, `Hourly rate band ${i + 1} from hour`, { required: true, maxDp: 8 }),
+              toHour: decimalInput(band.toHour, `Hourly rate band ${i + 1} to hour`, { required: true, maxDp: 8 }),
+              hourlyRate: decimalInput(band.hourlyRate, `Hourly rate band ${i + 1} rate`, { required: true, maxDp: 8 }),
+            }))
+            .sort((a, b) => D(a.fromHour).cmp(D(b.fromHour))),
           contractHoursIncentiveTiers: minimumTiers(uberSource.contractHoursIncentiveTiers, 'Contract-hours incentive'),
           acceptanceIncentiveTiers: minimumTiers(uberSource.acceptanceIncentiveTiers, 'Acceptance incentive'),
           cancellationIncentiveTiers: maximumTiers(uberSource.cancellationIncentiveTiers, 'Cancellation incentive'),
-          utilizationTarget: decimalInput(uberSource.utilizationTarget, 'Uber utilization target', { required: true, maxDp: 8 }),
-          utilizationIncentivePct: decimalInput(uberSource.utilizationIncentivePct, 'Uber utilization incentive percentage', { required: true, maxDp: 8 }),
-          coreHoursRequirement: decimalInput(uberSource.coreHoursRequirement, 'Uber core-hours requirement', { required: true, maxDp: 8 }),
+          utilizationEnabled: uberSource.utilizationEnabled !== false,
+          utilizationTarget: decimalInput(uberSource.utilizationTarget, 'Uber utilization target', { required: uberSource.utilizationEnabled !== false, maxDp: 8 }),
+          utilizationIncentivePct: decimalInput(uberSource.utilizationIncentivePct, 'Uber utilization incentive percentage', { required: uberSource.utilizationEnabled !== false, maxDp: 8 }),
+          coreHoursRuleType: uberSource.coreHoursRuleType || 'PERCENTAGE',
+          coreHoursRequirement: decimalInput(uberSource.coreHoursRequirement, 'Uber core-hours requirement', { required: (uberSource.coreHoursRuleType || 'PERCENTAGE') === 'PERCENTAGE', maxDp: 8 }),
         }
       : undefined,
     effectiveFrom: body.effectiveFrom ? toDateOnly(body.effectiveFrom) : null,

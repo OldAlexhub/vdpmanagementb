@@ -2,7 +2,7 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import XLSX from 'xlsx';
-import { parseUberPerformanceFile, REQUIRED_UBER_COLUMNS, UberFileValidationError } from '../src/services/uberPerformanceParser.js';
+import { parseUberPerformanceFile, REQUIRED_UBER_COLUMNS, OPTIONAL_UBER_COLUMNS, UberFileValidationError } from '../src/services/uberPerformanceParser.js';
 
 const fixtures = [
   '../artifacts/9.07.26 - 9.14.26.xlsx',
@@ -83,6 +83,13 @@ describe('Uber performance parser', () => {
     );
   });
 
+  test('accepts a missing Utilized Hours column so plan eligibility can be decided by the engine', async () => {
+    const row = validRow();
+    delete row['Utilized Hours'];
+    const parsed = await parseUberPerformanceFile(bufferFor([row]), 'no-utilization.xlsx');
+    assert.equal(parsed.rows[0].utilizedHours, null);
+  });
+
   test('accepts legacy .xls and .csv files', async () => {
     const xls = await parseUberPerformanceFile(bufferFor([validRow()], 'biff8'), 'weekly.xls');
     const csvSheet = XLSX.utils.json_to_sheet([validRow()]);
@@ -92,5 +99,8 @@ describe('Uber performance parser', () => {
     assert.equal(parsedCsv.rowCount, 1);
   });
 
-  test('required column contract stays explicit', () => assert.equal(REQUIRED_UBER_COLUMNS.length, 12));
+  test('required and optional column contracts stay explicit', () => {
+    assert.equal(REQUIRED_UBER_COLUMNS.length, 11);
+    assert.deepEqual(OPTIONAL_UBER_COLUMNS, ['Utilized Hours']);
+  });
 });

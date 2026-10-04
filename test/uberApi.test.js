@@ -69,6 +69,11 @@ test('Uber plan, upload, processing, weekly adjustment, and audit snapshot', { s
   assert.equal(plan.versions[0].basePay, null);
   assert.equal(plan.versions[0].contractedHours, null);
   assert.equal(plan.versions[0].uberConfig.coreRatePct, '0.65');
+  assert.equal(plan.versions[0].uberConfig.minimumFulfillmentForIncentives, '0.94');
+  assert.equal(plan.versions[0].uberConfig.belowThresholdBehavior, 'FARES_ONLY');
+  assert.equal(plan.versions[0].uberConfig.utilizationEnabled, true);
+  assert.equal(plan.versions[0].uberConfig.rateStructureType, 'FLAT');
+  assert.equal(plan.versions[0].uberConfig.coreHoursRuleType, 'PERCENTAGE');
 
   response = await call('POST', '/providers', {
     divisionId: division._id, name: 'Mary Witt LLC', planId: plan._id,
@@ -179,6 +184,11 @@ test('Uber plan, upload, processing, weekly adjustment, and audit snapshot', { s
   vdp = response.data;
   assert.equal(vdp.view.source, 'SNAPSHOT');
   assert.equal(vdp.view.settings.uberConfig.value.coreRatePct, '0.65');
+  assert.equal(vdp.view.settings.uberConfig.value.minimumFulfillmentForIncentives, '0.94');
+  assert.equal(vdp.view.settings.uberConfig.value.belowThresholdBehavior, 'FARES_ONLY');
+  assert.equal(vdp.view.settings.uberConfig.value.utilizationEnabled, true);
+  assert.equal(vdp.view.settings.uberConfig.value.rateStructureType, 'FLAT');
+  assert.equal(vdp.view.settings.uberConfig.value.coreHoursRuleType, 'PERCENTAGE');
   assert.equal(vdp.view.uberPerformanceImports.length, 1);
   assert.equal(vdp.view.calculation.uberRows[0].raw.totalSupplyHours, '52.86');
   assert.equal(vdp.view.calculation.uberRows[0].grossVdp, '1600.75');
@@ -187,4 +197,31 @@ test('Uber plan, upload, processing, weekly adjustment, and audit snapshot', { s
   assert.equal(vdp.view.adjustments[1].operatorName, 'Mary Witt');
   assert.equal(vdp.view.adjustments[1].week, '2026-09-07');
   assert.equal(vdp.view.adjustments[1].tollDirection, 'DEDUCTION');
+  response = await call('GET', `/vdps/${vdp._id}/statement.pdf`);
+  assert.equal(response.status, 200);
+
+  // A later plan version must not alter the plan settings or result frozen in
+  // an approved VDP snapshot.
+  response = await call('POST', `/vdp-plans/${plan._id}/versions`, {
+    calculationType: 'UBER',
+    effectiveFrom: '2026-09-21',
+    uberConfig: {
+      coreRatePct: '0.80',
+      minimumFulfillmentForIncentives: '0.90',
+      belowThresholdBehavior: 'CORE_ONLY',
+      utilizationEnabled: false,
+      coreHoursRuleType: 'PERCENTAGE',
+      coreHoursRequirement: '1.00',
+    },
+  });
+  assert.equal(response.status, 201, JSON.stringify(response.data));
+  assert.equal(response.data.versions[0].uberConfig.coreRatePct, '0.80');
+
+  vdp = (await call('GET', `/vdps/${vdp._id}`)).data;
+  assert.equal(vdp.view.source, 'SNAPSHOT');
+  assert.equal(vdp.view.settings.uberConfig.value.coreRatePct, '0.65');
+  assert.equal(vdp.view.settings.uberConfig.value.minimumFulfillmentForIncentives, '0.94');
+  assert.equal(vdp.view.settings.uberConfig.value.belowThresholdBehavior, 'FARES_ONLY');
+  assert.equal(vdp.view.calculation.uberRows[0].grossVdp, '1600.75');
+  assert.equal(vdp.view.calculation.gross, '1621.75');
 });

@@ -11,6 +11,10 @@ export const CALCULATION_TYPES = ['STANDARD', 'UBER'];
 export const DEFAULT_UBER_CONFIG = {
   coreRatePct: '0.65',
   approvedExtraHours: '0',
+  minimumFulfillmentForIncentives: '0.94',
+  belowThresholdBehavior: 'FARES_ONLY',
+  rateStructureType: 'FLAT',
+  hourlyRateBands: [],
   contractHoursIncentiveTiers: [
     { minimum: '0.94', rate: '0.05' },
     { minimum: '0.96', rate: '0.10' },
@@ -24,10 +28,42 @@ export const DEFAULT_UBER_CONFIG = {
     { maximum: '0.04', rate: '0.10' },
     { maximum: '0.05', rate: '0.05' },
   ],
+  utilizationEnabled: true,
   utilizationTarget: '0.70',
   utilizationIncentivePct: '0.05',
+  coreHoursRuleType: 'PERCENTAGE',
   coreHoursRequirement: '0.60',
 };
+
+export const UBER_BELOW_THRESHOLD_BEHAVIORS = ['FARES_ONLY', 'CORE_ONLY'];
+export const UBER_RATE_STRUCTURE_TYPES = ['FLAT', 'HOURLY_BANDS'];
+export const UBER_CORE_HOURS_RULE_TYPES = ['PERCENTAGE', 'CONTINUOUS_COVERAGE', 'NONE'];
+
+// Versions created before these controls existed must retain the exact DIV 12
+// semantics that were in force at the time. The threshold is derived from the
+// historical fulfillment tiers when possible, matching the legacy engine.
+export function uberConfigOf(config) {
+  const raw = config?.toObject ? config.toObject({ getters: true }) : (config || {});
+  const contractHoursIncentiveTiers = raw.contractHoursIncentiveTiers ?? DEFAULT_UBER_CONFIG.contractHoursIncentiveTiers;
+  const lowestTier = [...contractHoursIncentiveTiers]
+    .filter((tier) => !isBlank(tier?.minimum))
+    .sort((a, b) => D(a.minimum).cmp(D(b.minimum)))[0];
+  return {
+    ...DEFAULT_UBER_CONFIG,
+    ...raw,
+    contractHoursIncentiveTiers,
+    acceptanceIncentiveTiers: raw.acceptanceIncentiveTiers ?? DEFAULT_UBER_CONFIG.acceptanceIncentiveTiers,
+    cancellationIncentiveTiers: raw.cancellationIncentiveTiers ?? DEFAULT_UBER_CONFIG.cancellationIncentiveTiers,
+    hourlyRateBands: raw.hourlyRateBands ?? [],
+    minimumFulfillmentForIncentives: isBlank(raw.minimumFulfillmentForIncentives)
+      ? str(lowestTier?.minimum ?? DEFAULT_UBER_CONFIG.minimumFulfillmentForIncentives)
+      : str(raw.minimumFulfillmentForIncentives),
+    belowThresholdBehavior: raw.belowThresholdBehavior || 'FARES_ONLY',
+    utilizationEnabled: raw.utilizationEnabled ?? true,
+    rateStructureType: raw.rateStructureType || 'FLAT',
+    coreHoursRuleType: raw.coreHoursRuleType || 'PERCENTAGE',
+  };
+}
 
 // Versions saved before fuelMethod existed only had the per-trip switch.
 export const fuelMethodOf = (v) => v?.fuelMethod || (v?.fuelReimbursementEnabled ? 'PER_TRIP' : 'NONE');
@@ -90,15 +126,39 @@ export function validateVersion(v) {
   }
   if (calculationType === 'UBER') {
     if (v.paymentType !== 'HOURLY') errors.push('Uber plans use an hourly base rate.');
-    const u = v.uberConfig || {};
+    const u = uberConfigOf(v.uberConfig);
     validateRatio(u.coreRatePct, 'Uber core rate percentage', errors);
     if (isBlank(u.approvedExtraHours) || D(u.approvedExtraHours).lt(0)) errors.push('Uber approved extra hours cannot be negative.');
+    validateRatio(u.minimumFulfillmentForIncentives, 'Uber minimum fulfillment for incentives', errors, { max: 10 });
+    if (!UBER_BELOW_THRESHOLD_BEHAVIORS.includes(u.belowThresholdBehavior)) errors.push('Choose a valid Uber below-threshold behavior.');
+    if (!UBER_RATE_STRUCTURE_TYPES.includes(u.rateStructureType)) errors.push('Choose a valid Uber rate structure.');
+    if (u.rateStructureType === 'HOURLY_BANDS') {
+      if (!u.hourlyRateBands?.length) errors.push('Uber hourly-band plans need at least one rate band.');
+      let previousTo = null;
+      (u.hourlyRateBands || []).forEach((band, i) => {
+        if (isBlank(band.fromHour) || isBlank(band.toHour) || isBlank(band.hourlyRate)) {
+          errors.push(`Uber hourly rate band ${i + 1} needs From Hour, To Hour, and Rate.`);
+          return;
+        }
+        const from = D(band.fromHour);
+        const to = D(band.toHour);
+        const rate = D(band.hourlyRate);
+        if (from.lt(0) || to.lte(from)) errors.push(`Uber hourly rate band ${i + 1} must have a non-negative start and an end greater than its start.`);
+        if (rate.lt(0)) errors.push(`Uber hourly rate band ${i + 1} rate cannot be negative.`);
+        if (i === 0 && !from.eq(0)) errors.push('Uber hourly rate bands must start at hour 0.');
+        if (previousTo !== null && !from.eq(previousTo)) errors.push('Uber hourly rate bands must be contiguous and cannot overlap.');
+        previousTo = to;
+      });
+    }
     validateMinimumTiers(u.contractHoursIncentiveTiers, 'Uber contract-hours incentive tiers', errors, 10);
     validateMinimumTiers(u.acceptanceIncentiveTiers, 'Uber acceptance incentive tiers', errors, 1);
     validateMaximumTiers(u.cancellationIncentiveTiers, 'Uber cancellation incentive tiers', errors);
-    validateRatio(u.utilizationTarget, 'Uber utilization target', errors);
-    validateRatio(u.utilizationIncentivePct, 'Uber utilization incentive percentage', errors);
-    validateRatio(u.coreHoursRequirement, 'Uber core-hours requirement', errors);
+    if (u.utilizationEnabled) {
+      validateRatio(u.utilizationTarget, 'Uber utilization target', errors);
+      validateRatio(u.utilizationIncentivePct, 'Uber utilization incentive percentage', errors);
+    }
+    if (!UBER_CORE_HOURS_RULE_TYPES.includes(u.coreHoursRuleType)) errors.push('Choose a valid Uber core-hours rule.');
+    if (u.coreHoursRuleType === 'PERCENTAGE') validateRatio(u.coreHoursRequirement, 'Uber core-hours requirement', errors);
     return errors;
   }
   if (v.bonusEnabled) {
@@ -177,6 +237,8 @@ export function resolveSettings(provider, plan, version) {
   const tuiSource = !o.tuiEligibility || o.tuiEligibility === 'INHERIT' ? 'PLAN' : 'PROVIDER_OVERRIDE';
   const tuiEligible = tuiSource === 'PLAN' ? Boolean(version.incentiveEnabled) : o.tuiEligibility === 'ON';
 
+  const uber = calculationTypeOf(version) === 'UBER' ? uberConfigOf(version.uberConfig) : null;
+
   return {
     planId: plan._id,
     planName: plan.name,
@@ -213,14 +275,24 @@ export function resolveSettings(provider, plan, version) {
     uberConfig: calculationTypeOf(version) === 'UBER'
       ? {
           value: {
-            coreRatePct: str(version.uberConfig?.coreRatePct),
-            approvedExtraHours: str(version.uberConfig?.approvedExtraHours) ?? '0',
-            contractHoursIncentiveTiers: (version.uberConfig?.contractHoursIncentiveTiers || []).map((t) => ({ minimum: str(t.minimum), rate: str(t.rate) })),
-            acceptanceIncentiveTiers: (version.uberConfig?.acceptanceIncentiveTiers || []).map((t) => ({ minimum: str(t.minimum), rate: str(t.rate) })),
-            cancellationIncentiveTiers: (version.uberConfig?.cancellationIncentiveTiers || []).map((t) => ({ maximum: str(t.maximum), rate: str(t.rate) })),
-            utilizationTarget: str(version.uberConfig?.utilizationTarget),
-            utilizationIncentivePct: str(version.uberConfig?.utilizationIncentivePct),
-            coreHoursRequirement: str(version.uberConfig?.coreHoursRequirement),
+            coreRatePct: str(uber.coreRatePct),
+            approvedExtraHours: str(uber.approvedExtraHours) ?? '0',
+            minimumFulfillmentForIncentives: str(uber.minimumFulfillmentForIncentives),
+            belowThresholdBehavior: uber.belowThresholdBehavior,
+            rateStructureType: uber.rateStructureType,
+            hourlyRateBands: (uber.hourlyRateBands || []).map((band) => ({
+              fromHour: str(band.fromHour),
+              toHour: str(band.toHour),
+              hourlyRate: str(band.hourlyRate),
+            })),
+            contractHoursIncentiveTiers: (uber.contractHoursIncentiveTiers || []).map((t) => ({ minimum: str(t.minimum), rate: str(t.rate) })),
+            acceptanceIncentiveTiers: (uber.acceptanceIncentiveTiers || []).map((t) => ({ minimum: str(t.minimum), rate: str(t.rate) })),
+            cancellationIncentiveTiers: (uber.cancellationIncentiveTiers || []).map((t) => ({ maximum: str(t.maximum), rate: str(t.rate) })),
+            utilizationEnabled: uber.utilizationEnabled,
+            utilizationTarget: str(uber.utilizationTarget),
+            utilizationIncentivePct: str(uber.utilizationIncentivePct),
+            coreHoursRuleType: uber.coreHoursRuleType,
+            coreHoursRequirement: str(uber.coreHoursRequirement),
           },
           source: 'PLAN',
         }

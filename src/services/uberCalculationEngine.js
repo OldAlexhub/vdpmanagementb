@@ -20,6 +20,92 @@ function maximumTier(value, tiers) {
     .find((tier) => D(value).lte(tier.maximum)) || null;
 }
 
+const missing = (value) => value === null || value === undefined || value === '';
+
+function normalizeSettings(settings = {}) {
+  const fulfillmentTiers = settings.contractHoursIncentiveTiers || [];
+  const lowestTier = [...fulfillmentTiers].sort((a, b) => D(a.minimum).cmp(D(b.minimum)))[0];
+  return {
+    ...settings,
+    minimumFulfillmentForIncentives: missing(settings.minimumFulfillmentForIncentives)
+      ? str(lowestTier?.minimum ?? '0.94')
+      : str(settings.minimumFulfillmentForIncentives),
+    belowThresholdBehavior: settings.belowThresholdBehavior || 'FARES_ONLY',
+    utilizationEnabled: settings.utilizationEnabled ?? true,
+    rateStructureType: settings.rateStructureType || 'FLAT',
+    hourlyRateBands: settings.hourlyRateBands || [],
+    coreHoursRuleType: settings.coreHoursRuleType || 'PERCENTAGE',
+  };
+}
+
+export function calculateBaseCompensation(payableHours, settings) {
+  const hours = D(payableHours);
+  if (settings.rateStructureType !== 'HOURLY_BANDS') {
+    const amount = cents(hours.times(settings.baseHourlyRate));
+    return {
+      amount,
+      breakdown: [{
+        fromHour: D(0), toHour: hours, hours, hourlyRate: D(settings.baseHourlyRate), amount,
+      }],
+    };
+  }
+  const breakdown = settings.hourlyRateBands.map((band) => {
+    const fromHour = D(band.fromHour);
+    const toHour = D(band.toHour);
+    const available = min(hours, toHour).minus(fromHour);
+    const bandHours = available.gt(0) ? available : D(0);
+    return {
+      fromHour,
+      toHour,
+      hours: bandHours,
+      hourlyRate: D(band.hourlyRate),
+      amount: cents(bandHours.times(band.hourlyRate)),
+    };
+  });
+  const coveredThrough = settings.hourlyRateBands.length
+    ? D(settings.hourlyRateBands.at(-1).toHour)
+    : D(0);
+  if (hours.gt(coveredThrough)) {
+    throw new UberCalculationError(`Uber hourly rate bands cover ${fmtNum(coveredThrough)} hours, but ${fmtNum(hours)} payable hours were calculated.`);
+  }
+  return { amount: cents(sum(breakdown.map((band) => band.amount))), breakdown };
+}
+
+export const determineFulfillmentTier = (fulfillment, tiers) => minimumTier(fulfillment, tiers);
+
+export function determineAcceptanceCancellationTier(acceptanceRate, cancellationRate, accepts, settings) {
+  const acceptanceTier = minimumTier(acceptanceRate, settings.acceptanceIncentiveTiers);
+  const cancellationTier = D(accepts).gt(0) ? maximumTier(cancellationRate, settings.cancellationIncentiveTiers) : null;
+  const acceptancePct = D(acceptanceTier?.rate || 0);
+  const cancellationPct = D(cancellationTier?.rate || 0);
+  return {
+    acceptanceTier,
+    cancellationTier,
+    acceptancePct,
+    cancellationPct,
+    combinedPct: min(acceptancePct, cancellationPct),
+  };
+}
+
+export const calculateCoreCompensation = (baseCompensation, coreRatePct) => cents(D(baseCompensation).times(coreRatePct));
+
+export function calculateUtilizationIncentive(baseCompensation, qualifyingSupplyHours, utilizedHours, settings) {
+  if (!settings.utilizationEnabled) {
+    return { utilizationRate: null, utilizationIncentivePct: D(0), utilizationIncentive: D(0) };
+  }
+  if (missing(utilizedHours)) throw new UberCalculationError('Utilized Hours is required because this Uber plan enables utilization incentive.');
+  const utilized = D(utilizedHours);
+  if (utilized.lt(0)) throw new UberCalculationError('Uber performance data has negative utilized hours.');
+  const rate = D(qualifyingSupplyHours).gt(0) ? utilized.div(qualifyingSupplyHours) : D(0);
+  const pct = rate.gte(settings.utilizationTarget) ? D(settings.utilizationIncentivePct) : D(0);
+  return { utilizationRate: rate, utilizationIncentivePct: pct, utilizationIncentive: cents(D(baseCompensation).times(pct)) };
+}
+
+export function determineBelowThresholdCompensation({ behavior, coreCompensation, driverEarningsExclTips, tips, passThroughTotal }) {
+  const base = behavior === 'CORE_ONLY' ? D(coreCompensation) : D(driverEarningsExclTips);
+  return cents(base.plus(tips).plus(passThroughTotal));
+}
+
 const pctText = (value) => `${D(value).times(100).toDecimalPlaces(4).toString()}%`;
 const keyOf = (unit, week) => `${String(unit).toLowerCase()}|${week}`;
 const SUM_FIELDS = [
@@ -40,9 +126,12 @@ const sourceRow = (row) => ({
   ...Object.fromEntries(SUM_FIELDS.map((field) => [field, row[field]])),
 });
 
-const sharedSettingsSignature = (settings = {}) => JSON.stringify(Object.fromEntries(
-  Object.entries(settings).filter(([key]) => !['contractedWeeklyHours', 'contractedWeeklyHoursSource'].includes(key)),
-));
+const sharedSettingsSignature = (settings = {}) => {
+  const normalized = normalizeSettings(settings);
+  const ignored = ['contractedWeeklyHours', 'contractedWeeklyHoursSource'];
+  if (normalized.rateStructureType === 'HOURLY_BANDS') ignored.push('baseHourlyRate', 'baseHourlyRateSource');
+  return JSON.stringify(Object.fromEntries(Object.entries(normalized).filter(([key]) => !ignored.includes(key))));
+};
 
 // Uber contracts are normally one driver per vehicle. When several operators on
 // the provider profile share a Vehicle / pay unit, their source rows are summed
@@ -92,7 +181,10 @@ function groupCalculationRows(rows) {
       sourceFileName: sourceFiles.join(', '),
       sourceFiles,
       sourceRows: group.rows.map(sourceRow),
-      ...Object.fromEntries(SUM_FIELDS.map((field) => [field, str(sum(group.rows.map((row) => D(row[field]))))])),
+      ...Object.fromEntries(SUM_FIELDS.map((field) => [
+        field,
+        group.rows.some((row) => missing(row[field])) ? null : str(sum(group.rows.map((row) => D(row[field])))),
+      ])),
     };
   });
 }
@@ -111,14 +203,31 @@ function adjustmentFor(row, adjustments) {
 }
 
 function validatePlanSettings(settings) {
+  settings = normalizeSettings(settings);
   if (!settings.contractHoursIncentiveTiers?.length) throw new UberCalculationError('Uber contract-hours incentive tiers are missing.');
   if (!settings.acceptanceIncentiveTiers?.length) throw new UberCalculationError('Uber acceptance incentive tiers are missing.');
   if (!settings.cancellationIncentiveTiers?.length) throw new UberCalculationError('Uber cancellation incentive tiers are missing.');
+  if (!['FARES_ONLY', 'CORE_ONLY'].includes(settings.belowThresholdBehavior)) throw new UberCalculationError('Uber below-threshold behavior is invalid.');
+  if (!['FLAT', 'HOURLY_BANDS'].includes(settings.rateStructureType)) throw new UberCalculationError('Uber rate structure is invalid.');
+  if (!['PERCENTAGE', 'CONTINUOUS_COVERAGE', 'NONE'].includes(settings.coreHoursRuleType)) throw new UberCalculationError('Uber core-hours rule is invalid.');
+  if (D(settings.minimumFulfillmentForIncentives).lt(0)) throw new UberCalculationError('Uber minimum fulfillment for incentives cannot be negative.');
+  if (settings.rateStructureType === 'HOURLY_BANDS') {
+    if (!settings.hourlyRateBands.length) throw new UberCalculationError('Uber hourly rate bands are missing.');
+    let previousTo = D(0);
+    settings.hourlyRateBands.forEach((band, index) => {
+      const from = D(band.fromHour);
+      const to = D(band.toHour);
+      if (!from.eq(previousTo) || to.lte(from) || D(band.hourlyRate).lt(0)) {
+        throw new UberCalculationError(`Uber hourly rate band ${index + 1} is invalid; bands must start at 0, be contiguous, and have non-negative rates.`);
+      }
+      previousTo = to;
+    });
+  }
 }
 
 function validateSettings(settings) {
   validatePlanSettings(settings);
-  if (D(settings.baseHourlyRate).lte(0)) {
+  if (settings.rateStructureType === 'FLAT' && D(settings.baseHourlyRate).lte(0)) {
     throw new UberCalculationError('Uber operator base hourly rate must be greater than zero.');
   }
   if (D(settings.contractedWeeklyHours).lte(0)) {
@@ -127,7 +236,7 @@ function validateSettings(settings) {
 }
 
 function calculateRow(settings, row, adjustment = {}) {
-  settings = { ...settings, ...(row.settings || {}) };
+  settings = normalizeSettings({ ...settings, ...(row.settings || {}) });
   validateSettings(settings);
   const totalSupplyHours = D(row.totalSupplyHours);
   const pausedHours = D(row.pausedHours);
@@ -135,7 +244,7 @@ function calculateRow(settings, row, adjustment = {}) {
     throw new UberCalculationError(`${row.driverUuid} (${row.week}) has invalid supply/paused hours.`);
   }
   const contractedHours = D(settings.contractedWeeklyHours);
-  const approvedExtraHours = adjustment.approvedExtraHours === null || adjustment.approvedExtraHours === undefined || adjustment.approvedExtraHours === ''
+  const approvedExtraHours = missing(adjustment.approvedExtraHours)
     ? D(settings.approvedExtraHours || 0)
     : D(adjustment.approvedExtraHours);
   if (approvedExtraHours.lt(0)) throw new UberCalculationError('Approved extra hours cannot be negative.');
@@ -143,76 +252,95 @@ function calculateRow(settings, row, adjustment = {}) {
   const qualifyingSupplyHours = totalSupplyHours.minus(pausedHours);
   const fulfillment = qualifyingSupplyHours.div(contractedHours);
   const payableHours = min(qualifyingSupplyHours, contractedHours.plus(approvedExtraHours));
-  const hourTier = minimumTier(fulfillment, settings.contractHoursIncentiveTiers);
-  const hourIncentivePct = D(hourTier?.rate || 0);
-  const qualificationThreshold = D([...settings.contractHoursIncentiveTiers]
-    .sort((a, b) => D(a.minimum).cmp(D(b.minimum)))[0].minimum);
-  const qualified = fulfillment.gte(qualificationThreshold);
+  const hourTier = determineFulfillmentTier(fulfillment, settings.contractHoursIncentiveTiers);
+  const qualificationThreshold = D(settings.minimumFulfillmentForIncentives);
+  const qualifiedForIncentives = fulfillment.gte(qualificationThreshold);
+  const candidateHourIncentivePct = D(hourTier?.rate || 0);
+  const hourIncentivePct = qualifiedForIncentives ? candidateHourIncentivePct : D(0);
 
   const accepts = D(row.totalAccepts);
   const rejects = D(row.totalRejects);
   const expiredOffers = D(row.totalExpiredOffers);
   const cancels = D(row.totalCancels);
-  if ([accepts, rejects, expiredOffers, cancels].some((v) => v.lt(0))) {
+  if ([accepts, rejects, expiredOffers, cancels].some((value) => value.lt(0))) {
     throw new UberCalculationError(`${row.driverUuid} (${row.week}) has a negative offer/cancellation count.`);
   }
   const totalOffers = accepts.plus(rejects).plus(expiredOffers);
   const acceptanceRate = totalOffers.gt(0) ? accepts.div(totalOffers) : D(0);
-  const acceptanceTier = minimumTier(acceptanceRate, settings.acceptanceIncentiveTiers);
-  const acceptanceIncentivePct = D(acceptanceTier?.rate || 0);
-
   const cancellationRate = accepts.gt(0) ? cancels.div(accepts) : D(0);
-  const cancellationTier = accepts.gt(0) ? maximumTier(cancellationRate, settings.cancellationIncentiveTiers) : null;
-  const cancellationIncentivePct = D(cancellationTier?.rate || 0);
-  const acceptanceCancellationPct = min(acceptanceIncentivePct, cancellationIncentivePct);
+  const performanceTier = determineAcceptanceCancellationTier(acceptanceRate, cancellationRate, accepts, settings);
+  const acceptanceIncentivePct = qualifiedForIncentives ? performanceTier.acceptancePct : D(0);
+  const cancellationIncentivePct = qualifiedForIncentives ? performanceTier.cancellationPct : D(0);
+  const acceptanceCancellationPct = qualifiedForIncentives ? performanceTier.combinedPct : D(0);
 
-  const utilizedHours = D(row.utilizedHours);
-  if (utilizedHours.lt(0)) throw new UberCalculationError(`${row.driverUuid} (${row.week}) has negative utilized hours.`);
-  const utilizationRate = qualifyingSupplyHours.gt(0) ? utilizedHours.div(qualifyingSupplyHours) : D(0);
-  const utilizationIncentivePct = utilizationRate.gte(settings.utilizationTarget) ? D(settings.utilizationIncentivePct) : D(0);
+  let coreHoursPct = null;
+  let coreHoursPassed = null;
+  let coreHoursValidationStatus = 'NOT_APPLICABLE';
+  if (settings.coreHoursRuleType === 'PERCENTAGE') {
+    const coreHours = D(row.coreHoursTotalSupplyHours);
+    if (coreHours.lt(0)) throw new UberCalculationError(`${row.driverUuid} (${row.week}) has negative core hours.`);
+    coreHoursPct = coreHours.div(contractedHours);
+    coreHoursPassed = coreHoursPct.gte(settings.coreHoursRequirement);
+    coreHoursValidationStatus = coreHoursPassed ? 'PASS' : 'BELOW_REQUIREMENT';
+  } else if (settings.coreHoursRuleType === 'CONTINUOUS_COVERAGE') {
+    coreHoursValidationStatus = 'REQUIRES_COVERAGE_VALIDATION';
+  }
 
-  const coreHours = D(row.coreHoursTotalSupplyHours);
-  if (coreHours.lt(0)) throw new UberCalculationError(`${row.driverUuid} (${row.week}) has negative core hours.`);
-  const coreHoursPct = coreHours.div(contractedHours);
-  const coreHoursPassed = coreHoursPct.gte(settings.coreHoursRequirement);
-
-  const baseCompensation = cents(payableHours.times(settings.baseHourlyRate));
-  const coreCompensation = cents(baseCompensation.times(settings.coreRatePct));
+  const base = calculateBaseCompensation(payableHours, settings);
+  const baseCompensation = base.amount;
+  const coreCompensation = calculateCoreCompensation(baseCompensation, settings.coreRatePct);
   const contractHoursIncentive = cents(baseCompensation.times(hourIncentivePct));
+  const utilization = calculateUtilizationIncentive(baseCompensation, qualifyingSupplyHours, row.utilizedHours, settings);
+  const utilizationRate = utilization.utilizationRate;
+  const utilizationIncentivePct = qualifiedForIncentives ? utilization.utilizationIncentivePct : D(0);
+  const utilizationIncentive = qualifiedForIncentives ? utilization.utilizationIncentive : D(0);
   const acceptanceCancellationIncentive = cents(baseCompensation.times(acceptanceCancellationPct));
-  const utilizationIncentive = cents(baseCompensation.times(utilizationIncentivePct));
   const driverEarningsExclTips = cents(row.driverEarningsExclTips);
   const tips = cents(row.driverTips);
-  const passThroughs = (adjustment.passThroughs || []).map((p) => {
-    const amount = cents(p.amount || 0);
+  const passThroughs = (adjustment.passThroughs || []).map((passThrough) => {
+    const amount = cents(passThrough.amount || 0);
     if (amount.lt(0)) throw new UberCalculationError('Pass-through amounts cannot be negative.');
-    return { type: p.type || 'OTHER', amount, description: p.description || '' };
+    return { type: passThrough.type || 'OTHER', amount, description: passThrough.description || '' };
   });
-  const passThroughTotal = sum(passThroughs.map((p) => p.amount));
-  const tolls = sum(passThroughs.filter((p) => p.type === 'TOLL').map((p) => p.amount));
+  const passThroughTotal = sum(passThroughs.map((passThrough) => passThrough.amount));
+  const tolls = sum(passThroughs.filter((passThrough) => passThrough.type === 'TOLL').map((passThrough) => passThrough.amount));
 
-  // The fallback is intentionally isolated: earnings excluding tips are never
-  // added to the qualified accounting-style compensation.
   const normalGross = coreCompensation
     .plus(contractHoursIncentive)
     .plus(acceptanceCancellationIncentive)
     .plus(utilizationIncentive)
     .plus(tips)
     .plus(passThroughTotal);
-  const fallbackGross = driverEarningsExclTips.plus(tips).plus(passThroughTotal);
-  const grossVdp = cents(qualified ? normalGross : fallbackGross);
+  const belowThresholdGross = determineBelowThresholdCompensation({
+    behavior: settings.belowThresholdBehavior,
+    coreCompensation,
+    driverEarningsExclTips,
+    tips,
+    passThroughTotal,
+  });
+  const grossVdp = cents(qualifiedForIncentives ? normalGross : belowThresholdGross);
 
-  const explanation = qualified
+  const bandExplanation = settings.rateStructureType === 'HOURLY_BANDS'
+    ? `Base compensation: ${base.breakdown.map((band) => `${fmtNum(band.hours)} h x ${fmtMoney(band.hourlyRate)}`).join(' + ')} = ${fmtMoney(baseCompensation)}`
+    : `Base compensation: ${fmtNum(payableHours)} h x ${fmtMoney(settings.baseHourlyRate)} = ${fmtMoney(baseCompensation)}`;
+  const explanation = qualifiedForIncentives
     ? [
         `Qualified supply: ${fmtNum(totalSupplyHours)} - ${fmtNum(pausedHours)} = ${fmtNum(qualifyingSupplyHours)} hours`,
         `Fulfillment: ${fmtNum(qualifyingSupplyHours)} / ${fmtNum(contractedHours)} = ${pctText(fulfillment)}`,
         `Payable hours: lesser of ${fmtNum(qualifyingSupplyHours)} and ${fmtNum(contractedHours.plus(approvedExtraHours))} = ${fmtNum(payableHours)}`,
+        bandExplanation,
         `Gross VDP: core ${fmtMoney(coreCompensation)} + hours ${fmtMoney(contractHoursIncentive)} + acceptance/cancellation ${fmtMoney(acceptanceCancellationIncentive)} + utilization ${fmtMoney(utilizationIncentive)} + tips ${fmtMoney(tips)} + pass-throughs ${fmtMoney(passThroughTotal)} = ${fmtMoney(grossVdp)}`,
       ]
     : [
-        `Fulfillment ${pctText(fulfillment)} is below the configured ${pctText(qualificationThreshold)} qualification threshold.`,
-        `Fallback Gross VDP: driver earnings excluding tips ${fmtMoney(driverEarningsExclTips)} + tips ${fmtMoney(tips)} + pass-throughs ${fmtMoney(passThroughTotal)} = ${fmtMoney(grossVdp)}`,
+        `Fulfillment ${pctText(fulfillment)} is below the configured ${pctText(qualificationThreshold)} incentive threshold.`,
+        bandExplanation,
+        settings.belowThresholdBehavior === 'CORE_ONLY'
+          ? `Core-only Gross VDP: core compensation ${fmtMoney(coreCompensation)} + tips ${fmtMoney(tips)} + pass-throughs ${fmtMoney(passThroughTotal)} = ${fmtMoney(grossVdp)}`
+          : `Fares-only Gross VDP: driver earnings excluding tips ${fmtMoney(driverEarningsExclTips)} + tips ${fmtMoney(tips)} + pass-throughs ${fmtMoney(passThroughTotal)} = ${fmtMoney(grossVdp)}`,
       ];
+  if (settings.coreHoursRuleType === 'CONTINUOUS_COVERAGE') {
+    explanation.push('Core-hours rule: continuous coverage requires operational validation and does not alter Gross VDP.');
+  }
 
   return {
     week: row.week,
@@ -222,15 +350,10 @@ function calculateRow(settings, row, adjustment = {}) {
     calculationUnitLabel: row.calculationUnitLabel || row.operatorName || row.driverUuid,
     vehicleUnit: row.vehicleUnit || null,
     operatorNames: row.operatorNames || [row.operatorName].filter(Boolean),
-    // Display identity comes from the provider/operator profile. The upload
-    // supplies only the UUID join key and weekly performance facts.
     operatorName: row.operatorName || '',
     sourceImportId: row.sourceImportId || null,
     sourceFileName: row.sourceFileName || null,
     sourceFiles: row.sourceFiles || [row.sourceFileName].filter(Boolean),
-    // Keep one compact, reproducible source snapshot. Matching hints and
-    // provider-profile fields are intentionally excluded to avoid duplicating
-    // master data inside the calculation.
     raw: {
       week: row.week,
       driverUuid: row.driverUuid,
@@ -251,6 +374,13 @@ function calculateRow(settings, row, adjustment = {}) {
       sourceRows: row.sourceRows || [sourceRow(row)],
     },
     settingsUsed: { ...settings },
+    rateStructureType: settings.rateStructureType,
+    baseCompensationBreakdown: base.breakdown,
+    belowThresholdBehavior: settings.belowThresholdBehavior,
+    utilizationEnabled: settings.utilizationEnabled,
+    coreHoursRuleType: settings.coreHoursRuleType,
+    coreHoursValidationStatus,
+    minimumFulfillmentForIncentives: qualificationThreshold,
     totalSupplyHours,
     pausedHours,
     qualifyingSupplyHours,
@@ -258,17 +388,18 @@ function calculateRow(settings, row, adjustment = {}) {
     approvedExtraHours,
     payableHours,
     fulfillment,
-    qualified,
+    qualified: qualifiedForIncentives,
+    qualifiedForIncentives,
     qualificationThreshold,
     hourIncentivePct,
     hourTierMinimum: hourTier ? D(hourTier.minimum) : null,
     totalOffers,
     acceptanceRate,
     acceptanceIncentivePct,
-    acceptanceTierMinimum: acceptanceTier ? D(acceptanceTier.minimum) : null,
+    acceptanceTierMinimum: performanceTier.acceptanceTier ? D(performanceTier.acceptanceTier.minimum) : null,
     cancellationRate,
     cancellationIncentivePct,
-    cancellationTierMaximum: cancellationTier ? D(cancellationTier.maximum) : null,
+    cancellationTierMaximum: performanceTier.cancellationTier ? D(performanceTier.cancellationTier.maximum) : null,
     acceptanceCancellationPct,
     utilizationRate,
     utilizationIncentivePct,
@@ -290,7 +421,13 @@ function calculateRow(settings, row, adjustment = {}) {
       step('Qualifying supply hours', `${fmtNum(totalSupplyHours)} - ${fmtNum(pausedHours)}`, `${fmtNum(qualifyingSupplyHours)} h`),
       step('Fulfillment', `${fmtNum(qualifyingSupplyHours)} / ${fmtNum(contractedHours)}`, pctText(fulfillment)),
       step('Payable hours', `cap ${fmtNum(contractedHours.plus(approvedExtraHours))} h`, `${fmtNum(payableHours)} h`),
-      step(qualified ? 'Accounting-style Uber Gross VDP' : 'Uber fallback Gross VDP', qualified ? 'Qualified compensation components' : 'Earnings excluding tips + tips + pass-throughs', fmtMoney(grossVdp), 'total'),
+      step('Base compensation', settings.rateStructureType === 'HOURLY_BANDS' ? 'Configured hourly bands' : `${fmtMoney(settings.baseHourlyRate)} / hour`, fmtMoney(baseCompensation), 'money'),
+      step(
+        qualifiedForIncentives ? 'Accounting-style Uber Gross VDP' : `${settings.belowThresholdBehavior === 'CORE_ONLY' ? 'Core-only' : 'Fares-only'} Uber Gross VDP`,
+        qualifiedForIncentives ? 'Qualified compensation components' : 'Configured below-threshold compensation',
+        fmtMoney(grossVdp),
+        'total',
+      ),
     ],
   };
 }
@@ -419,6 +556,7 @@ export function serializeUberResult(result) {
       approvedExtraHours: str(row.approvedExtraHours),
       payableHours: str(row.payableHours),
       fulfillment: str(row.fulfillment),
+      minimumFulfillmentForIncentives: str(row.minimumFulfillmentForIncentives),
       qualificationThreshold: str(row.qualificationThreshold),
       hourIncentivePct: str(row.hourIncentivePct),
       hourTierMinimum: str(row.hourTierMinimum),
@@ -433,6 +571,13 @@ export function serializeUberResult(result) {
       utilizationRate: str(row.utilizationRate),
       utilizationIncentivePct: str(row.utilizationIncentivePct),
       coreHoursPct: str(row.coreHoursPct),
+      baseCompensationBreakdown: row.baseCompensationBreakdown.map((band) => ({
+        fromHour: str(band.fromHour),
+        toHour: str(band.toHour),
+        hours: str(band.hours),
+        hourlyRate: money(band.hourlyRate),
+        amount: money(band.amount),
+      })),
       baseCompensation: money(row.baseCompensation),
       coreCompensation: money(row.coreCompensation),
       contractHoursIncentive: money(row.contractHoursIncentive),

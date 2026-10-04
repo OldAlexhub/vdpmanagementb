@@ -32,15 +32,30 @@ const uberMaximumTierSchema = new Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
 );
 
+const uberHourlyRateBandSchema = new Schema(
+  {
+    fromHour: dec({ required: true }),
+    toHour: dec({ required: true }),
+    hourlyRate: dec({ required: true }),
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
 const uberConfigSchema = new Schema(
   {
     coreRatePct: dec({ default: null }),
     approvedExtraHours: dec({ default: 0 }),
+    minimumFulfillmentForIncentives: dec({ default: null }),
+    belowThresholdBehavior: { type: String, enum: ['FARES_ONLY', 'CORE_ONLY', null], default: null },
+    rateStructureType: { type: String, enum: ['FLAT', 'HOURLY_BANDS', null], default: null },
+    hourlyRateBands: { type: [uberHourlyRateBandSchema], default: [] },
     contractHoursIncentiveTiers: { type: [uberMinimumTierSchema], default: [] },
     acceptanceIncentiveTiers: { type: [uberMinimumTierSchema], default: [] },
     cancellationIncentiveTiers: { type: [uberMaximumTierSchema], default: [] },
+    utilizationEnabled: { type: Boolean, default: null },
     utilizationTarget: dec({ default: null }),
     utilizationIncentivePct: dec({ default: null }),
+    coreHoursRuleType: { type: String, enum: ['PERCENTAGE', 'CONTINUOUS_COVERAGE', 'NONE', null], default: null },
     coreHoursRequirement: dec({ default: null }),
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } },

@@ -213,3 +213,116 @@ describe('Uber weekly aggregation', () => {
     assert.equal(result.net, '3009.90');
   });
 });
+
+describe('configuration-driven Uber division rules', () => {
+  const div10 = {
+    ...SETTINGS,
+    minimumFulfillmentForIncentives: '0.90',
+    belowThresholdBehavior: 'FARES_ONLY',
+    contractHoursIncentiveTiers: [
+      { minimum: '0.90', rate: '0.05' },
+      { minimum: '0.96', rate: '0.10' },
+      { minimum: '0.98', rate: '0.20' },
+    ],
+    coreHoursRuleType: 'CONTINUOUS_COVERAGE',
+  };
+  const div3 = {
+    ...SETTINGS,
+    baseHourlyRate: '28.50',
+    coreRatePct: '0.80',
+    minimumFulfillmentForIncentives: '0.90',
+    belowThresholdBehavior: 'CORE_ONLY',
+    contractHoursIncentiveTiers: [
+      { minimum: '0.90', rate: '0.05' },
+      { minimum: '0.96', rate: '0.10' },
+      { minimum: '0.98', rate: '0.15' },
+    ],
+    acceptanceIncentiveTiers: [{ minimum: '0.95', rate: '0.05' }],
+    cancellationIncentiveTiers: [{ maximum: '0.04', rate: '0.05' }],
+    utilizationEnabled: false,
+    coreHoursRuleType: 'PERCENTAGE',
+    coreHoursRequirement: '1.00',
+  };
+
+  test('DIV 10 qualifies at 90% and earns the configured 5% hours incentive', () => {
+    const row = run(baseRow({ totalSupplyHours: '45', pausedHours: '0' }), { settings: div10 }).uberRows[0];
+    assert.equal(row.qualifiedForIncentives, true);
+    assert.equal(row.hourIncentivePct, '0.05');
+    assert.equal(row.coreHoursValidationStatus, 'REQUIRES_COVERAGE_VALIDATION');
+  });
+
+  test('DIV 10 at 89.99% uses fares-only compensation', () => {
+    const row = run(baseRow({ totalSupplyHours: '44.995', pausedHours: '0' }), { settings: div10 }).uberRows[0];
+    assert.equal(row.qualifiedForIncentives, false);
+    assert.equal(row.belowThresholdBehavior, 'FARES_ONLY');
+    assert.equal(row.grossVdp, '1178.00');
+  });
+
+  test('DIV 3 qualifies at 90%, tops out at 15% hours incentive, and caps A/C at 5%', () => {
+    const at90 = run(baseRow({ totalSupplyHours: '45', pausedHours: '0', coreHoursTotalSupplyHours: '50', utilizedHours: null }), { settings: div3 }).uberRows[0];
+    const at98 = run(baseRow({ totalSupplyHours: '49', pausedHours: '0', coreHoursTotalSupplyHours: '50', utilizedHours: null }), { settings: div3 }).uberRows[0];
+    const performance = run(baseRow({ totalAccepts: '100', totalRejects: '0', totalExpiredOffers: '0', totalCancels: '4', utilizedHours: null }), { settings: div3 }).uberRows[0];
+    assert.equal(at90.hourIncentivePct, '0.05');
+    assert.equal(at98.hourIncentivePct, '0.15');
+    assert.equal(performance.acceptanceCancellationPct, '0.05');
+  });
+
+  test('DIV 3 disables utilization and accepts missing Utilized Hours', () => {
+    const row = run(baseRow({ utilizedHours: null }), { settings: div3 }).uberRows[0];
+    assert.equal(row.utilizationEnabled, false);
+    assert.equal(row.utilizationRate, null);
+    assert.equal(row.utilizationIncentivePct, '0');
+    assert.equal(row.utilizationIncentive, '0.00');
+  });
+
+  test('DIV 3 below 90% retains core compensation and loses every incentive', () => {
+    const row = run(baseRow({ totalSupplyHours: '44.995', pausedHours: '0', utilizedHours: null }), { settings: div3 }).uberRows[0];
+    assert.equal(row.qualifiedForIncentives, false);
+    assert.equal(row.hourIncentivePct, '0');
+    assert.equal(row.acceptanceCancellationPct, '0');
+    assert.equal(row.utilizationIncentivePct, '0');
+    assert.equal(row.grossVdp, String((Number(row.coreCompensation) + 57).toFixed(2)));
+  });
+
+  test('DIV 3 percentage core model produces the contractual $22.80 hourly equivalent', () => {
+    const row = run(baseRow({ totalSupplyHours: '50', pausedHours: '0', utilizedHours: null }), { settings: div3 }).uberRows[0];
+    assert.equal(row.baseCompensation, '1425.00');
+    assert.equal(row.coreCompensation, '1140.00');
+    assert.equal(Number(row.coreCompensation) / 50, 22.8);
+  });
+
+  test('DIV 2 hourly bands price 70 hours at $31.45 and the next 20 at $0', () => {
+    const settings = {
+      ...SETTINGS,
+      contractedWeeklyHours: '90',
+      rateStructureType: 'HOURLY_BANDS',
+      hourlyRateBands: [
+        { fromHour: '0', toHour: '70', hourlyRate: '31.45' },
+        { fromHour: '70', toHour: '90', hourlyRate: '0' },
+      ],
+    };
+    const row = run(baseRow({ totalSupplyHours: '90', pausedHours: '0' }), { settings }).uberRows[0];
+    assert.equal(row.baseCompensation, '2201.50');
+    assert.deepEqual(row.baseCompensationBreakdown, [
+      { fromHour: '0', toHour: '70', hours: '70', hourlyRate: '31.45', amount: '2201.50' },
+      { fromHour: '70', toHour: '90', hours: '20', hourlyRate: '0.00', amount: '0.00' },
+    ]);
+  });
+
+  test('legacy Uber settings get safe DIV 12 defaults and flat-rate behavior', () => {
+    const row = run().uberRows[0];
+    assert.equal(row.rateStructureType, 'FLAT');
+    assert.equal(row.qualificationThreshold, '0.94');
+    assert.equal(row.belowThresholdBehavior, 'FARES_ONLY');
+    assert.equal(row.utilizationEnabled, true);
+    assert.equal(row.coreHoursRuleType, 'PERCENTAGE');
+    assert.equal(row.grossVdp, '1600.75');
+  });
+
+  test('enabled utilization still requires Utilized Hours', () => {
+    assert.throws(
+      () => run(baseRow({ utilizedHours: null })),
+      /Utilized Hours is required/,
+    );
+  });
+});

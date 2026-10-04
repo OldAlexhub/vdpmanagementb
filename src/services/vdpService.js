@@ -315,7 +315,10 @@ export async function computeVdp(vdp, preloaded = {}) {
   let uberImports = [];
   if (isUber && settings) {
     const operators = activeOperators(provider, cycle);
-    const missingBasePay = operators.filter((operator) => isBlank(uberBasePayFor(provider, operator).value));
+    const missingBasePay = operators.filter((operator) => {
+      const rateStructure = settingsOf(operator.id)?.uberConfig?.value?.rateStructureType || 'FLAT';
+      return rateStructure === 'FLAT' && isBlank(uberBasePayFor(provider, operator).value);
+    });
     if (missingBasePay.length) {
       exceptions.push(exception('MISSING_UBER_BASE_PAY',
         `Uber base hourly rate is missing for operator${missingBasePay.length === 1 ? '' : 's'} ${missingBasePay.map((operator) => operator.name).join(', ')}. Add one provider-level rate, or an operator-specific rate when someone differs.`));
