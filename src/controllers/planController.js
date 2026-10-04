@@ -20,6 +20,7 @@ export function versionInput(body) {
   // Older clients and the bulk import send only the per-trip switch.
   const fuelMethod = body.fuelMethod || (body.fuelReimbursementEnabled ? 'PER_TRIP' : 'NONE');
   const uberSource = calculationType === 'UBER' ? { ...DEFAULT_UBER_CONFIG, ...(body.uberConfig || {}) } : null;
+  const uberRateStructureType = uberSource?.rateStructureType || 'FLAT';
   const minimumTiers = (list, label) => (list || [])
     .map((t, i) => ({
       minimum: decimalInput(t.minimum, `${label} tier ${i + 1} minimum`, { required: true, maxDp: 8 }),
@@ -57,14 +58,18 @@ export function versionInput(body) {
           approvedExtraHours: decimalInput(uberSource.approvedExtraHours, 'Uber approved extra hours', { required: true, maxDp: 8 }),
           minimumFulfillmentForIncentives: decimalInput(uberSource.minimumFulfillmentForIncentives, 'Uber minimum fulfillment for incentives', { required: true, maxDp: 8 }),
           belowThresholdBehavior: uberSource.belowThresholdBehavior || 'FARES_ONLY',
-          rateStructureType: uberSource.rateStructureType || 'FLAT',
-          hourlyRateBands: (uberSource.hourlyRateBands || [])
-            .map((band, i) => ({
-              fromHour: decimalInput(band.fromHour, `Hourly rate band ${i + 1} from hour`, { required: true, maxDp: 8 }),
-              toHour: decimalInput(band.toHour, `Hourly rate band ${i + 1} to hour`, { required: true, maxDp: 8 }),
-              hourlyRate: decimalInput(band.hourlyRate, `Hourly rate band ${i + 1} rate`, { required: true, maxDp: 8 }),
-            }))
-            .sort((a, b) => D(a.fromHour).cmp(D(b.fromHour))),
+          rateStructureType: uberRateStructureType,
+          // A client can retain band rows while the flat-rate option is selected.
+          // They are inactive configuration and must not block or leak into the saved version.
+          hourlyRateBands: uberRateStructureType === 'HOURLY_BANDS'
+            ? (uberSource.hourlyRateBands || [])
+              .map((band, i) => ({
+                fromHour: decimalInput(band.fromHour, `Hourly rate band ${i + 1} from hour`, { required: true, maxDp: 8 }),
+                toHour: decimalInput(band.toHour, `Hourly rate band ${i + 1} to hour`, { required: true, maxDp: 8 }),
+                hourlyRate: decimalInput(band.hourlyRate, `Hourly rate band ${i + 1} rate`, { required: true, maxDp: 8 }),
+              }))
+              .sort((a, b) => D(a.fromHour).cmp(D(b.fromHour)))
+            : [],
           contractHoursIncentiveTiers: minimumTiers(uberSource.contractHoursIncentiveTiers, 'Contract-hours incentive'),
           acceptanceIncentiveTiers: minimumTiers(uberSource.acceptanceIncentiveTiers, 'Acceptance incentive'),
           cancellationIncentiveTiers: maximumTiers(uberSource.cancellationIncentiveTiers, 'Cancellation incentive'),
