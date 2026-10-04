@@ -34,7 +34,12 @@ export async function list(req, res) {
       net: j.net,
       totalDeductions: v.calculation?.totalDeductions ?? null,
       totalAdditions: v.calculation?.totalAdditions ?? null,
-      weeks: (v.calculation?.weeks || []).map((w) => ({ trips: w.trips, actualHours: w.actualHours, weeklyEarnings: w.weeklyEarnings })),
+      weeks: ((src.calculation || v.calculation)?.weeks || []).map((w) => ({
+        weekNumber: w.weekNumber,
+        trips: w.trips,
+        actualHours: w.actualHours,
+        weeklyEarnings: w.weeklyEarnings,
+      })),
       exceptions: v.exceptions,
       providerDeadline: v.providerDeadline,
       providerApproval: v.providerApproval?.method ? { method: v.providerApproval.method, at: v.providerApproval.at } : null,

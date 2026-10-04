@@ -138,6 +138,7 @@ test('Uber plan, upload, processing, weekly adjustment, and audit snapshot', { s
   assert.equal(response.status, 200, JSON.stringify(response.data));
   assert.equal(response.data.ready, 1);
   const list = (await call('GET', `/vdps?cycleId=${cycle._id}`)).data;
+  assert.deepEqual(list[0].weeks.map((week) => [week.weekNumber, week.weeklyEarnings]), [[1, '1600.75']]);
   let vdp = (await call('GET', `/vdps/${list[0]._id}`)).data;
   assert.equal(vdp.status, 'READY', JSON.stringify(vdp.exceptions));
   assert.equal(vdp.view.calculation.calculationType, 'UBER');

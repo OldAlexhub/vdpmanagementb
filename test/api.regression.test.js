@@ -135,6 +135,7 @@ test('DIV 10 end-to-end regression — RIMO / route 918 / 08/24–09/06/2026', {
 
   const { data: list } = await call('GET', `/vdps?cycleId=${cycleId}`);
   const rimoRow = list.find((v) => v.provider.name === 'Rimo Transit LLC');
+  assert.deepEqual(rimoRow.weeks.map((week) => [week.weekNumber, week.weeklyEarnings]), [[1, '1475.33'], [2, '1162.36']]);
   let rimo;
 
   await t.test('RIMO calculation matches the verified regression', async () => {
