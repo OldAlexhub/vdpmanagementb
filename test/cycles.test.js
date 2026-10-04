@@ -101,4 +101,15 @@ test('company-wide VDP cycles', { skip }, async (t) => {
     r = await call('GET', `/exports/cycle-schedule.pdf?year=${new Date().getUTCFullYear()}`);
     assert.equal(r.status, 200);
   });
+
+  await t.test('each VDP plan downloads as an executive PDF', async () => {
+    const plans = await call('GET', '/vdp-plans');
+    assert.equal(plans.status, 200);
+    assert.ok(plans.data.length > 0);
+    r = await call('GET', `/vdp-plans/${plans.data[0]._id}/report.pdf`);
+    assert.equal(r.status, 200);
+    assert.match(r.type, /pdf/);
+    assert.equal(r.data.subarray(0, 4).toString(), '%PDF');
+    assert.match(r.headers.get('content-disposition'), /VDP Plan Executive Report/);
+  });
 });

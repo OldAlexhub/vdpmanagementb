@@ -7,6 +7,10 @@ import { D, fmtMoney, fmtNum, fmtRate, sum, money } from './money.js';
 import { ISSUE_AREAS } from '../models/Vdp.js';
 import VdpCycle from '../models/VdpCycle.js';
 import Division from '../models/Division.js';
+import VdpPlan from '../models/VdpPlan.js';
+import Provider from '../models/Provider.js';
+import { currentVersion, fuelMethodOf, uberConfigOf } from './planService.js';
+import { notFound } from './errors.js';
 
 // Register "Other" column: other deductions plus any fuel overspend (both are deductions).
 const otherOf = (c) => money(sum([c?.otherDeductions ?? 0, c?.fuelOverspend ?? 0]));
@@ -36,6 +40,10 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 
 // Characters outside WinAnsi would print as garbage.
 const t = (s) => String(s ?? '')
+  .replace(/[\u2010-\u2015\u2212]/g, '-')
+  .replace(/[\u2192\u21d2]/g, '>')
+  .replace(/[\u201c\u201d]/g, '"')
+  .replace(/[\u2018\u2019]/g, "'")
   .replace(/−/g, '–')
   .replace(/[→⇒]/g, '>')
   .replace(/[“”]/g, '"')
@@ -939,4 +947,240 @@ export async function cycleSchedulePdf({ year, schedule } = {}) {
   }
   footers(doc, `Big Star Transit · VDP cycle schedule${year ? ` ${year}` : ''} · Generated ${localDate(new Date(), 'America/Los_Angeles')}`);
   return { buffer: await toBuffer(doc), fileName: `VDP Cycle Schedule${year ? ` ${year}` : ''}.pdf` };
+}
+
+// ---------- VDP plan executive report ----------
+
+const planFilePart = (value) => String(value || 'Plan').replace(/[^\w .,&-]/g, '').trim();
+const ratioPct = (value) => (value === null || value === undefined || value === '' ? '-' : `${fmtNum(D(value).mul(100), 4)}%`);
+const effectiveRange = (version) => `${longDate(version.effectiveFrom)} - ${version.effectiveTo ? longDate(version.effectiveTo) : 'Open-ended'}`;
+
+const PAYMENT_LABELS = { HOURLY: 'Hourly', PER_TRIP: 'Per trip' };
+const PERFORMANCE_LABELS = {
+  TOTAL_HOURS: 'Total hours', SERVICE_HOURS: 'Service hours', REVENUE_HOURS: 'Revenue hours', OTHER: 'Other report column',
+};
+
+function planSummaryRows(version) {
+  if (version.calculationType === 'UBER') {
+    const u = uberConfigOf(version.uberConfig);
+    return [
+      ['Compensation model', u.rateStructureType === 'HOURLY_BANDS' ? `Uber - ${u.hourlyRateBands.length} hourly rate band(s)` : 'Uber - flat operator-profile rate'],
+      ['Core compensation', `${ratioPct(u.coreRatePct)} of base hourly rate`],
+      ['Incentive qualification', `${ratioPct(u.minimumFulfillmentForIncentives)} minimum fulfillment`],
+      ['Below threshold', u.belowThresholdBehavior === 'CORE_ONLY' ? 'Core compensation only' : 'Driver fares only'],
+      ['Utilization incentive', u.utilizationEnabled ? `${ratioPct(u.utilizationIncentivePct)} at ${ratioPct(u.utilizationTarget)} utilization` : 'Disabled'],
+      ['Core-hours rule', u.coreHoursRuleType === 'PERCENTAGE' ? `${ratioPct(u.coreHoursRequirement)} of contracted hours` : u.coreHoursRuleType === 'CONTINUOUS_COVERAGE' ? 'Continuous coverage validation' : 'None'],
+    ];
+  }
+  const fuel = fuelMethodOf(version);
+  const unit = version.paymentType === 'HOURLY' ? 'hour' : 'trip';
+  const metric = version.performanceHourMetric === 'OTHER'
+    ? `${PERFORMANCE_LABELS.OTHER}: ${version.performanceHourColumn || '-'}`
+    : PERFORMANCE_LABELS[version.performanceHourMetric] || version.performanceHourMetric || '-';
+  const fuelText = fuel === 'PER_TRIP'
+    ? `${fmtRate(version.fuelReimbursementRate)} per trip reimbursement`
+    : fuel === 'SERVICE_MILE_ALLOWANCE' ? `Service-mile allowance at ${fmtNum(version.fuelMpg)} MPG` : 'None';
+  return [
+    ['Compensation model', PAYMENT_LABELS[version.paymentType] || version.paymentType],
+    ['Base pay', `${fmtRate(version.basePay)} per ${unit}`],
+    ['Contracted hours', version.contractedHours ? `${fmtNum(version.contractedHours)} per week` : 'Not configured'],
+    ['TUI incentive', version.incentiveEnabled ? `Enabled - ${version.incentiveTiers.length} tier(s)` : 'Disabled'],
+    ['Bonus', version.bonusEnabled ? `${fmtRate(version.bonusRate)} per hour above contract` : 'Disabled'],
+    ['Performance hours source', metric],
+    ['Fuel arrangement', fuelText],
+  ];
+}
+
+function detailTable(doc, rows) {
+  table(doc, [
+    { header: 'Setting', width: 182 },
+    { header: 'Plan rule', width: doc.content.width - 182 },
+  ], rows.map(([key, value]) => ({ cells: [key, value], labelBold: false, boldCols: [1] })), { fontSize: 8.8, rowPad: 5 });
+}
+
+function reportNote(doc, text) {
+  if (!text) return;
+  doc.font(F.reg).fontSize(8.6);
+  const value = t(text);
+  const height = doc.heightOfString(value, { width: doc.content.width - 24 }) + 20;
+  ensure(doc, height + 4);
+  const y = doc.y;
+  doc.roundedRect(doc.content.left, y, doc.content.width, height, 6).fill(C.soft);
+  doc.fillColor(C.text).font(F.reg).fontSize(8.6).text(value, doc.content.left + 12, y + 10, { width: doc.content.width - 24 });
+  doc.y = y + height + 7;
+}
+
+function standardVersionDetails(doc, version) {
+  if (version.incentiveTiers?.length) {
+    doc.fillColor(C.navy).font(F.bold).fontSize(8.5).text('TUI INCENTIVE TIERS', doc.content.left, doc.y + 3, { characterSpacing: 0.6 });
+    doc.y += 16;
+    table(doc, [
+      { header: 'Minimum performance', width: 174 },
+      { header: 'Maximum performance', width: 174 },
+      { header: 'Hourly rate', width: doc.content.width - 348, align: 'right' },
+    ], version.incentiveTiers.map((tier) => ({
+      cells: [
+        `${fmtNum(tier.minimumPercentage)}%`,
+        tier.maximumPercentage === null || tier.maximumPercentage === undefined ? 'And above' : `${fmtNum(tier.maximumPercentage)}%`,
+        fmtRate(tier.rate),
+      ],
+      labelBold: false,
+      boldCols: [2],
+    })), { fontSize: 8.6, rowPad: 5 });
+  }
+}
+
+function uberVersionDetails(doc, version) {
+  const u = uberConfigOf(version.uberConfig);
+  if (u.rateStructureType === 'HOURLY_BANDS' && u.hourlyRateBands.length) {
+    doc.fillColor(C.navy).font(F.bold).fontSize(8.5).text('HOURLY RATE BANDS', doc.content.left, doc.y + 3, { characterSpacing: 0.6 });
+    doc.y += 16;
+    table(doc, [
+      { header: 'From hour', width: 170 }, { header: 'To hour', width: 170 },
+      { header: 'Hourly rate', width: doc.content.width - 340, align: 'right' },
+    ], u.hourlyRateBands.map((band) => ({
+      cells: [fmtNum(band.fromHour), fmtNum(band.toHour), fmtRate(band.hourlyRate)], labelBold: false, boldCols: [2],
+    })), { fontSize: 8.6, rowPad: 5 });
+  }
+
+  const tierGroups = [
+    ['CONTRACT-HOURS INCENTIVES', 'Minimum fulfillment', u.contractHoursIncentiveTiers, 'minimum'],
+    ['ACCEPTANCE INCENTIVES', 'Minimum acceptance', u.acceptanceIncentiveTiers, 'minimum'],
+    ['CANCELLATION INCENTIVES', 'Maximum cancellation', u.cancellationIncentiveTiers, 'maximum'],
+  ];
+  tierGroups.forEach(([title, thresholdTitle, tiers, key]) => {
+    if (!tiers?.length) return;
+    doc.fillColor(C.navy).font(F.bold).fontSize(8.5).text(title, doc.content.left, doc.y + 3, { characterSpacing: 0.6 });
+    doc.y += 16;
+    table(doc, [
+      { header: thresholdTitle, width: 260 },
+      { header: 'Incentive rate', width: doc.content.width - 260, align: 'right' },
+    ], tiers.map((tier) => ({
+      cells: [ratioPct(tier[key]), ratioPct(tier.rate)], labelBold: false, boldCols: [1],
+    })), { fontSize: 8.6, rowPad: 5 });
+  });
+}
+
+/** Executive overview and complete rule history for one VDP plan. */
+export async function planReportPdf(planId) {
+  const plan = await VdpPlan.findById(planId);
+  if (!plan) throw notFound('VDP plan');
+  const [division, providerCount] = await Promise.all([
+    Division.findById(plan.divisionId),
+    Provider.countDocuments({ planId: plan._id, status: 'ACTIVE' }),
+  ]);
+  if (!division) throw notFound('Division');
+
+  const current = currentVersion(plan);
+  const versions = [...plan.versions].sort((a, b) => b.versionNumber - a.versionNumber);
+  const generated = localDate(new Date(), division.timezone);
+  const doc = newDoc('portrait', { Title: `VDP plan executive report - ${plan.name}` });
+  const L = doc.content.left;
+  const W = doc.content.width;
+
+  headerBand(doc, {
+    title: 'VDP Plan Executive Report',
+    rightLabel: `DIV ${division.divisionNumber} - ${division.name}`,
+    rightTitle: plan.name,
+    rightSub: `${plan.status === 'ACTIVE' ? 'Active plan' : 'Inactive plan'} - Generated ${generated}`,
+  });
+
+  chip(doc, plan.status === 'ACTIVE' ? 'ACTIVE' : 'INACTIVE', L + W, 110, plan.status === 'ACTIVE' ? 'ok' : 'draft');
+  doc.fillColor(C.muted).font(F.reg).fontSize(8.5)
+    .text('Executive overview of the current compensation model, supporting schedules, and complete plan-version history.', L, 113, { width: W - 95 });
+  doc.y = 145;
+
+  const tileValues = [
+    ['ACTIVE PROVIDERS', `${providerCount}`],
+    ['PLAN VERSIONS', `${versions.length}`],
+    ['CURRENT VERSION', current ? `Version ${current.versionNumber}` : '-'],
+    ['EFFECTIVE SINCE', current ? shortDate(current.effectiveFrom) : '-'],
+  ];
+  const tileGap = 8;
+  const tileW = (W - tileGap * 3) / 4;
+  const tileY = doc.y;
+  tileValues.forEach(([label, value], index) => {
+    const x = L + index * (tileW + tileGap);
+    doc.roundedRect(x, tileY, tileW, 43, 6).fill(index === 2 ? C.navy : C.soft);
+    doc.fillColor(index === 2 ? C.gold : C.muted).font(F.bold).fontSize(6.7).text(label, x + 10, tileY + 9, { width: tileW - 20, characterSpacing: 0.6, lineBreak: false });
+    doc.fillColor(index === 2 ? '#ffffff' : C.ink).font(F.bold).fontSize(12).text(value, x + 10, tileY + 22, { width: tileW - 20, lineBreak: false, ellipsis: true });
+  });
+  doc.y = tileY + 55;
+
+  if (current) {
+    sectionTitle(doc, 'Current compensation model', effectiveRange(current));
+    const rows = planSummaryRows(current);
+    rows.push(['Version owner', current.createdBy?.name || 'System']);
+    rows.push(['Created', current.createdAt ? longDate(current.createdAt) : '-']);
+    detailTable(doc, rows);
+    if (current.notes) reportNote(doc, `Version notes: ${current.notes}`);
+    if (current.calculationType === 'UBER') uberVersionDetails(doc, current);
+    else standardVersionDetails(doc, current);
+  }
+
+  if (plan.notes) {
+    sectionTitle(doc, 'Plan notes');
+    reportNote(doc, plan.notes);
+  }
+
+  sectionTitle(doc, 'Version history', `${versions.length} version${versions.length === 1 ? '' : 's'} - newest first`);
+  table(doc, [
+    { header: 'Version', width: 100 },
+    { header: 'Effective period', width: 180 },
+    { header: 'Model', width: 100 },
+    { header: 'Created by', width: W - 380 },
+  ], versions.map((version) => ({
+    cells: [
+      `Version ${version.versionNumber}${current && String(current._id) === String(version._id) ? ' (Current)' : ''}`,
+      effectiveRange(version),
+      version.calculationType === 'UBER' ? 'Uber' : PAYMENT_LABELS[version.paymentType] || version.paymentType,
+      version.createdBy?.name || 'System',
+    ],
+    labelBold: false,
+    boldCols: [0],
+  })), { fontSize: 8.2, rowPad: 5 });
+
+  const historical = versions.filter((version) => !current || String(current._id) !== String(version._id));
+  if (historical.length) sectionTitle(doc, 'Historical version details', `${historical.length} superseded version${historical.length === 1 ? '' : 's'}`);
+  historical.forEach((version) => {
+    ensure(doc, 125);
+    const headingY = doc.y;
+    doc.fillColor(C.navy).font(F.bold).fontSize(11).text(`Version ${version.versionNumber}`, L, headingY, { width: W - 150 });
+    doc.fillColor(C.muted).font(F.bold).fontSize(8).text(version.calculationType === 'UBER' ? 'UBER' : String(PAYMENT_LABELS[version.paymentType] || version.paymentType).toUpperCase(), L + W - 145, headingY + 1, { width: 145, align: 'right' });
+    doc.fillColor(C.muted).font(F.reg).fontSize(8.2).text(effectiveRange(version), L, headingY + 17, { width: W });
+    doc.y = headingY + 34;
+
+    const rows = planSummaryRows(version);
+    rows.push(['Version owner', version.createdBy?.name || 'System']);
+    rows.push(['Created', version.createdAt ? longDate(version.createdAt) : '-']);
+    detailTable(doc, rows);
+    if (version.notes) reportNote(doc, `Version notes: ${version.notes}`);
+    if (version.calculationType === 'UBER') uberVersionDetails(doc, version);
+    else standardVersionDetails(doc, version);
+    doc.y += 5;
+  });
+
+  if (plan.fuelPrices?.length) {
+    sectionTitle(doc, 'Fuel price schedule', 'Plan-level prices used by service-mile allowance versions');
+    table(doc, [
+      { header: 'Effective from', width: 145 },
+      { header: 'Effective to', width: 145 },
+      { header: 'Price per gallon', width: 120, align: 'right' },
+      { header: 'Notes', width: W - 410 },
+    ], [...plan.fuelPrices].sort((a, b) => String(a.effectiveFrom).localeCompare(String(b.effectiveFrom))).map((price) => ({
+      cells: [shortDate(price.effectiveFrom), price.effectiveTo ? shortDate(price.effectiveTo) : 'Open-ended', fmtRate(price.pricePerGallon), price.notes || ''],
+      labelBold: false,
+      boldCols: [2],
+    })), { fontSize: 8.4, rowPad: 5 });
+  }
+
+  ensure(doc, 105);
+  sectionTitle(doc, 'Report scope');
+  reportNote(doc, 'This report documents plan-level compensation rules and version history. Provider and operator profile overrides are applied during VDP calculation and are not included in these plan-level figures. Approved VDPs retain the version and settings snapshot used for their calculation.');
+
+  footers(doc, `Big Star Transit - VDP plan executive report - ${plan.name} - DIV ${division.divisionNumber} - Generated ${generated}`);
+  return {
+    buffer: await toBuffer(doc),
+    fileName: `VDP Plan Executive Report - DIV ${planFilePart(division.divisionNumber)} - ${planFilePart(plan.name)}.pdf`,
+  };
 }

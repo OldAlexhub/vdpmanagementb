@@ -12,7 +12,7 @@ import * as vdps from '../controllers/vdpController.js';
 import * as portal from '../controllers/portalController.js';
 import * as imports from '../controllers/importController.js';
 import { cycleWorkbook } from '../services/exportService.js';
-import { registerPdf, cycleSchedulePdf } from '../services/pdfService.js';
+import { registerPdf, cycleSchedulePdf, planReportPdf } from '../services/pdfService.js';
 import { leadershipReport, providerReport } from '../services/analyticsService.js';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
@@ -55,6 +55,10 @@ api.patch('/divisions/:id/status', requireAdmin, divisions.setStatus);
 api.get('/vdp-plans', plans.list);
 api.post('/vdp-plans', requireAdmin, plans.create);
 api.get('/vdp-plans/:id', plans.get);
+api.get('/vdp-plans/:id/report.pdf', async (req, res) => {
+  const { buffer, fileName } = await planReportPdf(req.params.id);
+  vdps.sendPdf(res, buffer, fileName);
+});
 api.put('/vdp-plans/:id', requireAdmin, plans.update);
 api.post('/vdp-plans/:id/versions', requireAdmin, plans.addVersion);
 api.put('/vdp-plans/:id/versions/:versionId', requireAdmin, plans.updateVersion);
