@@ -6,6 +6,7 @@ import { connectDb, disconnectDb } from '../src/config/db.js';
 import Division from '../src/models/Division.js';
 import Provider from '../src/models/Provider.js';
 import { syncCompassRoster } from '../src/services/compassRosterService.js';
+import * as liftLeases from '../src/controllers/liftLeaseController.js';
 
 const TEST_DB = 'bigstar_vdp_test';
 const skip = !process.env.MONGO_URI && 'MONGO_URI not set';
@@ -40,7 +41,7 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
   const removed = await Provider.create({ divisionId: div10._id, name: 'Not In Compass', status: 'ACTIVE' });
   const div12Provider = await Provider.create({ divisionId: div12._id, name: 'DIV 12 Local Provider', status: 'ACTIVE' });
 
-  const result = await syncCompassRoster({ snapshot: {
+  const snapshot = {
     retrievedAt: new Date('2026-10-06T12:00:00Z'),
     divisions: [
       { _id: 'd10', code: 'DIV_10', name: 'Portland', timezone: 'America/Los_Angeles', active: true },
@@ -58,7 +59,8 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
       { status: 'active', operator: { _id: 'o1' }, route: { code: '918' }, vehicle: { code: 'V1' } },
       { status: 'active', operator: { _id: 'o2' }, route: { code: '700' }, vehicle: { code: 'V2' } },
     ],
-  } });
+  };
+  const result = await syncCompassRoster({ snapshot });
 
   const refreshed = await Provider.findById(kept._id);
   assert.equal(refreshed.source.system, 'COMPASS');
@@ -84,4 +86,26 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
   } }), /incomplete roster/i);
   assert.equal(await Provider.countDocuments(), before);
   assert.equal((await Provider.findById(div12Provider._id)).status, 'ACTIVE');
+
+  let response;
+  await liftLeases.update(
+    { params: { divisionId: div10._id }, body: { frequency: 'PER_VDP_CYCLE', amount: '300.00' } },
+    { json: (value) => { response = value; } },
+  );
+  assert.deepEqual(response.applied, { providers: 2, operators: 1 });
+  let assigned = await Provider.findById(kept._id);
+  assert.equal(assigned.operators[0].liftLease.frequency, 'PER_VDP_CYCLE');
+  assert.equal(assigned.operators[0].liftLease.amount.toString(), '300.00');
+
+  await syncCompassRoster({ snapshot: {
+    ...snapshot,
+    operators: [...snapshot.operators,
+      { _id: 'o3', employeeId: '300', name: 'New Driver', active: true, division: { _id: 'd10' }, provider: { _id: 'p1' } }],
+    runCuts: [...snapshot.runCuts,
+      { status: 'active', operator: { _id: 'o3' }, route: { code: '919' }, vehicle: { code: 'V3' } }],
+  } });
+  assigned = await Provider.findById(kept._id);
+  assert.equal(assigned.operators.length, 2);
+  assert.ok(assigned.operators.every((operator) => operator.liftLease.frequency === 'PER_VDP_CYCLE'));
+  assert.ok(assigned.operators.every((operator) => operator.liftLease.amount.toString() === '300.00'));
 });

@@ -49,6 +49,12 @@ changing roster records, and never returns the API token to the client. Division
 successful Compass response are left untouched, so a MongoDB-only division such as DIV 12 is not
 deactivated. Keep the token in deployment environment variables, not in source control.
 
+Compass does not supply lift-lease pricing. The **Lift Leases** tab lists the Compass divisions and
+lets an administrator assign one weekly, per-cycle, or no-lease price to every operator/pay unit in
+a division. The value is stored on the division in MongoDB, applied to current operators, and copied
+to new operators during later Compass refreshes. Open VDPs are marked stale; approved and paid
+statements keep their frozen values.
+
 ## Scripts
 
 | Command | Purpose |

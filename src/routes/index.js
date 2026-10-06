@@ -12,6 +12,7 @@ import * as vdps from '../controllers/vdpController.js';
 import * as portal from '../controllers/portalController.js';
 import * as imports from '../controllers/importController.js';
 import * as compass from '../controllers/compassController.js';
+import * as liftLeases from '../controllers/liftLeaseController.js';
 import { cycleWorkbook } from '../services/exportService.js';
 import { registerPdf, cycleSchedulePdf, planReportPdf } from '../services/pdfService.js';
 import { leadershipReport, providerReport } from '../services/analyticsService.js';
@@ -53,6 +54,9 @@ api.post('/compass/test', requireAdmin, compass.test);
 api.post('/compass/preview', requireAdmin, compass.preview);
 api.post('/compass/sync', requireAdmin, compass.sync);
 api.put('/compass/settings', requireAdmin, compass.updateSettings);
+
+api.get('/lift-leases', liftLeases.list);
+api.put('/lift-leases/:divisionId', requireAdmin, liftLeases.update);
 
 api.get('/divisions', divisions.list);
 api.post('/divisions', requireAdmin, divisions.create);

@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import { jsonOptions } from './common.js';
+import { dec, jsonOptions } from './common.js';
 
 const sourceSchema = new mongoose.Schema(
   {
@@ -19,6 +19,14 @@ const divisionSchema = new mongoose.Schema(
     status: { type: String, enum: ['ACTIVE', 'INACTIVE'], default: 'ACTIVE' },
     notes: String,
     source: { type: sourceSchema, default: () => ({}) },
+    // Compass does not provide lease pricing. Once configured, this MongoDB-owned rate
+    // is assigned to every current and future Compass operator in the division.
+    liftLease: {
+      configured: { type: Boolean, default: false },
+      amount: dec({ default: null }),
+      frequency: { type: String, enum: ['WEEKLY', 'PER_VDP_CYCLE', 'NONE'], default: 'NONE' },
+      updatedAt: { type: Date, default: null },
+    },
     // How this division's VDP cycles are generated. Can evolve per division.
     cycleSettings: {
       anchorDate: { type: Date, default: () => new Date('2026-08-24T00:00:00Z') },

@@ -181,6 +181,10 @@ const rosterSignature = (provider) => JSON.stringify({
     status: operator.status,
     routes: [...(operator.routes || [])].sort(),
     vehicleUnit: operator.vehicleUnit || null,
+    liftLease: {
+      amount: operator.liftLease?.amount === null || operator.liftLease?.amount === undefined ? null : String(operator.liftLease.amount),
+      frequency: operator.liftLease?.frequency || 'NONE',
+    },
   })),
 });
 
@@ -208,7 +212,7 @@ const plainOperator = (operator, { keepIdentity = true } = {}) => {
   return value;
 };
 
-function compassOperatorValue(operator, previous, syncedAt, { keepIdentity = true } = {}) {
+function compassOperatorValue(operator, previous, syncedAt, { keepIdentity = true, divisionLease = null } = {}) {
   const value = plainOperator(previous, { keepIdentity });
   return {
     ...value,
@@ -218,7 +222,7 @@ function compassOperatorValue(operator, previous, syncedAt, { keepIdentity = tru
     vehicleUnit: operator.vehicleUnit,
     employeeId: operator.employeeId,
     source: sourceOf(operator.externalId, syncedAt),
-    liftLease: value.liftLease || { amount: null, frequency: 'NONE' },
+    liftLease: divisionLease || value.liftLease || { amount: null, frequency: 'NONE' },
   };
 }
 
@@ -278,6 +282,9 @@ async function performCompassSync(snapshot) {
     else summary.divisions.updated += 1;
     divisionByExternalId.set(compassDivision.externalId, division);
     managedDivisionIds.add(id(division._id));
+    const divisionLease = division.liftLease?.configured
+      ? { amount: division.liftLease.amount, frequency: division.liftLease.frequency }
+      : null;
 
     const providersInDivision = mongoProviders.filter((provider) => id(provider.divisionId) === id(division._id));
     const providerByExternalId = new Map(providersInDivision
@@ -320,7 +327,7 @@ async function performCompassSync(snapshot) {
           if (elsewhere) { previous = elsewhere.operator; keepIdentity = false; }
         }
         if (previous?._id && keepIdentity) matchedLocalIds.add(id(previous._id));
-        nextOperators.push(compassOperatorValue(compassOperator, previous, syncedAt, { keepIdentity }));
+        nextOperators.push(compassOperatorValue(compassOperator, previous, syncedAt, { keepIdentity, divisionLease }));
         if (!previous) summary.operators.created += 1;
         else if (adopted) summary.operators.adopted += 1;
         else summary.operators.updated += 1;

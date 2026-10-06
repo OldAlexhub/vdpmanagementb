@@ -78,7 +78,7 @@ function applyOperators(provider, list) {
   provider.operators = [...operators, ...movedAway];
 }
 
-function applyCompassOperatorSettings(provider, list) {
+function applyCompassOperatorSettings(provider, list, { leaseManaged = false } = {}) {
   if (!Array.isArray(list)) throw badRequest('Operators must be a list.');
   const inputById = new Map(list.filter((operator) => operator?._id).map((operator) => [String(operator._id), operator]));
   provider.operators.forEach((operator, index) => {
@@ -93,7 +93,7 @@ function applyCompassOperatorSettings(provider, list) {
     }, index);
     operator.basePay = parsed.basePay;
     operator.contractedHours = parsed.contractedHours;
-    operator.liftLease = parsed.liftLease;
+    if (!leaseManaged) operator.liftLease = parsed.liftLease;
     operator.planId = parsed.planId;
     operator.notes = parsed.notes;
   });
@@ -228,7 +228,10 @@ export async function update(req, res) {
   const p = await Provider.findById(req.params.id);
   if (!p) throw notFound('Provider');
   if (p.source?.system === 'COMPASS') {
-    if (req.body.operators !== undefined) applyCompassOperatorSettings(p, req.body.operators);
+    const division = await Division.findById(p.divisionId);
+    if (req.body.operators !== undefined) {
+      applyCompassOperatorSettings(p, req.body.operators, { leaseManaged: Boolean(division?.liftLease?.configured) });
+    }
     await applyInput(p, pick(req.body, ['providerNumber', 'serviceType', 'notes', 'planId', 'overrides', 'contact']));
   } else {
     await applyInput(p, req.body);
