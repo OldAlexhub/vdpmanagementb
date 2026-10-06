@@ -140,9 +140,7 @@ export async function applyInput(provider, body) {
     if (!body.planId) provider.planId = null;
     else {
       const plan = await VdpPlan.findById(body.planId);
-      if (!plan || String(plan.divisionId) !== String(provider.divisionId)) {
-        throw badRequest('The VDP plan must belong to the provider’s division.');
-      }
+      if (!plan) throw badRequest('Choose a valid VDP plan.');
       provider.planId = plan._id;
     }
   }
@@ -246,9 +244,7 @@ export async function assignDivisionPlan(req, res) {
   if (!division) throw notFound('Division');
   if (!req.body.planId) throw badRequest('Choose a VDP plan to assign.');
   const plan = await VdpPlan.findById(req.body.planId);
-  if (!plan || String(plan.divisionId) !== String(division._id)) {
-    throw badRequest('The VDP plan must belong to this division.');
-  }
+  if (!plan) throw badRequest('Choose a valid VDP plan.');
   if (plan.status !== 'ACTIVE') throw badRequest('Choose an active VDP plan.');
 
   division.defaultPlanId = plan._id;
