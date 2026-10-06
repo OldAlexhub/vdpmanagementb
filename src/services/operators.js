@@ -27,6 +27,12 @@ export function operatorsOf(provider) {
       endDate: o.endDate || null,
       transferredFrom: transferOf(o.transferredFrom),
       transferredTo: transferOf(o.transferredTo),
+      employeeId: o.employeeId || null,
+      source: o.source ? {
+        system: o.source.system || 'MANUAL',
+        externalId: o.source.externalId || null,
+        lastSyncedAt: o.source.lastSyncedAt || null,
+      } : { system: 'MANUAL', externalId: null, lastSyncedAt: null },
     }));
   }
   if (!provider) return [];
@@ -45,6 +51,8 @@ export function operatorsOf(provider) {
     endDate: null,
     transferredFrom: null,
     transferredTo: null,
+    employeeId: null,
+    source: { system: 'MANUAL', externalId: null, lastSyncedAt: null },
   }];
 }
 

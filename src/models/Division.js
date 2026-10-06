@@ -1,6 +1,15 @@
 import mongoose from 'mongoose';
 import { jsonOptions } from './common.js';
 
+const sourceSchema = new mongoose.Schema(
+  {
+    system: { type: String, enum: ['MANUAL', 'COMPASS'], default: 'MANUAL' },
+    externalId: { type: String, trim: true, default: null },
+    lastSyncedAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
 const divisionSchema = new mongoose.Schema(
   {
     divisionNumber: { type: String, required: true, unique: true, trim: true },
@@ -9,6 +18,7 @@ const divisionSchema = new mongoose.Schema(
     timezone: { type: String, default: 'America/Los_Angeles' },
     status: { type: String, enum: ['ACTIVE', 'INACTIVE'], default: 'ACTIVE' },
     notes: String,
+    source: { type: sourceSchema, default: () => ({}) },
     // How this division's VDP cycles are generated. Can evolve per division.
     cycleSettings: {
       anchorDate: { type: Date, default: () => new Date('2026-08-24T00:00:00Z') },
@@ -18,6 +28,11 @@ const divisionSchema = new mongoose.Schema(
     },
   },
   jsonOptions,
+);
+
+divisionSchema.index(
+  { 'source.system': 1, 'source.externalId': 1 },
+  { unique: true, partialFilterExpression: { 'source.system': 'COMPASS', 'source.externalId': { $type: 'string' } } },
 );
 
 export default mongoose.model('Division', divisionSchema);

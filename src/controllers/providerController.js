@@ -9,6 +9,7 @@ import { operatorsOf, worksBetween, LEGACY_OPERATOR_ID } from '../services/opera
 import { isoDate, addDays, toDateOnly } from '../services/cycleService.js';
 import { badRequest, conflict, notFound, actor } from '../services/errors.js';
 import { decimalInput, pick } from './validate.js';
+import { isCompassRosterAuthority } from '../services/compassClient.js';
 
 const normRoutes = (routes) =>
   [...new Set((Array.isArray(routes) ? routes : String(routes || '').split(/[,\s]+/))
@@ -75,6 +76,27 @@ function applyOperators(provider, list) {
     }
   }
   provider.operators = [...operators, ...movedAway];
+}
+
+function applyCompassOperatorSettings(provider, list) {
+  if (!Array.isArray(list)) throw badRequest('Operators must be a list.');
+  const inputById = new Map(list.filter((operator) => operator?._id).map((operator) => [String(operator._id), operator]));
+  provider.operators.forEach((operator, index) => {
+    const input = inputById.get(String(operator._id));
+    if (!input) return;
+    const parsed = operatorInput({
+      ...input,
+      name: operator.name,
+      routes: operator.routes,
+      status: operator.status,
+      vehicleUnit: operator.vehicleUnit,
+    }, index);
+    operator.basePay = parsed.basePay;
+    operator.contractedHours = parsed.contractedHours;
+    operator.liftLease = parsed.liftLease;
+    operator.planId = parsed.planId;
+    operator.notes = parsed.notes;
+  });
 }
 
 export async function applyInput(provider, body) {
@@ -193,6 +215,7 @@ export async function get(req, res) {
 }
 
 export async function create(req, res) {
+  if (isCompassRosterAuthority()) throw badRequest('Compass manages providers. Use Sync from Compass in Settings.');
   if (!req.body.name) throw badRequest('Provider name is required.');
   if (!req.body.divisionId) throw badRequest('Choose a division.');
   const p = new Provider({ divisionId: req.body.divisionId });
@@ -204,7 +227,12 @@ export async function create(req, res) {
 export async function update(req, res) {
   const p = await Provider.findById(req.params.id);
   if (!p) throw notFound('Provider');
-  await applyInput(p, req.body);
+  if (p.source?.system === 'COMPASS') {
+    if (req.body.operators !== undefined) applyCompassOperatorSettings(p, req.body.operators);
+    await applyInput(p, pick(req.body, ['providerNumber', 'serviceType', 'notes', 'planId', 'overrides', 'contact']));
+  } else {
+    await applyInput(p, req.body);
+  }
   await p.save();
   await markStale({ providerId: p._id });
   res.json(await withPayment(p));
@@ -228,12 +256,14 @@ export async function transferOperator(req, res) {
   const { toProviderId, effectiveDate, note } = req.body;
   const source = await Provider.findById(req.params.id);
   if (!source) throw notFound('Provider');
+  if (source.source?.system === 'COMPASS') throw badRequest('Compass controls operator assignments. Change the provider in Compass, then refresh the roster.');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(effectiveDate || '')) || Number.isNaN(Date.parse(effectiveDate))) {
     throw badRequest('Choose the effective date (the operator’s first day with the new provider).');
   }
   if (!toProviderId || String(toProviderId) === String(source._id)) throw badRequest('Choose the provider the operator is moving to.');
   const target = await Provider.findById(toProviderId);
   if (!target || String(target.divisionId) !== String(source.divisionId)) throw badRequest('Choose a provider in the same division.');
+  if (target.source?.system === 'COMPASS') throw badRequest('Compass controls operator assignments for the selected provider.');
   if (target.status !== 'ACTIVE') throw badRequest(`${target.name} is inactive. Activate it before moving an operator there.`);
 
   materializeOperators(source);

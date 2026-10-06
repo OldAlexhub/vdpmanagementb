@@ -4,6 +4,10 @@ import VdpPlan from '../models/VdpPlan.js';
 import { badRequest, notFound } from '../services/errors.js';
 import { pick } from './validate.js';
 import { joinOpenPeriods } from './cycleController.js';
+import { isCompassRosterAuthority } from '../services/compassClient.js';
+
+const compassOwned = (division) => division.source?.system === 'COMPASS';
+const manualRosterDisabled = () => badRequest('Compass manages divisions and providers. Use Sync from Compass in Settings.');
 
 // The VDP cycle schedule is company-wide (Settings), not per division.
 export function applyInput(division, body) {
@@ -27,6 +31,7 @@ export async function get(req, res) {
 }
 
 export async function create(req, res) {
+  if (isCompassRosterAuthority()) throw manualRosterDisabled();
   if (!req.body.divisionNumber || !req.body.name) throw badRequest('Division number and name are required.');
   const d = new Division();
   applyInput(d, req.body);
@@ -38,7 +43,7 @@ export async function create(req, res) {
 export async function update(req, res) {
   const d = await Division.findById(req.params.id);
   if (!d) throw notFound('Division');
-  applyInput(d, req.body);
+  applyInput(d, compassOwned(d) ? pick(req.body, ['location', 'notes']) : req.body);
   await d.save();
   res.json(d);
 }
@@ -46,6 +51,7 @@ export async function update(req, res) {
 export async function setStatus(req, res) {
   const d = await Division.findById(req.params.id);
   if (!d) throw notFound('Division');
+  if (compassOwned(d)) throw badRequest("Compass controls this division's status. Refresh the Compass roster instead.");
   if (!['ACTIVE', 'INACTIVE'].includes(req.body.status)) throw badRequest('Status must be ACTIVE or INACTIVE.');
   d.status = req.body.status;
   await d.save();

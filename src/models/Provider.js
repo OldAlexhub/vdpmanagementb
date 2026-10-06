@@ -3,6 +3,15 @@ import { dec, jsonOptions } from './common.js';
 
 const { Schema } = mongoose;
 
+const sourceSchema = new Schema(
+  {
+    system: { type: String, enum: ['MANUAL', 'COMPASS'], default: 'MANUAL' },
+    externalId: { type: String, trim: true, default: null },
+    lastSyncedAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
 const leaseSchema = {
   amount: dec({ default: null }),
   frequency: { type: String, enum: ['WEEKLY', 'PER_VDP_CYCLE', 'NONE'], default: 'NONE' },
@@ -42,6 +51,8 @@ const operatorSchema = new Schema(
     endDate: { type: String, default: null },
     transferredFrom: transferSchema,
     transferredTo: transferSchema,
+    employeeId: { type: String, trim: true, default: null },
+    source: { type: sourceSchema, default: () => ({}) },
   },
   { toJSON: { getters: true, versionKey: false }, toObject: { getters: true } },
 );
@@ -74,6 +85,7 @@ const providerSchema = new Schema(
       address: String,
     },
     notes: String,
+    source: { type: sourceSchema, default: () => ({}) },
   },
   jsonOptions,
 );
@@ -90,5 +102,9 @@ providerSchema.pre('validate', function syncFromOperators() {
 
 providerSchema.index({ divisionId: 1, providerNumber: 1 });
 providerSchema.index({ divisionId: 1, routes: 1 });
+providerSchema.index(
+  { divisionId: 1, 'source.system': 1, 'source.externalId': 1 },
+  { unique: true, partialFilterExpression: { 'source.system': 'COMPASS', 'source.externalId': { $type: 'string' } } },
+);
 
 export default mongoose.model('Provider', providerSchema);

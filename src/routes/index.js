@@ -11,6 +11,7 @@ import * as uberPerformance from '../controllers/uberPerformanceController.js';
 import * as vdps from '../controllers/vdpController.js';
 import * as portal from '../controllers/portalController.js';
 import * as imports from '../controllers/importController.js';
+import * as compass from '../controllers/compassController.js';
 import { cycleWorkbook } from '../services/exportService.js';
 import { registerPdf, cycleSchedulePdf, planReportPdf } from '../services/pdfService.js';
 import { leadershipReport, providerReport } from '../services/analyticsService.js';
@@ -45,6 +46,13 @@ api.use(requireStaff);
 api.get('/users', requireAdmin, auth.listUsers);
 api.post('/users', requireAdmin, auth.createUser);
 api.patch('/users/:id', requireAdmin, auth.updateUser);
+
+// Compass is the roster authority. MongoDB remains the VDP application database.
+api.get('/compass/status', compass.status);
+api.post('/compass/test', requireAdmin, compass.test);
+api.post('/compass/preview', requireAdmin, compass.preview);
+api.post('/compass/sync', requireAdmin, compass.sync);
+api.put('/compass/settings', requireAdmin, compass.updateSettings);
 
 api.get('/divisions', divisions.list);
 api.post('/divisions', requireAdmin, divisions.create);

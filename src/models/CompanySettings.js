@@ -11,6 +11,15 @@ const companySettingsSchema = new mongoose.Schema(
       submissionOffsetDays: { type: Number, default: 15, min: 0 },
       paymentOffsetDays: { type: Number, default: 4, min: 0 },
     },
+    compassRoster: {
+      automaticSyncEnabled: { type: Boolean, default: true },
+      syncIntervalMinutes: { type: Number, default: 15, min: 1, max: 1440 },
+      lastAttemptAt: { type: Date, default: null },
+      lastSyncAt: { type: Date, default: null },
+      lastSyncStatus: { type: String, enum: ['NEVER', 'RUNNING', 'SUCCESS', 'FAILED'], default: 'NEVER' },
+      lastError: { type: String, default: null },
+      lastSummary: { type: mongoose.Schema.Types.Mixed, default: null },
+    },
   },
   jsonOptions,
 );

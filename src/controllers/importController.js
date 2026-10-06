@@ -14,6 +14,7 @@ import { operatorsOf } from '../services/operators.js';
 import { isoDate } from '../services/cycleService.js';
 import { str } from '../services/money.js';
 import { HttpError, actor, notFound } from '../services/errors.js';
+import { isCompassRosterAuthority } from '../services/compassClient.js';
 import {
   MAX_ROWS, addDataSheet, addInstructionsSheet, addListsSheet, addReferenceSheet, listRanges,
   loadWorkbook, newWorkbook, parseDate, readSheet, sheetRange,
@@ -560,6 +561,9 @@ const KINDS = { divisions, plans, providers };
 function specFor(req) {
   const spec = KINDS[req.params.kind];
   if (!spec) throw notFound('Import type');
+  if (isCompassRosterAuthority() && ['divisions', 'providers'].includes(req.params.kind)) {
+    throw new HttpError(400, 'Compass manages divisions and providers. Bulk roster import is disabled.');
+  }
   if (spec.admin && req.user?.role !== 'ADMIN') throw new HttpError(403, `Only administrators can import ${spec.title.toLowerCase()}.`);
   return spec;
 }
