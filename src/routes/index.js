@@ -13,7 +13,6 @@ import * as portal from '../controllers/portalController.js';
 import * as imports from '../controllers/importController.js';
 import * as compass from '../controllers/compassController.js';
 import * as liftLeases from '../controllers/liftLeaseController.js';
-import * as planAssignments from '../controllers/planAssignmentController.js';
 import { cycleWorkbook } from '../services/exportService.js';
 import { registerPdf, cycleSchedulePdf, planReportPdf } from '../services/pdfService.js';
 import { leadershipReport, providerReport } from '../services/analyticsService.js';
@@ -59,9 +58,6 @@ api.put('/compass/settings', requireAdmin, compass.updateSettings);
 api.get('/lift-leases', liftLeases.list);
 api.put('/lift-leases/:divisionId', requireAdmin, liftLeases.update);
 
-api.get('/plan-assignments', planAssignments.list);
-api.put('/plan-assignments/:divisionId', requireAdmin, planAssignments.update);
-
 api.get('/divisions', divisions.list);
 api.post('/divisions', requireAdmin, divisions.create);
 api.get('/divisions/:id', divisions.get);
@@ -83,6 +79,7 @@ api.put('/vdp-plans/:id/fuel-prices', plans.setFuelPrices);
 
 api.get('/providers', providers.list);
 api.post('/providers', providers.create);
+api.put('/providers/division/:divisionId/plan', requireAdmin, providers.assignDivisionPlan);
 api.get('/providers/:id', providers.get);
 api.put('/providers/:id', providers.update);
 api.post('/providers/:id/operators/:operatorId/transfer', providers.transferOperator);

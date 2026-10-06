@@ -145,13 +145,6 @@ export async function applyInput(provider, body) {
       }
       provider.planId = plan._id;
     }
-    const division = await Division.findById(provider.divisionId);
-    const defaultPlanId = division?.planAssignment?.defaultPlanId;
-    const matchesDefault = provider.planId && defaultPlanId && String(provider.planId) === String(defaultPlanId);
-    provider.planAssignment = {
-      source: matchesDefault ? 'DIVISION' : (provider.planId || defaultPlanId ? 'PROVIDER_OVERRIDE' : 'UNASSIGNED'),
-      assignedAt: new Date(),
-    };
   }
   if (body.overrides) {
     const o = body.overrides;
@@ -246,6 +239,27 @@ export async function update(req, res) {
   await p.save();
   await markStale({ providerId: p._id });
   res.json(await withPayment(p));
+}
+
+export async function assignDivisionPlan(req, res) {
+  const division = await Division.findById(req.params.divisionId);
+  if (!division) throw notFound('Division');
+  if (!req.body.planId) throw badRequest('Choose a VDP plan to assign.');
+  const plan = await VdpPlan.findById(req.body.planId);
+  if (!plan || String(plan.divisionId) !== String(division._id)) {
+    throw badRequest('The VDP plan must belong to this division.');
+  }
+  if (plan.status !== 'ACTIVE') throw badRequest('Choose an active VDP plan.');
+
+  division.defaultPlanId = plan._id;
+  await division.save();
+  const result = await Provider.updateMany({ divisionId: division._id }, { $set: { planId: plan._id } });
+  if (result.matchedCount) await markStale({ providerId: { $in: (await Provider.find({ divisionId: division._id }, '_id')).map((provider) => provider._id) } });
+  res.json({
+    divisionId: division._id,
+    plan: { _id: plan._id, name: plan.name },
+    applied: { providers: result.matchedCount },
+  });
 }
 
 // A provider saved before operators existed gets its one operator as a real record first.

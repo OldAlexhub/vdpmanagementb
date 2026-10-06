@@ -56,10 +56,9 @@ a division. The value is stored on the division in MongoDB, applied to current o
 to new operators during later Compass refreshes. Open VDPs are marked stale; approved and paid
 statements keep their frozen values.
 
-The **Plan Assignments** tab applies one active VDP plan to every provider in a division and saves it
-as the default for providers discovered by later Compass refreshes. A provider can be edited afterward
-to choose another plan as an explicit exception. Routine refreshes preserve exceptions; deliberately
-applying the division plan again replaces them. Plan assignments remain MongoDB-owned.
+On the **Providers** tab, administrators can filter to a division and batch assign one of that
+division's existing active VDP plans. The selection also becomes the default for providers discovered
+by later Compass refreshes. An individual provider can still be edited afterward to use another plan.
 
 ## Scripts
 

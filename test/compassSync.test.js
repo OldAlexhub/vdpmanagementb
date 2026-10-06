@@ -8,8 +8,7 @@ import Provider from '../src/models/Provider.js';
 import VdpPlan from '../src/models/VdpPlan.js';
 import { syncCompassRoster } from '../src/services/compassRosterService.js';
 import * as liftLeases from '../src/controllers/liftLeaseController.js';
-import * as planAssignments from '../src/controllers/planAssignmentController.js';
-import { applyInput as applyProviderInput } from '../src/controllers/providerController.js';
+import { applyInput as applyProviderInput, assignDivisionPlan } from '../src/controllers/providerController.js';
 
 const TEST_DB = 'bigstar_vdp_test';
 const skip = !process.env.MONGO_URI && 'MONGO_URI not set';
@@ -117,18 +116,16 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
     { divisionId: div10._id, name: 'Division Standard' },
     { divisionId: div10._id, name: 'Provider Exception' },
   ]);
-  await planAssignments.update(
+  await assignDivisionPlan(
     { params: { divisionId: div10._id }, body: { planId: divisionPlan._id } },
     { json: (value) => { response = value; } },
   );
   assert.deepEqual(response.applied, { providers: 2 });
   assigned = await Provider.findById(kept._id);
   assert.equal(String(assigned.planId), String(divisionPlan._id));
-  assert.equal(assigned.planAssignment.source, 'DIVISION');
 
   await applyProviderInput(assigned, { planId: exceptionPlan._id });
   await assigned.save();
-  assert.equal(assigned.planAssignment.source, 'PROVIDER_OVERRIDE');
 
   await syncCompassRoster({ snapshot: {
     ...snapshot,
@@ -142,14 +139,6 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
   } });
   const exception = await Provider.findById(kept._id);
   assert.equal(String(exception.planId), String(exceptionPlan._id));
-  assert.equal(exception.planAssignment.source, 'PROVIDER_OVERRIDE');
   const later = await Provider.findOne({ 'source.externalId': 'p3' });
   assert.equal(String(later.planId), String(divisionPlan._id));
-  assert.equal(later.planAssignment.source, 'DIVISION');
-
-  let rows;
-  await planAssignments.list({}, { json: (value) => { rows = value; } });
-  const div10Row = rows.find((row) => String(row.divisionId) === String(div10._id));
-  assert.equal(div10Row.assignedToDefaultCount, 1);
-  assert.equal(div10Row.overrideCount, 1);
 });

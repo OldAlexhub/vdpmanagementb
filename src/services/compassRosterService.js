@@ -332,10 +332,9 @@ async function performCompassSync(snapshot) {
       const wasCompassProvider = provider?.source?.system === 'COMPASS';
       if (!provider) {
         provider = new Provider({ divisionId: division._id, name: compassProvider.name });
-        const defaultPlanId = division.planAssignment?.defaultPlanId;
+        const defaultPlanId = division.defaultPlanId;
         if (defaultPlanId && activePlanIds.has(id(defaultPlanId))) {
           provider.planId = defaultPlanId;
-          provider.planAssignment = { source: 'DIVISION', assignedAt: syncedAt };
         }
       }
       const before = isNewProvider ? null : rosterSignature(provider);
