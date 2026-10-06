@@ -27,6 +27,12 @@ const divisionSchema = new mongoose.Schema(
       frequency: { type: String, enum: ['WEEKLY', 'PER_VDP_CYCLE', 'NONE'], default: 'NONE' },
       updatedAt: { type: Date, default: null },
     },
+    // The plan applied to every provider in this division. New providers brought in
+    // by Compass inherit it; an individual provider can still keep an explicit exception.
+    planAssignment: {
+      defaultPlanId: { type: mongoose.Schema.Types.ObjectId, ref: 'VdpPlan', default: null },
+      updatedAt: { type: Date, default: null },
+    },
     // How this division's VDP cycles are generated. Can evolve per division.
     cycleSettings: {
       anchorDate: { type: Date, default: () => new Date('2026-08-24T00:00:00Z') },

@@ -1,11 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assertSafeCompassSnapshot, compassDivisionNumber, normalizeCompassSnapshot } from '../src/services/compassRosterService.js';
+import {
+  assertSafeCompassSnapshot, compassDivisionNumber, normalizeCompassSnapshot, runCutWeeklyServiceHours,
+} from '../src/services/compassRosterService.js';
 
 test('Compass division codes map to VDP division numbers', () => {
   assert.equal(compassDivisionNumber('DIV_10'), '10');
   assert.equal(compassDivisionNumber('DIV-3GL'), '3GL');
   assert.equal(compassDivisionNumber('6'), '6');
+});
+
+test('run-cut daily service hours become weekly contracted hours', () => {
+  assert.equal(runCutWeeklyServiceHours({
+    status: 'active', operator: { _id: 'o1' }, serviceHours: 9.5,
+    daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'],
+  }), 47.5);
+  assert.equal(runCutWeeklyServiceHours({
+    status: 'active', operator: { _id: 'o1' }, serviceHours: 8,
+    daysOfWeek: ['MON', 'MON', 'TUE'],
+  }), 16);
+  assert.equal(runCutWeeklyServiceHours({ status: 'unassigned', operator: null, serviceHours: 8, daysOfWeek: ['MON'] }), null);
+  assert.equal(runCutWeeklyServiceHours({ status: 'active', operator: { _id: 'o1' }, serviceHours: 0, daysOfWeek: ['MON'] }), null);
 });
 
 test('Compass operators are grouped by provider and division with active run-cut routes', () => {
@@ -18,8 +33,8 @@ test('Compass operators are grouped by provider and division with active run-cut
       { _id: 'o2', employeeId: '101', name: 'Two Driver', active: false, division: { _id: 'd10' }, provider: { _id: 'p1' } },
     ],
     runCuts: [
-      { status: 'active', operator: { _id: 'o1' }, route: { code: '918' }, vehicle: { code: 'V1' } },
-      { status: 'active', operator: { _id: 'o1' }, route: { code: '919' }, vehicle: { code: 'V1' } },
+      { status: 'active', operator: { _id: 'o1' }, route: { code: '918' }, vehicle: { code: 'V1' }, serviceHours: 5, daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] },
+      { status: 'active', operator: { _id: 'o1' }, route: { code: '919' }, vehicle: { code: 'V1' }, serviceHours: 2.5, daysOfWeek: ['SAT', 'SUN'] },
       { status: 'unassigned', operator: null, route: { code: '920' }, vehicle: null },
     ],
   });
@@ -27,6 +42,7 @@ test('Compass operators are grouped by provider and division with active run-cut
   assert.equal(normalized.divisions[0].providers.length, 1);
   assert.deepEqual(normalized.divisions[0].providers[0].operators[0].routes, ['918', '919']);
   assert.equal(normalized.divisions[0].providers[0].operators[0].vehicleUnit, 'V1');
+  assert.equal(normalized.divisions[0].providers[0].operators[0].contractedHours, '30');
   assert.equal(normalized.unassignedRunCuts, 1);
 });
 

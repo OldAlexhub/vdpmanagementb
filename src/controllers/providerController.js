@@ -92,7 +92,7 @@ function applyCompassOperatorSettings(provider, list, { leaseManaged = false } =
       vehicleUnit: operator.vehicleUnit,
     }, index);
     operator.basePay = parsed.basePay;
-    operator.contractedHours = parsed.contractedHours;
+    // Contracted hours for Compass operators are derived from active run-cut service hours.
     if (!leaseManaged) operator.liftLease = parsed.liftLease;
     operator.planId = parsed.planId;
     operator.notes = parsed.notes;
@@ -145,6 +145,13 @@ export async function applyInput(provider, body) {
       }
       provider.planId = plan._id;
     }
+    const division = await Division.findById(provider.divisionId);
+    const defaultPlanId = division?.planAssignment?.defaultPlanId;
+    const matchesDefault = provider.planId && defaultPlanId && String(provider.planId) === String(defaultPlanId);
+    provider.planAssignment = {
+      source: matchesDefault ? 'DIVISION' : (provider.planId || defaultPlanId ? 'PROVIDER_OVERRIDE' : 'UNASSIGNED'),
+      assignedAt: new Date(),
+    };
   }
   if (body.overrides) {
     const o = body.overrides;

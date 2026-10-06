@@ -1,5 +1,6 @@
 import Division from '../models/Division.js';
 import Provider from '../models/Provider.js';
+import VdpPlan from '../models/VdpPlan.js';
 import { getCompanySettings } from '../models/CompanySettings.js';
 import { normalizeName } from './uberDriverMatching.js';
 import { readCompassSnapshot } from './compassClient.js';
@@ -11,15 +12,30 @@ export const compassDivisionNumber = (code) => String(code || '').trim().replace
 const id = (value) => (value === undefined || value === null ? '' : String(value));
 const sorted = (values) => [...new Set(values.filter(Boolean).map(String))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
+// Compass serviceHours is the service time for one scheduled day. Contracted hours
+// are the weekly sum across the run cut's distinct scheduled days.
+export function runCutWeeklyServiceHours(runCut) {
+  if (runCut?.status !== 'active' || !runCut.operator?._id) return null;
+  const dailyHours = Number(runCut.serviceHours);
+  const days = new Set((runCut.daysOfWeek || []).filter(Boolean)).size;
+  if (!Number.isFinite(dailyHours) || dailyHours <= 0 || !days) return null;
+  return Math.round(dailyHours * days * 100) / 100;
+}
+
 export function normalizeCompassSnapshot(snapshot) {
   const providerById = new Map(snapshot.providers.map((provider) => [id(provider._id), provider]));
   const routesByOperator = new Map();
   const vehiclesByOperator = new Map();
+  const weeklyHoursByOperator = new Map();
   for (const runCut of snapshot.runCuts) {
     const operatorId = id(runCut.operator?._id);
-    if (!operatorId || !runCut.route?.code || runCut.status !== 'active') continue;
-    if (!routesByOperator.has(operatorId)) routesByOperator.set(operatorId, new Set());
-    routesByOperator.get(operatorId).add(String(runCut.route.code).trim());
+    if (!operatorId || runCut.status !== 'active') continue;
+    const weeklyHours = runCutWeeklyServiceHours(runCut);
+    if (weeklyHours !== null) weeklyHoursByOperator.set(operatorId, (weeklyHoursByOperator.get(operatorId) || 0) + weeklyHours);
+    if (runCut.route?.code) {
+      if (!routesByOperator.has(operatorId)) routesByOperator.set(operatorId, new Set());
+      routesByOperator.get(operatorId).add(String(runCut.route.code).trim());
+    }
     if (runCut.vehicle?.code) {
       if (!vehiclesByOperator.has(operatorId)) vehiclesByOperator.set(operatorId, new Set());
       vehiclesByOperator.get(operatorId).add(String(runCut.vehicle.code).trim());
@@ -61,6 +77,9 @@ export function normalizeCompassSnapshot(snapshot) {
       employeeId: String(operator.employeeId || '').trim() || null,
       name: String(operator.name || '').trim(),
       status: operator.active === false ? 'INACTIVE' : 'ACTIVE',
+      contractedHours: weeklyHoursByOperator.has(operatorId)
+        ? String(Math.round(weeklyHoursByOperator.get(operatorId) * 100) / 100)
+        : null,
       routes,
       vehicleUnits,
       vehicleUnit: vehicleUnits.length === 1 ? vehicleUnits[0] : null,
@@ -83,6 +102,7 @@ export function normalizeCompassSnapshot(snapshot) {
     providersWithoutOperators: snapshot.providers.filter((provider) => !referencedProviders.has(id(provider._id))).length,
     operatorsWithoutEmployeeId: snapshot.operators.filter((operator) => !String(operator.employeeId || '').trim()).length,
     activeOperatorsWithoutRoutes: snapshot.operators.filter((operator) => operator.active !== false && !(routesByOperator.get(id(operator._id))?.size)).length,
+    activeOperatorsWithoutContractedHours: snapshot.operators.filter((operator) => operator.active !== false && !weeklyHoursByOperator.has(id(operator._id))).length,
     unassignedRunCuts: snapshot.runCuts.filter((runCut) => !runCut.operator?._id).length,
   };
 }
@@ -119,6 +139,7 @@ export async function previewCompassRoster() {
         operatorCount: provider.operators.length,
         activeOperatorCount: provider.operators.filter((operator) => operator.status === 'ACTIVE').length,
         operatorsWithRoutes: provider.operators.filter((operator) => operator.routes.length).length,
+        operatorsWithContractedHours: provider.operators.filter((operator) => operator.contractedHours !== null).length,
         mongoProviderMatched: Boolean(match),
         exactOperatorMatches: operatorMatches,
       });
@@ -133,6 +154,7 @@ export async function previewCompassRoster() {
       providerCount: division.providers.length,
       operatorCount: division.providers.reduce((sum, provider) => sum + provider.operators.length, 0),
       activeOperatorCount: division.providers.reduce((sum, provider) => sum + provider.operators.filter((operator) => operator.status === 'ACTIVE').length, 0),
+      operatorsWithContractedHours: division.providers.reduce((sum, provider) => sum + provider.operators.filter((operator) => operator.contractedHours !== null).length, 0),
       providersMatched: divisionProviderMatches,
       operatorsMatched: divisionOperatorMatches,
     };
@@ -147,6 +169,7 @@ export async function previewCompassRoster() {
   if (missingFromCompass.length) warnings.push(`MongoDB divisions not returned by this Compass token: ${missingFromCompass.join(', ')}.`);
   if (missingFromMongo.length) warnings.push(`Compass divisions not yet present in MongoDB: ${missingFromMongo.join(', ')}.`);
   if (normalized.activeOperatorsWithoutRoutes) warnings.push(`${normalized.activeOperatorsWithoutRoutes} active Compass operators have no active Master Run Cut route.`);
+  if (normalized.activeOperatorsWithoutContractedHours) warnings.push(`${normalized.activeOperatorsWithoutContractedHours} active Compass operators have no active run-cut service hours, so contracted hours remain blank.`);
   if (normalized.operatorsWithoutEmployeeId) warnings.push(`${normalized.operatorsWithoutEmployeeId} Compass operator record has no employee ID.`);
   if (normalized.providersWithoutOperators) warnings.push(`${normalized.providersWithoutOperators} Compass provider records cannot be assigned to a division because they have no operators.`);
 
@@ -158,6 +181,7 @@ export async function previewCompassRoster() {
       providerDivisionRecords: normalized.providerDivisionRecords,
       compassOperators: normalized.divisions.reduce((sum, division) => sum + division.providers.reduce((n, provider) => n + provider.operators.length, 0), 0),
       operatorsWithRoutes: normalized.divisions.reduce((sum, division) => sum + division.providers.reduce((n, provider) => n + provider.operators.filter((operator) => operator.routes.length).length, 0), 0),
+      operatorsWithContractedHours: normalized.divisions.reduce((sum, division) => sum + division.providers.reduce((n, provider) => n + provider.operators.filter((operator) => operator.contractedHours !== null).length, 0), 0),
       mongoDivisionMatches: divisions.filter((division) => division.mongoDivisionMatched).length,
       exactProviderMatches: matchedProviders,
       exactOperatorMatches: matchedOperators,
@@ -181,6 +205,7 @@ const rosterSignature = (provider) => JSON.stringify({
     status: operator.status,
     routes: [...(operator.routes || [])].sort(),
     vehicleUnit: operator.vehicleUnit || null,
+    contractedHours: operator.contractedHours === null || operator.contractedHours === undefined ? null : String(operator.contractedHours),
     liftLease: {
       amount: operator.liftLease?.amount === null || operator.liftLease?.amount === undefined ? null : String(operator.liftLease.amount),
       frequency: operator.liftLease?.frequency || 'NONE',
@@ -220,6 +245,7 @@ function compassOperatorValue(operator, previous, syncedAt, { keepIdentity = tru
     routes: operator.routes,
     status: operator.status,
     vehicleUnit: operator.vehicleUnit,
+    contractedHours: operator.contractedHours,
     employeeId: operator.employeeId,
     source: sourceOf(operator.externalId, syncedAt),
     liftLease: divisionLease || value.liftLease || { amount: null, frequency: 'NONE' },
@@ -229,7 +255,12 @@ function compassOperatorValue(operator, previous, syncedAt, { keepIdentity = tru
 async function performCompassSync(snapshot) {
   const normalized = assertSafeCompassSnapshot(normalizeCompassSnapshot(snapshot));
   const syncedAt = new Date();
-  const [mongoDivisions, mongoProviders] = await Promise.all([Division.find(), Provider.find()]);
+  const [mongoDivisions, mongoProviders, activePlans] = await Promise.all([
+    Division.find(),
+    Provider.find(),
+    VdpPlan.find({ status: 'ACTIVE' }, '_id'),
+  ]);
+  const activePlanIds = new Set(activePlans.map((plan) => id(plan._id)));
   const divisionByExternalId = new Map(mongoDivisions
     .filter((division) => division.source?.system === 'COMPASS' && division.source.externalId)
     .map((division) => [id(division.source.externalId), division]));
@@ -253,6 +284,7 @@ async function performCompassSync(snapshot) {
     dataQuality: {
       providersWithoutOperators: normalized.providersWithoutOperators,
       activeOperatorsWithoutRoutes: normalized.activeOperatorsWithoutRoutes,
+      activeOperatorsWithoutContractedHours: normalized.activeOperatorsWithoutContractedHours,
       operatorsWithoutEmployeeId: normalized.operatorsWithoutEmployeeId,
       unassignedRunCuts: normalized.unassignedRunCuts,
     },
@@ -298,7 +330,14 @@ async function performCompassSync(snapshot) {
       let provider = providerByExternalId.get(compassProvider.externalId) || providerByName.get(normalizeName(compassProvider.name));
       const isNewProvider = !provider;
       const wasCompassProvider = provider?.source?.system === 'COMPASS';
-      if (!provider) provider = new Provider({ divisionId: division._id, name: compassProvider.name });
+      if (!provider) {
+        provider = new Provider({ divisionId: division._id, name: compassProvider.name });
+        const defaultPlanId = division.planAssignment?.defaultPlanId;
+        if (defaultPlanId && activePlanIds.has(id(defaultPlanId))) {
+          provider.planId = defaultPlanId;
+          provider.planAssignment = { source: 'DIVISION', assignedAt: syncedAt };
+        }
+      }
       const before = isNewProvider ? null : rosterSignature(provider);
       provider.divisionId = division._id;
       provider.name = compassProvider.name;

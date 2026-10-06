@@ -5,8 +5,11 @@ import mongoose from 'mongoose';
 import { connectDb, disconnectDb } from '../src/config/db.js';
 import Division from '../src/models/Division.js';
 import Provider from '../src/models/Provider.js';
+import VdpPlan from '../src/models/VdpPlan.js';
 import { syncCompassRoster } from '../src/services/compassRosterService.js';
 import * as liftLeases from '../src/controllers/liftLeaseController.js';
+import * as planAssignments from '../src/controllers/planAssignmentController.js';
+import { applyInput as applyProviderInput } from '../src/controllers/providerController.js';
 
 const TEST_DB = 'bigstar_vdp_test';
 const skip = !process.env.MONGO_URI && 'MONGO_URI not set';
@@ -56,8 +59,8 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
       { _id: 'o2', employeeId: '200', name: 'Two Driver', active: true, division: { _id: 'd6' }, provider: { _id: 'p2' } },
     ],
     runCuts: [
-      { status: 'active', operator: { _id: 'o1' }, route: { code: '918' }, vehicle: { code: 'V1' } },
-      { status: 'active', operator: { _id: 'o2' }, route: { code: '700' }, vehicle: { code: 'V2' } },
+      { status: 'active', operator: { _id: 'o1' }, route: { code: '918' }, vehicle: { code: 'V1' }, serviceHours: 8, daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] },
+      { status: 'active', operator: { _id: 'o2' }, route: { code: '700' }, vehicle: { code: 'V2' }, serviceHours: 10, daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] },
     ],
   };
   const result = await syncCompassRoster({ snapshot });
@@ -102,10 +105,51 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
     operators: [...snapshot.operators,
       { _id: 'o3', employeeId: '300', name: 'New Driver', active: true, division: { _id: 'd10' }, provider: { _id: 'p1' } }],
     runCuts: [...snapshot.runCuts,
-      { status: 'active', operator: { _id: 'o3' }, route: { code: '919' }, vehicle: { code: 'V3' } }],
+      { status: 'active', operator: { _id: 'o3' }, route: { code: '919' }, vehicle: { code: 'V3' }, serviceHours: 9.5, daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] }],
   } });
   assigned = await Provider.findById(kept._id);
   assert.equal(assigned.operators.length, 2);
   assert.ok(assigned.operators.every((operator) => operator.liftLease.frequency === 'PER_VDP_CYCLE'));
   assert.ok(assigned.operators.every((operator) => operator.liftLease.amount.toString() === '300.00'));
+  assert.equal(assigned.operators.find((operator) => operator.source.externalId === 'o3').contractedHours.toString(), '47.5');
+
+  const [divisionPlan, exceptionPlan] = await VdpPlan.create([
+    { divisionId: div10._id, name: 'Division Standard' },
+    { divisionId: div10._id, name: 'Provider Exception' },
+  ]);
+  await planAssignments.update(
+    { params: { divisionId: div10._id }, body: { planId: divisionPlan._id } },
+    { json: (value) => { response = value; } },
+  );
+  assert.deepEqual(response.applied, { providers: 2 });
+  assigned = await Provider.findById(kept._id);
+  assert.equal(String(assigned.planId), String(divisionPlan._id));
+  assert.equal(assigned.planAssignment.source, 'DIVISION');
+
+  await applyProviderInput(assigned, { planId: exceptionPlan._id });
+  await assigned.save();
+  assert.equal(assigned.planAssignment.source, 'PROVIDER_OVERRIDE');
+
+  await syncCompassRoster({ snapshot: {
+    ...snapshot,
+    providers: [...snapshot.providers, { _id: 'p3', name: 'Later Portland Provider', active: true }],
+    operators: [...snapshot.operators,
+      { _id: 'o3', employeeId: '300', name: 'New Driver', active: true, division: { _id: 'd10' }, provider: { _id: 'p1' } },
+      { _id: 'o4', employeeId: '400', name: 'Later Driver', active: true, division: { _id: 'd10' }, provider: { _id: 'p3' } }],
+    runCuts: [...snapshot.runCuts,
+      { status: 'active', operator: { _id: 'o3' }, route: { code: '919' }, vehicle: { code: 'V3' }, serviceHours: 9.5, daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] },
+      { status: 'active', operator: { _id: 'o4' }, route: { code: '920' }, vehicle: { code: 'V4' }, serviceHours: 8, daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] }],
+  } });
+  const exception = await Provider.findById(kept._id);
+  assert.equal(String(exception.planId), String(exceptionPlan._id));
+  assert.equal(exception.planAssignment.source, 'PROVIDER_OVERRIDE');
+  const later = await Provider.findOne({ 'source.externalId': 'p3' });
+  assert.equal(String(later.planId), String(divisionPlan._id));
+  assert.equal(later.planAssignment.source, 'DIVISION');
+
+  let rows;
+  await planAssignments.list({}, { json: (value) => { rows = value; } });
+  const div10Row = rows.find((row) => String(row.divisionId) === String(div10._id));
+  assert.equal(div10Row.assignedToDefaultCount, 1);
+  assert.equal(div10Row.overrideCount, 1);
 });

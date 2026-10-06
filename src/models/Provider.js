@@ -70,6 +70,10 @@ const providerSchema = new Schema(
     routes: { type: [String], default: [] },
     serviceType: { type: String, trim: true },
     planId: { type: Schema.Types.ObjectId, ref: 'VdpPlan', default: null },
+    planAssignment: {
+      source: { type: String, enum: ['UNASSIGNED', 'DIVISION', 'PROVIDER_OVERRIDE'], default: 'UNASSIGNED' },
+      assignedAt: { type: Date, default: null },
+    },
     liftLease: leaseSchema, // legacy single-operator lease; unused once operators are set
     // Only set when this provider differs from their plan. Null = inherit.
     overrides: {

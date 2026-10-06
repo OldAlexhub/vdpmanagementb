@@ -38,7 +38,8 @@ When the client is served by this API (same origin), the defaults are enough.
 ### Compass roster synchronization
 
 When the Compass connection is configured, Compass becomes the authority for divisions, providers,
-operators, active status, routes, and vehicles. Manual division/provider creation and bulk roster
+operators, active status, routes, vehicles, and weekly contracted hours. Contracted hours are the
+sum of each active run cut's `serviceHours` multiplied by its distinct scheduled weekdays. Manual division/provider creation and bulk roster
 imports are disabled. MongoDB remains the application database for VDP plans, rates, overrides,
 lift leases, contact details, notes, statements, and payment history.
 
@@ -54,6 +55,11 @@ lets an administrator assign one weekly, per-cycle, or no-lease price to every o
 a division. The value is stored on the division in MongoDB, applied to current operators, and copied
 to new operators during later Compass refreshes. Open VDPs are marked stale; approved and paid
 statements keep their frozen values.
+
+The **Plan Assignments** tab applies one active VDP plan to every provider in a division and saves it
+as the default for providers discovered by later Compass refreshes. A provider can be edited afterward
+to choose another plan as an explicit exception. Routine refreshes preserve exceptions; deliberately
+applying the division plan again replaces them. Plan assignments remain MongoDB-owned.
 
 ## Scripts
 
