@@ -247,7 +247,10 @@ export async function assignDivisionPlan(req, res) {
   if (!req.body.planId) {
     division.defaultPlanId = null;
     await division.save();
-    const result = await Provider.updateMany({ divisionId: division._id }, { $set: { planId: null } });
+    const result = await Provider.updateMany(
+      { divisionId: division._id },
+      { $set: { planId: null, 'operators.$[].planId': null } },
+    );
     if (providerIds.length) await markStale({ providerId: { $in: providerIds } });
     res.json({
       divisionId: division._id,

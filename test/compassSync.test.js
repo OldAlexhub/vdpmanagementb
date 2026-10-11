@@ -139,6 +139,8 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
   } });
   const exception = await Provider.findById(kept._id);
   assert.equal(String(exception.planId), String(exceptionPlan._id));
+  exception.operators[0].planId = exceptionPlan._id;
+  await exception.save();
   const later = await Provider.findOne({ 'source.externalId': 'p3' });
   assert.equal(String(later.planId), String(divisionPlan._id));
 
@@ -151,4 +153,6 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
   assert.deepEqual(response.applied, { providers: div10ProviderCount });
   assert.equal((await Division.findById(div10._id)).defaultPlanId, null);
   assert.equal(await Provider.countDocuments({ divisionId: div10._id, planId: { $ne: null } }), 0);
+  const unassignedProviders = await Provider.find({ divisionId: div10._id });
+  assert.ok(unassignedProviders.every((provider) => provider.operators.every((operator) => !operator.planId)));
 });
