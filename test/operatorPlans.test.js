@@ -80,6 +80,12 @@ test('operators on different VDP plans', { skip }, async (t) => {
     assert.equal(r.status, 400);
     assert.match(r.data.error, /provider’s division/);
 
+    r = await call('PUT', `/vdp-plans/${foreign.data._id}`, { divisionId: div10._id });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.divisionId, div10._id);
+    const div10Plans = (await call('GET', `/vdp-plans?divisionId=${div10._id}`)).data;
+    assert.ok(div10Plans.some((plan) => plan._id === foreign.data._id), 'moved plan is offered in its new division');
+
     r = await call('PUT', `/providers/${rimo._id}`, {
       operators: [
         { name: 'Lisa Moore', routes: '918', liftLease: lease, planId: String(rimo.planId) }, // same as provider = none

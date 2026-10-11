@@ -197,6 +197,18 @@ export async function create(req, res) {
 export async function update(req, res) {
   const plan = await VdpPlan.findById(req.params.id);
   if (!plan) throw notFound('VDP plan');
+  if (req.body.divisionId !== undefined && String(req.body.divisionId) !== String(plan.divisionId)) {
+    const division = await Division.findById(req.body.divisionId);
+    if (!division) throw badRequest('Choose a valid division.');
+    const assignedElsewhere = await Provider.findOne({
+      divisionId: { $ne: division._id },
+      $or: [{ planId: plan._id }, { 'operators.planId': plan._id }],
+    }, 'name divisionId');
+    if (assignedElsewhere) {
+      throw conflict(`This plan is still assigned to ${assignedElsewhere.name} in another division. Reassign those providers or operators before changing the plan division.`);
+    }
+    plan.divisionId = division._id;
+  }
   if (req.body.name !== undefined) plan.name = req.body.name;
   if (req.body.notes !== undefined) plan.notes = req.body.notes;
   if (req.body.status !== undefined) {
