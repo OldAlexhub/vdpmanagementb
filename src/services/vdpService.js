@@ -126,6 +126,17 @@ function cycleInfo(cycle) {
 const weekTotals = (days, cycle) => [1, 2].map((n) => {
   const rows = days.filter((d) => d.week === n);
   const attainmentMissing = rows.some((d) => d.attainmentHours === null || d.attainmentHours === undefined);
+  const byDate = new Map();
+  rows.forEach((row) => {
+    const current = byDate.get(row.date) || { date: row.date, trips: D(0), active: false };
+    current.trips = current.trips.plus(D(row.trips || 0));
+    current.active ||= D(row.hours || 0).gt(0) || D(row.trips || 0).gt(0);
+    byDate.set(row.date, current);
+  });
+  const tripDays = [...byDate.values()]
+    .filter((day) => day.active)
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map((day) => ({ date: day.date, trips: day.trips.toString() }));
   return {
     weekNumber: n,
     start: n === 1 ? isoDate(cycle.week1Start) : isoDate(cycle.week2Start),
@@ -137,6 +148,8 @@ const weekTotals = (days, cycle) => [1, 2].map((n) => {
     // source is a review exception; silently falling back could activate a tier.
     attainmentHours: attainmentMissing ? null : sum(rows.map((d) => d.attainmentHours ?? 0)).toString(),
     serviceMiles: rows.some((d) => d.serviceMiles === null) ? null : sum(rows.map((d) => d.serviceMiles)).toString(),
+    workedDays: tripDays.length,
+    tripDays,
   };
 });
 
@@ -491,7 +504,12 @@ export async function computeVdp(vdp, preloaded = {}) {
       division3Imports = preloaded.division3Imports !== undefined ? preloaded.division3Imports : await activeDivision3ImportsFor(cycle._id);
       const groupedDivisions = await processingDivisionsFor(division);
       const groupedProviders = await Provider.find({ divisionId: { $in: groupedDivisions.map((item) => item._id) } });
-      const readiness = division3Readiness({ cycle, imports: division3Imports, providers: groupedProviders });
+      const readiness = division3Readiness({
+        cycle,
+        imports: division3Imports,
+        providers: groupedProviders,
+        processingDivisions: groupedDivisions,
+      });
       if (!readiness.requiredReady) {
         exceptions.push(exception('NO_DIV3_IMPORT', 'DIV 3 requires ADA, GoLink, and ADA fare data for both weeks before calculation.'));
       } else if (settings) {
@@ -499,6 +517,7 @@ export async function computeVdp(vdp, preloaded = {}) {
           imports: division3Imports,
           providers: groupedProviders,
           cycle,
+          processingDivisions: groupedDivisions,
         });
         performance = division3ProviderPerformance({ provider, cycle, dutyRows: inputs.dutyRows });
         const multiService = performance.operators.filter((operator) => operator.services.length > 1);
@@ -728,8 +747,8 @@ export async function processCycle(cycleId, user) {
     division3 ? activeDivision3ImportsFor(cycle._id) : Promise.resolve([]),
   ]);
   if (needsStandard && !importDoc) throw badRequest('Upload the Performance Report for this cycle before processing standard VDP plans.');
-  if (needsUber && !uberImports.length) throw badRequest('Upload valid Uber weekly data for this cycle before processing Uber VDP plans.');
-  if (needsUber && (division2 || division3)) {
+  if (needsUber && !division3 && !uberImports.length) throw badRequest('Upload valid Uber weekly data for this cycle before processing Uber VDP plans.');
+  if (needsUber && uberImports.length && (division2 || division3)) {
     const loadedWeeks = new Set(uberImports.flatMap((doc) => doc.weeksDetected || []));
     const missingWeeks = [isoDate(cycle.week1Start), isoDate(cycle.week2Start)].filter((week) => !loadedWeeks.has(week));
     if (missingWeeks.length) throw badRequest(`Upload the DIV ${division2 ? '2' : '3'} Uber Report for both weeks before processing. Missing: ${missingWeeks.join(', ')}.`);
@@ -756,7 +775,7 @@ export async function processCycle(cycleId, user) {
   }
   let division3Rows = null;
   if (division3) {
-    const readiness = division3Readiness({ cycle, imports: division3Imports, providers });
+    const readiness = division3Readiness({ cycle, imports: division3Imports, providers, processingDivisions });
     if (!readiness.requiredReady) {
       const missing = Object.values(readiness.sources).filter((source) => source.required && !source.ready).map((source) => source.label);
       throw badRequest(`Upload both DIV 3 weeks for ${missing.join(', ')} before processing.`);
@@ -764,10 +783,10 @@ export async function processCycle(cycleId, user) {
     if (readiness.unresolvedCount) {
       throw conflict(
         `${readiness.unresolvedCount} ADA/GoLink driver(s) need to be matched to provider operators before VDPs can be processed.`,
-        { code: 'UNRESOLVED_DIV3_DRIVERS', drivers: readiness.driverMatches.filter((match) => match.status !== 'MATCHED') },
+        { code: 'UNRESOLVED_DIV3_DRIVERS', drivers: readiness.driverMatches.filter((match) => ['UNMATCHED', 'AMBIGUOUS'].includes(match.status)) },
       );
     }
-    division3Rows = division3RowsForCalculation({ imports: division3Imports, providers, cycle });
+    division3Rows = division3RowsForCalculation({ imports: division3Imports, providers, cycle, processingDivisions });
   }
   const uberRows = needsUber ? await uberRowsForCycle(cycle._id) : [];
   const counts = { processed: 0, ready: 0, needsReview: 0, skippedLocked: 0 };

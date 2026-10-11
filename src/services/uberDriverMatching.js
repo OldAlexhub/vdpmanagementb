@@ -16,6 +16,12 @@ export function normalizeName(value) {
 const tokensOf = (value) => normalizeName(value).split(' ').filter(Boolean);
 const sortedName = (value) => tokensOf(value).sort().join(' ');
 const withoutLegalSuffixes = (value) => tokensOf(value).filter((token) => !LEGAL_SUFFIXES.has(token)).join(' ');
+const PERSON_SUFFIXES = new Set(['jr', 'sr', 'ii', 'iii', 'iv']);
+const personEndpoints = (value) => {
+  const tokens = tokensOf(value).filter((token) => !PERSON_SUFFIXES.has(token));
+  if (tokens.length < 2) return '';
+  return [tokens[0], tokens.at(-1)].sort().join(' ');
+};
 
 function levenshtein(a, b) {
   if (!a.length) return b.length;
@@ -41,6 +47,10 @@ export function nameSimilarity(left, right) {
   if (!a || !b) return 0;
   if (a === b) return 1;
   if (sortedName(a) === sortedName(b)) return 0.99;
+  // Compass commonly includes a middle name while operational exports do not.
+  // Equal first/last endpoints are a strong person match in either name order;
+  // suggestOperator still requires the best candidate to be uniquely ahead.
+  if (personEndpoints(a) && personEndpoints(a) === personEndpoints(b)) return 0.98;
   const edit = 1 - (levenshtein(a, b) / Math.max(a.length, b.length));
   const at = new Set(tokensOf(a));
   const bt = new Set(tokensOf(b));

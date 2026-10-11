@@ -18,7 +18,7 @@ import {
   reconcileDivision3Fares,
   division3DriverKey,
 } from './division3Parser.js';
-import { isDivision3Division, processingDivisionsFor } from './divisionGroups.js';
+import { divisionNumberKey, isDivision3Division, processingDivisionsFor } from './divisionGroups.js';
 
 const LABELS = {
   DIV3_ADA: 'ADA raw data',
@@ -76,25 +76,35 @@ async function requireDivision3(divisionId) {
   return division;
 }
 
-async function division3Providers(cycle) {
-  const division = await requireDivision3(cycle.divisionId);
-  const divisions = await processingDivisionsFor(division);
-  return Provider.find({ divisionId: { $in: divisions.map((item) => item._id) } });
-}
-
 async function markCycleStale(cycleId) {
   await Vdp.updateMany({ cycleId, status: { $in: ['DRAFT', 'NEEDS_REVIEW', 'READY'] } }, { $set: { stale: true } });
 }
 
 const operatorKey = (providerId, operatorId) => `${String(providerId)}|${String(operatorId)}`;
 
-function candidatesFor(providers, cycle) {
+function candidatesFor(providers, cycle, processingDivisions = []) {
+  const divisionNumbers = new Map(processingDivisions.map((division) => [String(division._id), divisionNumberKey(division.divisionNumber)]));
   return providers.filter((provider) => provider.status === 'ACTIVE').flatMap((provider) => activeOperators(provider, cycle).map((operator) => ({
     providerId: provider._id,
     providerName: provider.name,
+    divisionId: provider.divisionId,
+    divisionNumber: divisionNumbers.get(String(provider.divisionId)) || divisionNumberKey(provider.divisionNumber),
     operatorId: operator.id,
     operatorName: operator.name,
   })));
+}
+
+const serviceForKind = (kind) => (kind === 'DIV3_GOLINK' ? 'GOLINK' : 'ADA');
+const sourceMatchKey = (sourceName, service) => `${division3DriverKey(sourceName)}|${service}`;
+const serviceForStoredMatch = (doc, match) => match.service || serviceForKind(doc.kind);
+
+function candidatesForServices(candidates, services = []) {
+  const targetDivisions = new Set([...services].map((service) => (service === 'GOLINK' ? '3GL' : '3')));
+  if (!targetDivisions.size) return candidates;
+  const scoped = candidates.filter((candidate) => targetDivisions.has(candidate.divisionNumber));
+  // Keep legacy/non-grouped test data working when no division metadata was
+  // supplied, but never mix ADA and GoLink rosters when the group is known.
+  return candidates.some((candidate) => candidate.divisionNumber) ? scoped : candidates;
 }
 
 const namesIn = (parsed, kind) => {
@@ -104,20 +114,24 @@ const namesIn = (parsed, kind) => {
 
 function automaticMatches(parsed, kind, candidates, reserved) {
   const matches = [];
+  const service = serviceForKind(kind);
   for (const sourceName of [...new Set(namesIn(parsed, kind).filter(Boolean))]) {
     const normalized = division3DriverKey(sourceName);
-    const available = candidates.filter((candidate) => {
+    const matchKey = sourceMatchKey(sourceName, service);
+    const serviceCandidates = candidatesForServices(candidates, [service]);
+    const available = serviceCandidates.filter((candidate) => {
       const owner = reserved.get(operatorKey(candidate.providerId, candidate.operatorId));
-      return !owner || owner === normalized;
+      return !owner || owner === matchKey;
     });
     const { suggestion } = suggestOperator(normalized, available);
-    if (!suggestion || suggestion.confidence < 0.99) continue;
-    reserved.set(operatorKey(suggestion.providerId, suggestion.operatorId), normalized);
+    if (!suggestion) continue;
+    reserved.set(operatorKey(suggestion.providerId, suggestion.operatorId), matchKey);
     matches.push({
       sourceName,
+      service,
       providerId: suggestion.providerId,
       operatorId: suggestion.operatorId,
-      method: 'AUTO_EXACT_NAME',
+      method: suggestion.confidence >= 0.99 ? 'AUTO_EXACT_NAME' : 'AUTO_SMART_NAME',
       confidence: String(suggestion.confidence),
       matchedAt: new Date(),
     });
@@ -158,17 +172,18 @@ export async function uploadDivision3Files({ cycleId, divisionId, kind, files, u
       label: `DIV 3 ${LABELS[kind]}`,
     });
   }
-  await requireDivision3(cycle.divisionId);
+  const division = await requireDivision3(cycle.divisionId);
+  const processingDivisions = await processingDivisionsFor(division);
   const [existing, providers] = await Promise.all([
     activeDivision3ImportsFor(cycle._id, kind),
-    division3Providers(cycle),
+    Provider.find({ divisionId: { $in: processingDivisions.map((item) => item._id) } }),
   ]);
   const allActive = await activeDivision3ImportsFor(cycle._id);
   const hashes = new Set(existing.map((doc) => doc.fileHash));
   const keys = new Map(existing.flatMap((doc) => rowKeys(doc, kind).map((key) => [key, doc.originalFileName])));
-  const candidates = candidatesFor(providers, cycle);
+  const candidates = candidatesFor(providers, cycle, processingDivisions);
   const reserved = new Map(allActive.flatMap((doc) => (doc.division3DriverMatches || []).map((match) => [
-    operatorKey(match.providerId, match.operatorId), division3DriverKey(match.sourceName),
+    operatorKey(match.providerId, match.operatorId), sourceMatchKey(match.sourceName, serviceForStoredMatch(doc, match)),
   ])));
   const results = [];
 
@@ -297,10 +312,10 @@ function sourceNames(imports) {
   for (const doc of imports) {
     const rows = [...(doc.division3DutyRows || []), ...(doc.division3FareRows || [])];
     for (const row of rows) {
-      const key = division3DriverKey(row.driverName);
-      if (!names.has(key)) names.set(key, { sourceName: row.driverName, services: new Set(), dates: new Set(), files: new Set() });
+      const service = row.service || (doc.kind === 'DIV3_ADA_FARE' ? 'ADA' : serviceForKind(doc.kind));
+      const key = sourceMatchKey(row.driverName, service);
+      if (!names.has(key)) names.set(key, { sourceName: row.driverName, service, dates: new Set(), files: new Set() });
       const item = names.get(key);
-      if (row.service) item.services.add(row.service);
       item.dates.add(row.date);
       item.files.add(doc.originalFileName);
     }
@@ -308,13 +323,23 @@ function sourceNames(imports) {
   return names;
 }
 
-export function matchDivision3Drivers(imports, providers, cycle = null) {
-  const candidates = candidatesFor(providers, cycle);
+export function matchDivision3Drivers(imports, providers, cycle = null, processingDivisions = []) {
+  const candidates = candidatesFor(providers, cycle, processingDivisions);
   const names = sourceNames(imports);
   const resolved = new Map();
+  const excluded = new Map();
   for (const doc of imports) {
+    for (const exclusion of doc.division3DriverExclusions || []) {
+      const key = sourceMatchKey(exclusion.sourceName, exclusion.service);
+      excluded.set(key, {
+        setAsideReason: exclusion.reason,
+        setAsideBy: exclusion.excludedBy,
+        setAsideAt: exclusion.excludedAt,
+      });
+    }
     for (const match of doc.division3DriverMatches || []) {
-      const key = division3DriverKey(match.sourceName);
+      const service = serviceForStoredMatch(doc, match);
+      const key = sourceMatchKey(match.sourceName, service);
       const candidate = candidates.find((item) => String(item.providerId) === String(match.providerId) && item.operatorId === match.operatorId);
       if (!candidate) continue;
       const list = resolved.get(key) || [];
@@ -324,57 +349,145 @@ export function matchDivision3Drivers(imports, providers, cycle = null) {
       resolved.set(key, list);
     }
   }
+  const reserved = new Map([...resolved.entries()].flatMap(([sourceKey, matches]) => matches.map((match) => [
+    operatorKey(match.providerId, match.operatorId), sourceKey,
+  ])));
   return [...names.entries()].map(([key, source]) => {
     const matches = resolved.get(key) || [];
-    const smart = matches.length ? { suggestion: null, candidates: [] } : suggestOperator(key, candidates);
+    const exclusion = excluded.get(key) || null;
+    const serviceCandidates = candidatesForServices(candidates, [source.service]);
+    const available = serviceCandidates.filter((candidate) => {
+      const owner = reserved.get(operatorKey(candidate.providerId, candidate.operatorId));
+      return !owner || owner === key;
+    });
+    const smart = matches.length || exclusion ? { suggestion: null, candidates: [] } : suggestOperator(division3DriverKey(source.sourceName), available);
+    const automatic = matches.length || exclusion ? null : smart.suggestion;
+    if (automatic) reserved.set(operatorKey(automatic.providerId, automatic.operatorId), key);
+    const effectiveMatches = exclusion ? [] : automatic ? [{
+      ...automatic,
+      matchMethod: automatic.confidence >= 0.99 ? 'AUTO_EXACT_NAME' : 'AUTO_SMART_NAME',
+    }] : matches;
     return {
       sourceKey: key,
       sourceName: source.sourceName,
-      services: [...source.services].sort(),
+      service: source.service,
+      services: [source.service],
       dates: [...source.dates].sort(),
       files: [...source.files],
-      status: matches.length === 1 ? 'MATCHED' : matches.length > 1 ? 'AMBIGUOUS' : smart.suggestion ? 'SUGGESTED' : 'UNMATCHED',
-      ...(matches.length === 1 ? matches[0] : {}),
-      ...(matches.length > 1 ? { candidates: matches } : {}),
-      ...(smart.suggestion ? {
-        suggestedProviderId: smart.suggestion.providerId,
-        suggestedProviderName: smart.suggestion.providerName,
-        suggestedOperatorId: smart.suggestion.operatorId,
-        suggestedOperatorName: smart.suggestion.operatorName,
-        suggestionConfidence: smart.suggestion.confidence,
-        suggestionReason: smart.suggestion.reason,
-      } : {}),
+      status: exclusion ? 'SET_ASIDE' : effectiveMatches.length === 1 ? 'MATCHED' : effectiveMatches.length > 1 ? 'AMBIGUOUS' : 'UNMATCHED',
+      ...(exclusion || {}),
+      ...(effectiveMatches.length === 1 ? effectiveMatches[0] : {}),
+      ...(effectiveMatches.length > 1 ? { candidates: effectiveMatches } : {}),
     };
   }).sort((a, b) => a.sourceName.localeCompare(b.sourceName));
 }
 
-export async function assignDivision3Driver({ cycleId, sourceName, providerId, operatorId }, user) {
+function resolveSourceService(imports, sourceName, requestedService) {
+  const sources = sourceNames(imports);
+  const sourceKey = division3DriverKey(sourceName);
+  const sourceServices = [...sources.values()].filter((item) => division3DriverKey(item.sourceName) === sourceKey).map((item) => item.service);
+  const service = String(requestedService || '').trim().toUpperCase() || (sourceServices.length === 1 ? sourceServices[0] : null);
+  if (!['ADA', 'GOLINK'].includes(service)) throw badRequest('Choose whether this driver is for ADA or GoLink.');
+  const key = sourceMatchKey(sourceName, service);
+  if (!sources.has(key)) throw badRequest(`This driver is not in the active Division 3 ${service === 'GOLINK' ? 'GoLink' : 'ADA'} uploads.`);
+  return { key, service };
+}
+
+function docHasSource(doc, key) {
+  return [...(doc.division3DutyRows || []), ...(doc.division3FareRows || [])].some((row) => {
+    const rowService = row.service || (doc.kind === 'DIV3_ADA_FARE' ? 'ADA' : serviceForKind(doc.kind));
+    return sourceMatchKey(row.driverName, rowService) === key;
+  });
+}
+
+export async function assignDivision3Driver({ cycleId, sourceName, service: requestedService, providerId, operatorId }, user) {
   const cycle = await VdpCycle.findById(cycleId);
   if (!cycle) throw notFound('VDP cycle');
   const imports = await activeDivision3ImportsFor(cycle._id);
-  const key = division3DriverKey(sourceName);
-  if (!sourceNames(imports).has(key)) throw badRequest('This driver is not in the active Division 3 uploads.');
+  const { key, service } = resolveSourceService(imports, sourceName, requestedService);
   const divisions = await processingDivisionsFor(await requireDivision3(cycle.divisionId));
-  const provider = await Provider.findOne({ _id: providerId, divisionId: { $in: divisions.map((item) => item._id) } });
-  if (!provider) throw badRequest('Choose a provider in the selected Division 3 ADA / GoLink group.');
+  const targetNumber = service === 'GOLINK' ? '3GL' : '3';
+  const targetDivisionIds = divisions.filter((item) => divisionNumberKey(item.divisionNumber) === targetNumber).map((item) => item._id);
+  const provider = await Provider.findOne({ _id: providerId, divisionId: { $in: targetDivisionIds } });
+  if (!provider) throw badRequest(`Choose a provider in the ${service === 'GOLINK' ? 'DIV 3GL GoLink' : 'DIV 3 ADA'} division.`);
   const operator = activeOperators(provider, cycle).find((item) => item.id === String(operatorId));
   if (!operator) throw badRequest('Choose a valid active operator.');
-  const used = imports.flatMap((doc) => doc.division3DriverMatches || []).find((match) => (
-    operatorKey(match.providerId, match.operatorId) === operatorKey(provider._id, operator.id) && division3DriverKey(match.sourceName) !== key
+  const used = imports.flatMap((doc) => (doc.division3DriverMatches || []).map((match) => ({ doc, match }))).find(({ doc, match }) => (
+    operatorKey(match.providerId, match.operatorId) === operatorKey(provider._id, operator.id)
+      && sourceMatchKey(match.sourceName, serviceForStoredMatch(doc, match)) !== key
   ));
-  if (used) throw badRequest(`${operator.name} is already matched to another Division 3 source driver.`);
+  if (used) {
+    const usedService = serviceForStoredMatch(used.doc, used.match);
+    throw badRequest(`${operator.name} is already matched to ${used.match.sourceName} (${usedService}). Clear that match or set that source aside first.`);
+  }
   for (const doc of imports) {
-    const hasName = [...(doc.division3DutyRows || []), ...(doc.division3FareRows || [])].some((row) => division3DriverKey(row.driverName) === key);
-    if (!hasName) continue;
-    doc.division3DriverMatches = (doc.division3DriverMatches || []).filter((match) => division3DriverKey(match.sourceName) !== key);
-    doc.division3DriverMatches.push({ sourceName, providerId: provider._id, operatorId: operator.id, method: 'MANUAL', confidence: null, matchedBy: actor(user), matchedAt: new Date() });
+    const exclusions = (doc.division3DriverExclusions || []).filter((exclusion) => sourceMatchKey(exclusion.sourceName, exclusion.service) !== key);
+    const exclusionRemoved = exclusions.length !== (doc.division3DriverExclusions || []).length;
+    doc.division3DriverExclusions = exclusions;
+    const hasName = docHasSource(doc, key);
+    if (!hasName) {
+      if (exclusionRemoved) await doc.save();
+      continue;
+    }
+    doc.division3DriverMatches = (doc.division3DriverMatches || []).filter((match) => sourceMatchKey(match.sourceName, serviceForStoredMatch(doc, match)) !== key);
+    doc.division3DriverMatches.push({ sourceName, service, providerId: provider._id, operatorId: operator.id, method: 'MANUAL', confidence: null, matchedBy: actor(user), matchedAt: new Date() });
     await doc.save();
   }
   await markCycleStale(cycle._id);
   return provider;
 }
 
-export function division3Readiness({ cycle, imports, providers = [] }) {
+export async function clearDivision3DriverMatch({ cycleId, sourceName, service: requestedService }) {
+  const cycle = await VdpCycle.findById(cycleId);
+  if (!cycle) throw notFound('VDP cycle');
+  const imports = await activeDivision3ImportsFor(cycle._id);
+  const { key, service } = resolveSourceService(imports, sourceName, requestedService);
+  let cleared = false;
+  for (const doc of imports) {
+    const matches = (doc.division3DriverMatches || []).filter((match) => sourceMatchKey(match.sourceName, serviceForStoredMatch(doc, match)) !== key);
+    if (matches.length === (doc.division3DriverMatches || []).length) continue;
+    doc.division3DriverMatches = matches;
+    await doc.save();
+    cleared = true;
+  }
+  if (cleared) await markCycleStale(cycle._id);
+  return { sourceName, service, cleared };
+}
+
+export async function setAsideDivision3Driver({ cycleId, sourceName, service: requestedService }, user) {
+  const cycle = await VdpCycle.findById(cycleId);
+  if (!cycle) throw notFound('VDP cycle');
+  const imports = await activeDivision3ImportsFor(cycle._id);
+  const { key, service } = resolveSourceService(imports, sourceName, requestedService);
+  for (const doc of imports) {
+    if (!docHasSource(doc, key)) continue;
+    doc.division3DriverMatches = (doc.division3DriverMatches || []).filter((match) => sourceMatchKey(match.sourceName, serviceForStoredMatch(doc, match)) !== key);
+    doc.division3DriverExclusions = (doc.division3DriverExclusions || []).filter((exclusion) => sourceMatchKey(exclusion.sourceName, exclusion.service) !== key);
+    doc.division3DriverExclusions.push({ sourceName, service, excludedBy: actor(user), excludedAt: new Date() });
+    await doc.save();
+  }
+  await markCycleStale(cycle._id);
+  return { sourceName, service, status: 'SET_ASIDE' };
+}
+
+export async function restoreDivision3Driver({ cycleId, sourceName, service: requestedService }) {
+  const cycle = await VdpCycle.findById(cycleId);
+  if (!cycle) throw notFound('VDP cycle');
+  const imports = await activeDivision3ImportsFor(cycle._id);
+  const { key, service } = resolveSourceService(imports, sourceName, requestedService);
+  let restored = false;
+  for (const doc of imports) {
+    const exclusions = (doc.division3DriverExclusions || []).filter((exclusion) => sourceMatchKey(exclusion.sourceName, exclusion.service) !== key);
+    if (exclusions.length === (doc.division3DriverExclusions || []).length) continue;
+    doc.division3DriverExclusions = exclusions;
+    await doc.save();
+    restored = true;
+  }
+  if (restored) await markCycleStale(cycle._id);
+  return { sourceName, service, restored };
+}
+
+export function division3Readiness({ cycle, imports, providers = [], processingDivisions = [] }) {
   const expectedWeeks = [isoDate(cycle.week1Start), isoDate(cycle.week2Start)];
   const byKind = Object.fromEntries(DIV3_IMPORT_KINDS.map((kind) => {
     const docs = imports.filter((doc) => doc.kind === kind);
@@ -393,7 +506,7 @@ export function division3Readiness({ cycle, imports, providers = [] }) {
       sourceRowCount: docs.reduce((total, doc) => total + Number(doc.stats?.sourceRowCount || 0), 0),
     }];
   }));
-  const matches = matchDivision3Drivers(imports, providers, cycle);
+  const matches = matchDivision3Drivers(imports, providers, cycle, processingDivisions);
   const fareRows = imports.filter((doc) => doc.kind === 'DIV3_ADA_FARE').flatMap((doc) => doc.division3FareRows || []);
   const returnedRows = imports.filter((doc) => doc.kind === 'DIV3_RETURNED_FARE').flatMap((doc) => doc.division3ReturnedFareRows || []);
   const fareReconciliation = reconcileDivision3Fares(fareRows, returnedRows);
@@ -402,7 +515,7 @@ export function division3Readiness({ cycle, imports, providers = [] }) {
     sources: byKind,
     requiredReady: ['DIV3_ADA', 'DIV3_GOLINK', 'DIV3_ADA_FARE'].every((kind) => byKind[kind].ready),
     driverMatches: matches,
-    unresolvedCount: matches.filter((match) => match.status !== 'MATCHED').length,
+    unresolvedCount: matches.filter((match) => ['UNMATCHED', 'AMBIGUOUS'].includes(match.status)).length,
     fareReconciliation: {
       ...fareReconciliation.totals,
       rowCount: fareReconciliation.rows.length,
@@ -416,12 +529,12 @@ export function division3Readiness({ cycle, imports, providers = [] }) {
 
 // Normalized calculation inputs. Matching remains an explicit source-to-roster
 // join so uploaded names never become provider master data.
-export function division3RowsForCalculation({ imports, providers, cycle }) {
-  const matches = matchDivision3Drivers(imports, providers, cycle).filter((match) => match.status === 'MATCHED');
+export function division3RowsForCalculation({ imports, providers, cycle, processingDivisions = [] }) {
+  const matches = matchDivision3Drivers(imports, providers, cycle, processingDivisions).filter((match) => match.status === 'MATCHED');
   const byName = new Map(matches.map((match) => [match.sourceKey, match]));
   const dutyRows = imports.filter((doc) => ['DIV3_ADA', 'DIV3_GOLINK'].includes(doc.kind)).flatMap((doc) => (
     (doc.division3DutyRows || []).map((row) => {
-      const match = byName.get(division3DriverKey(row.driverName));
+      const match = byName.get(sourceMatchKey(row.driverName, row.service || serviceForKind(doc.kind)));
       return match ? { ...(row.toObject?.() || row), providerId: match.providerId, operatorId: match.operatorId, sourceImportId: doc._id, sourceFileName: doc.originalFileName } : null;
     }).filter(Boolean)
   ));
@@ -429,7 +542,7 @@ export function division3RowsForCalculation({ imports, providers, cycle }) {
   const returnedRows = imports.filter((doc) => doc.kind === 'DIV3_RETURNED_FARE').flatMap((doc) => doc.division3ReturnedFareRows || []);
   const reconciled = reconcileDivision3Fares(rawFares, returnedRows);
   const fareRows = reconciled.rows.map((row) => {
-    const match = byName.get(division3DriverKey(row.driverName));
+    const match = byName.get(sourceMatchKey(row.driverName, 'ADA'));
     return match ? { ...row, providerId: match.providerId, operatorId: match.operatorId } : null;
   }).filter(Boolean);
   return { dutyRows, fareRows, reconciliation: reconciled };

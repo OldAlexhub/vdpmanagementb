@@ -11,6 +11,7 @@ import * as performance from '../controllers/performanceController.js';
 import * as uberPerformance from '../controllers/uberPerformanceController.js';
 import * as uberTolls from '../controllers/uberTollController.js';
 import * as division3Imports from '../controllers/division3ImportController.js';
+import * as divisionSources from '../controllers/divisionSourceController.js';
 import * as vdps from '../controllers/vdpController.js';
 import * as portal from '../controllers/portalController.js';
 import * as imports from '../controllers/importController.js';
@@ -126,6 +127,14 @@ api.post('/division3-imports', upload.array('files', 20), division3Imports.uploa
 api.delete('/division3-imports/invalid', division3Imports.clearInvalid);
 api.delete('/division3-imports/:id', division3Imports.remove);
 api.post('/division3-driver-matches', division3Imports.assignDriver);
+api.post('/division3-driver-matches/clear', division3Imports.clearDriverMatch);
+api.post('/division3-driver-exclusions', division3Imports.setAsideDriver);
+api.post('/division3-driver-exclusions/restore', division3Imports.restoreDriver);
+
+api.get('/division-source-contracts/:divisionId', divisionSources.contract);
+api.get('/division-source-imports', divisionSources.list);
+api.post('/division-source-imports', upload.array('files', 100), divisionSources.upload);
+api.delete('/division-source-imports/:id', divisionSources.remove);
 
 api.get('/uber-toll-imports', uberTolls.list);
 api.post('/uber-toll-imports', upload.array('files', 20), uberTolls.upload);

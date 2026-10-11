@@ -1,5 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import mongoose from 'mongoose';
 import XLSX from 'xlsx';
 import {
   parseDivision3DutyFile,
@@ -39,6 +40,16 @@ describe('Division 3 source parsers', () => {
     assert.equal(parsed.rows[0].attainmentHours, parsed.rows[0].paidHours);
     assert.equal(parsed.rows[0].lateStart, true);
     assert.equal(parsed.rows[0].earlyEnd, true);
+  });
+
+  test('normalizes repeating minute conversions for MongoDB Decimal128', async () => {
+    const parsed = await parseDivision3DutyFile(workbook([duty({
+      'Pause Duration while In Progress (min)': 18.1,
+    })]), 'golink.xlsx', 'GOLINK');
+    assert.equal(parsed.rows[0].pauseHours, '0.301666666667');
+    for (const field of ['paidHours', 'attainmentHours', 'revenueHours', 'pauseHours', 'breakHours']) {
+      assert.doesNotThrow(() => mongoose.Types.Decimal128.fromString(parsed.rows[0][field]), field);
+    }
   });
 
   test('groups completed Big Star ADA riders at the template fare rate', async () => {

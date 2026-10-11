@@ -258,6 +258,9 @@ export function validateVersion(v) {
     errors.push('Choose the report column to use for the incentive attainment metric.');
   }
   if (!['OPERATOR', 'PROVIDER'].includes(v.attainmentScope || 'OPERATOR')) errors.push('Choose a valid incentive attainment scope.');
+  if (!isBlank(v.attainmentPercentageCap) && D(v.attainmentPercentageCap).lte(0)) {
+    errors.push('Attainment percentage cap must be greater than zero when entered.');
+  }
   return errors;
 }
 
@@ -377,6 +380,7 @@ export function resolveSettings(provider, plan, version) {
     attainmentHourMetric: { value: version.attainmentHourMetric || 'SAME_AS_PAID', source: 'PLAN' },
     attainmentHourColumn: { value: version.attainmentHourColumn || null, source: 'PLAN' },
     attainmentScope: { value: version.attainmentScope || 'OPERATOR', source: 'PLAN' },
+    attainmentPercentageCap: { value: str(version.attainmentPercentageCap), source: 'PLAN' },
     uberConfig: calculationTypeOf(version) === 'UBER'
       ? {
           value: {
@@ -430,6 +434,7 @@ export const engineSettings = (s) => ({
   standbyRate: s.standbyRate?.value ?? null,
   attainmentHourMetric: s.attainmentHourMetric?.value || 'SAME_AS_PAID',
   attainmentScope: s.attainmentScope?.value || 'OPERATOR',
+  attainmentPercentageCap: s.attainmentPercentageCap?.value ?? null,
   fuelReimbursementEnabled: Boolean(s.fuelReimbursementEnabled?.value),
   fuelReimbursementRate: s.fuelReimbursementRate?.value ?? null,
   fuelMethod: s.fuelMethod?.value || (s.fuelReimbursementEnabled?.value ? 'PER_TRIP' : 'NONE'),

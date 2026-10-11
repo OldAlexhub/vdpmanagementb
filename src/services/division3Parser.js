@@ -153,6 +153,10 @@ const DUTY_COLUMNS = [
 const minTime = (left, right) => (!left || (right && right < left) ? right : left);
 const maxTime = (left, right) => (!left || (right && right > left) ? right : left);
 const decimal = (value) => new Decimal(value || 0);
+// Division of source minutes by 60 can create repeating decimals. MongoDB
+// Decimal128 accepts at most 34 significant digits, so calculated hour values
+// are normalized at a precision far beyond what payroll rounding consumes.
+const calculatedHours = (value) => decimal(value).toDecimalPlaces(12, Decimal.ROUND_HALF_UP).toString();
 
 export async function parseDivision3DutyFile(buffer, fileName, service) {
   if (!['ADA', 'GOLINK'].includes(service)) throw new Division3FileValidationError('Choose ADA or GoLink duty data.', { code: 'INVALID_KIND' });
@@ -217,11 +221,11 @@ export async function parseDivision3DutyFile(buffer, fileName, service) {
   }
   const rows = [...grouped.values()].map((row) => ({
     ...row,
-    paidHours: row.paidHours.toString(),
-    attainmentHours: row.attainmentHours.toString(),
-    revenueHours: row.revenueHours.toString(),
-    pauseHours: row.pauseHours.toString(),
-    breakHours: row.breakHours.toString(),
+    paidHours: calculatedHours(row.paidHours),
+    attainmentHours: calculatedHours(row.attainmentHours),
+    revenueHours: calculatedHours(row.revenueHours),
+    pauseHours: calculatedHours(row.pauseHours),
+    breakHours: calculatedHours(row.breakHours),
     lateStart: Boolean(row.scheduledStart && row.firstSeen && row.firstSeen > row.scheduledStart),
     earlyEnd: Boolean(row.scheduledEnd && row.lastSeen && row.lastSeen < row.scheduledEnd),
   })).sort((a, b) => a.date.localeCompare(b.date) || a.driverName.localeCompare(b.driverName));

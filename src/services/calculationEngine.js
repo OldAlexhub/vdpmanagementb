@@ -29,8 +29,10 @@ const contractedForWeek = (settings, week) => D(isBlank(week.contractedHours) ? 
 const attainmentForWeek = (week) => D(isBlank(week.attainmentHours) ? week.actualHours : week.attainmentHours);
 
 function attainmentPercentage(settings, week, contractedHours) {
-  if (!isBlank(week.performancePercentageOverride)) return D(week.performancePercentageOverride);
-  return attainmentForWeek(week).div(contractedHours).times(100);
+  const percentage = !isBlank(week.performancePercentageOverride)
+    ? D(week.performancePercentageOverride)
+    : attainmentForWeek(week).div(contractedHours).times(100);
+  return isBlank(settings.attainmentPercentageCap) ? percentage : min(percentage, D(settings.attainmentPercentageCap));
 }
 
 function bonusQualification(settings, week, actualHours, attainmentHours, contractedHours) {
@@ -87,6 +89,11 @@ function calculateHourlyWeek(settings, week) {
   const bonusHours = bonusApplies ? max(actualHours.minus(contractedHours), 0) : D(0);
   const bonusRate = settings.bonusEnabled ? D(settings.bonusRate) : D(0);
   const coreEarnings = cents(corePaidHours.times(rate));
+  const baseRate = D(settings.basePay);
+  const baseEarnings = cents(corePaidHours.times(baseRate));
+  const contractHoursIncentiveRate = settings.tuiEligible ? max(rate.minus(baseRate), 0) : D(0);
+  // Keep displayed components reconciled to the all-in tier calculation at cents.
+  const contractHoursIncentive = coreEarnings.minus(baseEarnings);
   const bonusEarnings = cents(bonusHours.times(bonusRate));
   const normalEarnings = coreEarnings.plus(bonusEarnings);
   const standby = applyStandby(settings, week, normalEarnings, rate);
@@ -102,7 +109,8 @@ function calculateHourlyWeek(settings, week) {
     `Core hours: ${fmtNum(corePaidHours)}` + (settings.bonusEnabled ? ` (lesser of actual and contracted)` : ''),
     `Bonus hours: ${fmtNum(bonusHours)}` +
       (settings.bonusEnabled ? ` (hours above ${fmtNum(contractedHours)})` : ' (bonus not part of this plan)'),
-    `Core: ${fmtNum(corePaidHours)} × ${fmtRate(rate)} = ${fmtMoney(coreEarnings)}`,
+    `Core revenue: ${fmtNum(corePaidHours)} × ${fmtRate(baseRate)} = ${fmtMoney(baseEarnings)}`,
+    ...(contractHoursIncentive.gt(0) ? [`Contract-hours incentive: ${fmtNum(corePaidHours)} × ${fmtRate(contractHoursIncentiveRate)} = ${fmtMoney(contractHoursIncentive)}`] : []),
     `Bonus: ${fmtNum(bonusHours)} × ${fmtRate(bonusRate)} = ${fmtMoney(bonusEarnings)}`,
     ...(standby.topUp.gt(0) ? [`Standby guarantee top-up: ${fmtMoney(standby.topUp)}`] : []),
     `Week ${week.weekNumber}: ${fmtMoney(weeklyEarnings)}`,
@@ -113,15 +121,11 @@ function calculateHourlyWeek(settings, week) {
     step('Contracted hours', 'per week', fmtHours(contractedHours)),
     step('Incentive attainment', `${fmtNum(attainmentHours)} ÷ ${fmtNum(contractedHours)}`, fmtPct(pct)),
     step('Rate', settings.tuiEligible ? `Incentive tier ${label}` : 'Base rate (no TUI)', `${fmtRate(rate)} / h`),
-    step(
-      'Core pay',
-      settings.bonusEnabled && bonusApplies
-        ? `${fmtNum(corePaidHours)} h (contract) × ${fmtRate(rate)}`
-        : `${fmtNum(corePaidHours)} h × ${fmtRate(rate)}`,
-      fmtMoney(coreEarnings),
-      'money',
-    ),
+    step('Core revenue', `${fmtNum(corePaidHours)} h × ${fmtRate(baseRate)}`, fmtMoney(baseEarnings), 'money'),
   ];
+  if (contractHoursIncentive.gt(0)) {
+    steps.push(step('Contract-hours incentive', `${fmtNum(corePaidHours)} h × ${fmtRate(contractHoursIncentiveRate)}`, fmtMoney(contractHoursIncentive), 'money'));
+  }
   if (settings.bonusEnabled) {
     steps.push(step(
       'Bonus pay',
@@ -142,6 +146,10 @@ function calculateHourlyWeek(settings, week) {
     tierIndex,
     steps,
     incentiveRate: rate,
+    baseRate,
+    baseEarnings,
+    contractHoursIncentiveRate,
+    contractHoursIncentive,
     corePaidHours,
     bonusHours,
     bonusRate,
@@ -173,12 +181,26 @@ function calculatePerTripWeek(settings, week) {
     label = tierLabel(tier);
     tierIndex = tier.index;
   }
-  const coreEarnings = cents(trips.times(rate));
   const qualification = contracted && contracted.gt(0)
     ? bonusQualification(settings, week, actualHours, attainmentHours, contracted)
     : { passed: false };
-  const bonusTrips = settings.bonusEnabled && settings.bonusBasis === 'SIXTH_DAY_TRIPS' && qualification.passed
-    ? D(week.bonusTrips || 0) : D(0);
+  const sixthDayBonus = settings.bonusEnabled && settings.bonusBasis === 'SIXTH_DAY_TRIPS';
+  const derivedBonusTrips = sixthDayBonus
+    ? (week.tripDays || [])
+      .filter((_day, index) => D(index + 1).gt(settings.contractedDays || 0))
+      .reduce((total, day) => total.plus(D(day.trips || 0)), D(0))
+    : D(0);
+  const requestedBonusTrips = sixthDayBonus
+    ? (isBlank(week.bonusTrips) ? derivedBonusTrips : D(week.bonusTrips))
+    : D(0);
+  if (sixthDayBonus && (requestedBonusTrips.lt(0) || requestedBonusTrips.gt(trips))) {
+    throw new CalculationError('Sixth-day bonus trips must be between zero and the total trips for the week.');
+  }
+  const bonusTrips = sixthDayBonus && qualification.passed ? requestedBonusTrips : D(0);
+  // Qualifying sixth-day trips replace the ordinary per-trip rate. They are
+  // not paid once at the tier rate and then paid again as a bonus.
+  const regularTrips = trips.minus(bonusTrips);
+  const coreEarnings = cents(regularTrips.times(rate));
   const bonusRate = settings.bonusEnabled ? D(settings.bonusRate || 0) : D(0);
   const bonusEarnings = cents(bonusTrips.times(bonusRate));
   const standby = applyStandby(settings, week, coreEarnings.plus(bonusEarnings), rate);
@@ -188,8 +210,8 @@ function calculatePerTripWeek(settings, week) {
     settings.tuiEligible
       ? `Incentive tier ${label} → ${fmtRate(rate)} per trip`
       : `TUI not applied → ${fmtRate(rate)} per trip`,
-    `Trips: ${fmtNum(trips)} × ${fmtRate(rate)} = ${fmtMoney(coreEarnings)}`,
-    ...(bonusTrips.gt(0) ? [`Sixth-day bonus: ${fmtNum(bonusTrips)} trips × ${fmtRate(bonusRate)} = ${fmtMoney(bonusEarnings)}`] : []),
+    `${sixthDayBonus ? 'Regular trips' : 'Trips'}: ${fmtNum(regularTrips)} × ${fmtRate(rate)} = ${fmtMoney(coreEarnings)}`,
+    ...(bonusTrips.gt(0) ? [`Sixth-day trips: ${fmtNum(bonusTrips)} × ${fmtRate(bonusRate)} = ${fmtMoney(bonusEarnings)}`] : []),
     ...(standby.topUp.gt(0) ? [`Standby guarantee top-up: ${fmtMoney(standby.topUp)}`] : []),
     `Week ${week.weekNumber}: ${fmtMoney(standby.weeklyEarnings)}`,
   ];
@@ -197,10 +219,10 @@ function calculatePerTripWeek(settings, week) {
     step('Trips provided', 'Performance Report', `${fmtNum(trips)} trips`),
     step('Incentive attainment', pct ? `${fmtPct(pct)} of ${fmtNum(contracted)} h` : 'Performance Report', fmtHours(attainmentHours)),
     step('Rate', settings.tuiEligible ? `Tier ${label}` : 'Per-trip rate (no TUI)', `${fmtRate(rate)} / trip`),
-    step('Trip pay', `${fmtNum(trips)} trips × ${fmtRate(rate)}`, fmtMoney(coreEarnings), 'money'),
+    step(sixthDayBonus ? 'Regular trip pay' : 'Trip pay', `${fmtNum(regularTrips)} trips × ${fmtRate(rate)}`, fmtMoney(coreEarnings), 'money'),
   ];
-  if (settings.bonusEnabled && settings.bonusBasis === 'SIXTH_DAY_TRIPS') {
-    steps.push(step('Sixth-day bonus', qualification.passed ? `${fmtNum(bonusTrips)} qualifying trips × ${fmtRate(bonusRate)}` : 'Bonus qualification not met', fmtMoney(bonusEarnings), 'money'));
+  if (sixthDayBonus) {
+    steps.push(step('Sixth-day trip pay', qualification.passed ? `${fmtNum(bonusTrips)} qualifying trips × ${fmtRate(bonusRate)}` : 'Bonus qualification not met', fmtMoney(bonusEarnings), 'money'));
   }
   if (standby.topUp.gt(0)) {
     steps.push(step('Standby guarantee', `${fmtNum(standby.guaranteedHours)} h × ${fmtRate(standby.rate)}`, fmtMoney(standby.topUp), 'plus'));
@@ -213,6 +235,7 @@ function calculatePerTripWeek(settings, week) {
     tierIndex,
     steps,
     incentiveRate: rate,
+    regularTrips,
     corePaidHours: actualHours,
     bonusHours: bonusTrips,
     bonusRate,
@@ -225,7 +248,23 @@ function calculatePerTripWeek(settings, week) {
   };
 }
 
-const sameText = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+const normalizedText = (value) => String(value || '').normalize('NFKD').replace(/[^a-z0-9]/gi, '').toUpperCase();
+
+const serviceKey = (value) => {
+  const key = normalizedText(value);
+  if (['CCCTA', 'CCCTALINK', 'COUNTYCONNECTION', 'COUNTYCONNECTIONLINK'].includes(key)) return 'CCCTA';
+  if (['LAVTA', 'LAVTAWHEELS', 'WHEELS'].includes(key)) return 'LAVTA';
+  if (['ONESEAT', 'OS'].includes(key)) return 'ONESEAT';
+  return key;
+};
+
+const vehicleKey = (value) => {
+  const key = normalizedText(value);
+  if (['WC', 'WHEELCHAIR', 'WAV', 'WHEELCHAIRACCESSIBLEVEHICLE'].includes(key)) return 'WAV';
+  if (['SD', 'SEDAN'].includes(key)) return 'SEDAN';
+  if (['BIGV', 'BIGVAN'].includes(key)) return 'BIGVAN';
+  return key;
+};
 
 function lineDayType(line) {
   if (line.dayType) return line.dayType;
@@ -235,8 +274,8 @@ function lineDayType(line) {
 }
 
 function componentMatches(component, line) {
-  if (component.serviceType && !sameText(component.serviceType, line.serviceType)) return false;
-  if (component.vehicleType && !sameText(component.vehicleType, line.vehicleType)) return false;
+  if (component.serviceType && serviceKey(component.serviceType) !== serviceKey(line.serviceType)) return false;
+  if (component.vehicleType && vehicleKey(component.vehicleType) !== vehicleKey(line.vehicleType)) return false;
   if (component.dayType && component.dayType !== 'ANY' && component.dayType !== lineDayType(line)) return false;
   if (!isBlank(component.minimumDistance) || !isBlank(component.maximumDistance)) {
     const trips = D(line.trips || 0);
@@ -547,7 +586,9 @@ function withProviderAttainment(settings, units) {
         week,
       )));
       if (contracted.lte(0)) throw new CalculationError('Provider-wide attainment needs contracted hours greater than zero.');
-      const percentage = attainment.div(contracted).times(100).toString();
+      const rawPercentage = attainment.div(contracted).times(100);
+      const cap = list.map(({ effective }) => effective.attainmentPercentageCap).find((value) => !isBlank(value));
+      const percentage = (isBlank(cap) ? rawPercentage : min(rawPercentage, D(cap))).toString();
       rows.forEach(({ week }) => { week.performancePercentageOverride = percentage; });
     }
   }
@@ -572,6 +613,7 @@ function combineWeeks(ops) {
       start: first.start,
       end: first.end,
       trips: total('trips'),
+      regularTrips: total('regularTrips'),
       actualHours: total('actualHours'),
       attainmentHours: total('attainmentHours'),
       contractedHours: contracted,
@@ -579,6 +621,10 @@ function combineWeeks(ops) {
       tierLabel: 'Per operator',
       tierIndex: null,
       incentiveRate: null,
+      baseRate: null,
+      baseEarnings: total('baseEarnings'),
+      contractHoursIncentiveRate: null,
+      contractHoursIncentive: total('contractHoursIncentive'),
       corePaidHours: total('corePaidHours'),
       bonusHours: total('bonusHours'),
       bonusRate: null,
@@ -734,12 +780,17 @@ const serializeWeek = (w) => ({
   start: w.start,
   end: w.end,
   trips: str(w.trips),
+  regularTrips: str(w.regularTrips),
   actualHours: str(w.actualHours),
   attainmentHours: str(w.attainmentHours),
   contractedHours: str(w.contractedHours),
   performancePercentage: w.performancePercentage === null ? null : w.performancePercentage.toDecimalPlaces(6).toString(),
   tierLabel: w.tierLabel,
   incentiveRate: str(w.incentiveRate),
+  baseRate: str(w.baseRate),
+  baseEarnings: money(w.baseEarnings),
+  contractHoursIncentiveRate: str(w.contractHoursIncentiveRate),
+  contractHoursIncentive: money(w.contractHoursIncentive),
   corePaidHours: str(w.corePaidHours),
   bonusHours: str(w.bonusHours),
   bonusRate: str(w.bonusRate),

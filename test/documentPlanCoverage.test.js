@@ -22,9 +22,10 @@ const standardSettings = (id, overrides = {}) => {
 const week = (overrides = {}) => ({ weekNumber: 1, trips: '0', actualHours: '0', ...overrides });
 
 describe('audited VDP document templates', () => {
-  test('has one editable starter for every plan PDF and every preset passes plan validation', async () => {
-    assert.equal(templates.length, 17);
-    assert.equal(new Set(templates.map((item) => item.sourceDocument)).size, 17);
+  test('has editable starters for every plan document and partner-rate variant', async () => {
+    assert.equal(templates.length, 30);
+    assert.equal(new Set(templates.map((item) => item.id)).size, templates.length);
+    assert.equal(templates.every((item) => item.sourceDocument), true);
     for (const item of templates) {
       assert.deepEqual(validateVersion({ ...item.version, effectiveFrom: new Date('2026-01-01') }), [], item.id);
       const parsed = versionInput({ ...item.version, effectiveFrom: '2026-01-01' });
@@ -47,7 +48,22 @@ describe('audited VDP document templates', () => {
     assert.equal(result.weeks[0].performancePercentage, '98');
     assert.equal(result.weeks[0].incentiveRate, '24.75');
     assert.equal(result.weeks[0].bonusHours, '10');
-    assert.equal(result.weeks[0].weeklyEarnings, '2734.90');
+    assert.equal(result.weeks[0].weeklyEarnings, '2487.40');
+    assert.equal(result.weeks[0].regularTrips, '90');
+    assert.equal(result.weeks[0].coreEarnings, '2227.50');
+    assert.equal(result.weeks[0].bonusEarnings, '259.90');
+  });
+
+  test('DIV 10 day derives sixth-day trips from dated performance rows', () => {
+    const result = serializeResult(calculateVdp({
+      settings: standardSettings('div10-day'),
+      operators: [{ name: 'Day operator', contractedHours: '50', weeks: [week({
+        trips: '60', actualHours: '50', attainmentHours: '50', workedDays: '6',
+        tripDays: [1, 2, 3, 4, 5, 6].map((day) => ({ date: `2026-09-${day + 6}`, trips: '10' })),
+      })] }],
+    }));
+    assert.equal(result.weeks[0].bonusHours, '10');
+    assert.equal(result.weeks[0].weeklyEarnings, '1497.40');
   });
 
   test('DIV 10 night pays actual hours but selects its tier from incentive-window hours', () => {
@@ -64,7 +80,7 @@ describe('audited VDP document templates', () => {
   test('DIV 11 withholds above-contract bonus until full incentive-hour qualification', () => {
     const result = serializeResult(calculateVdp({
       settings: standardSettings('div11-standard'),
-      weeks: [week({ actualHours: '55', attainmentHours: '48' })],
+      weeks: [week({ contractedHours: '49.5', actualHours: '55', attainmentHours: '48' })],
     }));
     assert.equal(result.weeks[0].bonusQualified, false);
     assert.equal(result.weeks[0].bonusHours, '0');
@@ -87,17 +103,43 @@ describe('audited VDP document templates', () => {
       { name: 'B', contractedHours: '100', weeks: [week({ actualHours: '100', attainmentHours: '100' })] },
     ] }));
     assert.deepEqual(result.operators.map((operator) => operator.weeks[0].performancePercentage), ['95', '95']);
-    assert.deepEqual(result.operators.map((operator) => operator.weeks[0].incentiveRate), ['28.9', '28.9']);
-    assert.equal(result.gross, '5491.00');
+    assert.deepEqual(result.operators.map((operator) => operator.weeks[0].incentiveRate), ['27.2', '27.2']);
+    assert.equal(result.gross, '5168.00');
+  });
+
+  test('DIV 3 $32 schedule reconciles the Azalea accounting workbook example', () => {
+    const result = serializeResult(calculateVdp({
+      settings: standardSettings('div3-dart'),
+      operators: [{ name: 'Iralyn Houston', contractedHours: '41.5', weeks: [
+        week({ weekNumber: 1, actualHours: '40.87', attainmentHours: '44.98' }),
+        week({ weekNumber: 2, actualHours: '38.32', attainmentHours: '43.93' }),
+      ] }],
+    }));
+
+    assert.deepEqual(result.weeks.map((entry) => entry.performancePercentage), ['100', '100']);
+    assert.deepEqual(result.weeks.map((entry) => entry.incentiveRate), ['32', '32']);
+    assert.deepEqual(result.weeks.map((entry) => entry.baseEarnings), ['1046.27', '980.99']);
+    assert.deepEqual(result.weeks.map((entry) => entry.contractHoursIncentive), ['261.57', '245.25']);
+    assert.deepEqual(result.weeks.map((entry) => entry.weeklyEarnings), ['1307.84', '1226.24']);
+    assert.equal(result.gross, '2534.08');
+  });
+
+  test('DIV 3 $34 schedule remains available for the workbook partners assigned that rate', () => {
+    const result = serializeResult(calculateVdp({
+      settings: standardSettings('div3-dart-34'),
+      weeks: [week({ actualHours: '10', contractedHours: '10', attainmentHours: '10' })],
+    }));
+    assert.equal(result.weeks[0].incentiveRate, '34');
+    assert.equal(result.gross, '340.00');
   });
 
   test('DIV 5 rate card adds vehicle/service pricing and weekend differential', () => {
     const result = serializeResult(calculateVdp({
       settings: standardSettings('div5-service-rate-card', { fuelMethod: 'NONE' }),
       weeks: [week({ actualHours: '15', trips: '2', serviceMiles: '12', lineItems: [
-        { hours: '10', serviceType: 'CCCTA Link', vehicleType: 'Wheelchair', dayType: 'WEEKDAY' },
-        { hours: '5', serviceType: 'CCCTA Link', vehicleType: 'Wheelchair', dayType: 'WEEKEND' },
-        { trips: '2', miles: '12', serviceType: 'One Seat', vehicleType: 'Wheelchair', dayType: 'WEEKDAY' },
+        { hours: '10', serviceType: 'CCCTA', vehicleType: 'WAV', dayType: 'WEEKDAY' },
+        { hours: '5', serviceType: 'County Connection', vehicleType: 'WAV', dayType: 'WEEKEND' },
+        { trips: '2', miles: '12', serviceType: 'OS', vehicleType: 'WC', dayType: 'WEEKDAY' },
       ] })],
     }));
     assert.equal(result.gross, '534.50');
@@ -110,13 +152,40 @@ describe('audited VDP document templates', () => {
   test('DIV 13 selects an attainment card and applies distance bands plus excess miles', () => {
     const result = serializeResult(calculateVdp({
       settings: standardSettings('div13-distance'),
-      weeks: [week({ actualHours: '57.5', attainmentHours: '56.35', trips: '3', serviceMiles: '20', lineItems: [
+      weeks: [week({ contractedHours: '57.5', actualHours: '57.5', attainmentHours: '56.35', trips: '3', serviceMiles: '20', lineItems: [
         { trips: '1', miles: '4', distance: '4' }, { trips: '1', miles: '6', distance: '6' }, { trips: '1', miles: '10', distance: '10' },
       ] })],
     }));
     assert.equal(result.weeks[0].performancePercentage, '98');
     assert.equal(result.weeks[0].tierLabel, '98%+ incentive rate');
     assert.equal(result.gross, '71.68');
+  });
+
+  test('partner-rate presets retain the documented exceptional schedules', () => {
+    const div6 = serializeResult(calculateVdp({
+      settings: standardSettings('div6-door-to-door-125-fuel'),
+      weeks: [week({ trips: '2' })],
+    }));
+    assert.equal(div6.gross, '44.00');
+    assert.equal(div6.fuelReimbursement, '2.50');
+    assert.equal(div6.net, '46.50');
+
+    const div7 = serializeResult(calculateVdp({
+      settings: standardSettings('div7-legacy-hourly'),
+      weeks: [week({ contractedHours: '40', actualHours: '45' })],
+    }));
+    assert.equal(div7.weeks[0].coreEarnings, '1112.40');
+    assert.equal(div7.weeks[0].bonusEarnings, '190.55');
+
+    const div10 = serializeResult(calculateVdp({
+      settings: standardSettings('div10-night-operational'),
+      operators: [{ name: 'Night operator', contractedHours: '40', weeks: [week({ actualHours: '40', attainmentHours: '40' })] }],
+    }));
+    assert.equal(div10.weeks[0].incentiveRate, '28.8556');
+
+    assert.equal(template('div11-bonus-2730').version.bonusRate, '27.30');
+    assert.equal(template('div8-no-bonus').version.bonusEnabled, false);
+    assert.equal(template('div2-uber-wav-qtell').version.uberConfig.hourlyRateBands[0].hourlyRate, '31.50');
   });
 
   test('standby supports a weekly guarantee amount and force-majeure proration', () => {

@@ -146,6 +146,9 @@ const versionSchema = new Schema(
     },
     attainmentHourColumn: { type: String, default: null }, // only for OTHER
     attainmentScope: { type: String, enum: ['OPERATOR', 'PROVIDER'], default: 'OPERATOR' },
+    // Optional cap for contracts whose fulfillment percentage stops at 100%
+    // even when in-window hours exceed the weekly forecast.
+    attainmentPercentageCap: dec({ default: null }),
     uberConfig: { type: uberConfigSchema, default: undefined },
     notes: String,
     createdBy: actorSchema,

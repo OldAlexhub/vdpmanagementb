@@ -101,6 +101,8 @@ export function versionInput(body) {
       ? (String(body.attainmentHourColumn || '').trim() || (incentiveEnabled ? 'Incentive Hours' : null))
       : null,
     attainmentScope: body.attainmentScope || 'OPERATOR',
+    attainmentPercentageCap: calculationType === 'STANDARD'
+      ? decimalInput(body.attainmentPercentageCap, 'Attainment percentage cap') : null,
     uberConfig: uberSource
       ? {
           coreRatePct: decimalInput(uberSource.coreRatePct, 'Uber core rate percentage', { required: true, maxDp: 8 }),

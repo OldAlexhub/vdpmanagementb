@@ -24,6 +24,12 @@ describe('Uber smart driver matching', () => {
     assert.equal(nameSimilarity('Mary Witt', 'Witt, Mary'), 0.99);
   });
 
+  test('matches a Compass full name when the source omits middle names', () => {
+    const result = suggestOperator('Alison Greene', [candidate('Alison Grace Greene'), candidate('Alison Grant')]);
+    assert.equal(result.suggestion.operatorName, 'Alison Grace Greene');
+    assert.equal(result.suggestion.confidence, 0.98);
+  });
+
   test('does not suggest when two operators are too close to distinguish safely', () => {
     const result = suggestOperator('Alex Smith', [candidate('Alex Smith', 'North LLC', 'north'), candidate('Alex Smith', 'South LLC', 'south')]);
     assert.equal(result.suggestion, null);

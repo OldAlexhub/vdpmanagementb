@@ -144,9 +144,13 @@ const division3ReturnedFareRowSchema = new Schema(
 const division3DriverMatchSchema = new Schema(
   {
     sourceName: { type: String, required: true },
+    // Older imports did not store this because names were matched across both
+    // services. New matches are service-specific so ADA and GoLink can resolve
+    // to their own Compass division/provider pay units.
+    service: { type: String, enum: ['ADA', 'GOLINK'], default: null },
     providerId: { type: Schema.Types.ObjectId, ref: 'Provider', required: true },
     operatorId: { type: String, required: true },
-    method: { type: String, enum: ['AUTO_EXACT_NAME', 'MANUAL'], required: true },
+    method: { type: String, enum: ['AUTO_EXACT_NAME', 'AUTO_SMART_NAME', 'MANUAL'], required: true },
     confidence: dec({ default: null }),
     matchedBy: actorSchema,
     matchedAt: { type: Date, default: Date.now },
@@ -154,11 +158,25 @@ const division3DriverMatchSchema = new Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
 );
 
+const division3DriverExclusionSchema = new Schema(
+  {
+    sourceName: { type: String, required: true },
+    service: { type: String, enum: ['ADA', 'GOLINK'], required: true },
+    reason: { type: String, trim: true, default: 'Set aside for this VDP cycle' },
+    excludedBy: actorSchema,
+    excludedAt: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
 const importSchema = new Schema(
   {
     divisionId: { type: Schema.Types.ObjectId, ref: 'Division', required: true },
     cycleId: { type: Schema.Types.ObjectId, ref: 'VdpCycle', required: true },
-    kind: { type: String, enum: ['STANDARD', 'UBER', 'UBER_TOLLS', 'DIV3_ADA', 'DIV3_GOLINK', 'DIV3_ADA_FARE', 'DIV3_RETURNED_FARE'], default: 'STANDARD', index: true },
+    kind: { type: String, enum: ['STANDARD', 'UBER', 'UBER_TOLLS', 'DIV3_ADA', 'DIV3_GOLINK', 'DIV3_ADA_FARE', 'DIV3_RETURNED_FARE', 'DIVISION_SOURCE'], default: 'STANDARD', index: true },
+    // Exact source slot from the division-specific upload contract. Keeping a
+    // single kind avoids pretending these unlike reports share one schema.
+    datasetType: { type: String, trim: true, default: null, index: true },
     originalFileName: { type: String, required: true },
     fileHash: { type: String, required: true },
     fileSize: Number,
@@ -184,6 +202,7 @@ const importSchema = new Schema(
     division3FareRows: { type: [division3FareRowSchema], default: [] },
     division3ReturnedFareRows: { type: [division3ReturnedFareRowSchema], default: [] },
     division3DriverMatches: { type: [division3DriverMatchSchema], default: [] },
+    division3DriverExclusions: { type: [division3DriverExclusionSchema], default: [] },
     datesDetected: { type: [String], default: [] },
     weeksDetected: { type: [String], default: [] },
     driversDetected: { type: Number, default: 0 },
@@ -194,6 +213,7 @@ const importSchema = new Schema(
 
 importSchema.index({ cycleId: 1, status: 1 });
 importSchema.index({ cycleId: 1, kind: 1, status: 1 });
+importSchema.index({ cycleId: 1, kind: 1, datasetType: 1, status: 1 });
 importSchema.index({ cycleId: 1, fileHash: 1 });
 
 export default mongoose.model('PerformanceImport', importSchema);

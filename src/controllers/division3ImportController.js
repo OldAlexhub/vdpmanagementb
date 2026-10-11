@@ -27,3 +27,15 @@ export async function assignDriver(req, res) {
   const provider = await service.assignDivision3Driver(req.body, req.user);
   res.json({ providerId: provider._id, name: provider.name });
 }
+
+export async function clearDriverMatch(req, res) {
+  res.json(await service.clearDivision3DriverMatch(req.body));
+}
+
+export async function setAsideDriver(req, res) {
+  res.json(await service.setAsideDivision3Driver(req.body, req.user));
+}
+
+export async function restoreDriver(req, res) {
+  res.json(await service.restoreDivision3Driver(req.body, req.user));
+}

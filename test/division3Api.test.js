@@ -83,8 +83,8 @@ test('DIV 3 stages ADA, GoLink, Uber, fares, and an incomplete NSM return before
   };
 
   response = await upload('DIV3_ADA', [
-    ['ada-week-1.xlsx', book([duty('2026-09-08', 'ada-1')])],
-    ['ada-week-2.xlsx', book([duty('2026-09-15', 'ada-2')])],
+    ['ada-week-1.xlsx', book([duty('2026-09-08', 'ada-1'), duty('2026-09-08', 'ada-deferred-1', 'Deferred Driver')])],
+    ['ada-week-2.xlsx', book([duty('2026-09-15', 'ada-2'), duty('2026-09-15', 'ada-deferred-2', 'Deferred Driver')])],
   ]);
   assert.equal(response.status, 201, JSON.stringify(response.data));
   const cycleId = response.data.cycleId;
@@ -105,6 +105,7 @@ test('DIV 3 stages ADA, GoLink, Uber, fares, and an incomplete NSM return before
   response = await call('POST', '/uber-performance-imports', undefined, uberForm);
   assert.equal(response.status, 201, JSON.stringify(response.data));
   assert.equal(response.data.files.every((file) => file.validationStatus === 'VALID'), true);
+  const uberFileIds = response.data.files.map((file) => file._id);
 
   const fareRow = (date) => ({ 'Trip Status': 'completed', 'Pickup Arrived At': `${date} 10:00:00`, 'Driver Name': 'Future Driver', Provider: 'Big Star', 'Number of Riders (Adult)': 1 });
   response = await upload('DIV3_ADA_FARE', [
@@ -132,6 +133,8 @@ test('DIV 3 stages ADA, GoLink, Uber, fares, and an incomplete NSM return before
   assert.equal(response.data.division3Data.sources.DIV3_ADA.ready, true);
   assert.equal(response.data.division3Data.sources.DIV3_GOLINK.ready, true);
   assert.equal(response.data.division3Data.sources.DIV3_ADA_FARE.ready, true);
+  assert.equal(response.data.inputRequirements.uberRequired, false);
+  assert.equal(response.data.inputRequirements.uberOptional, true);
   assert.equal(response.data.uberPerformance.ready, true);
   assert.equal(response.data.division3Data.fareReconciliation.pendingCount, 2);
   assert.equal(response.data.division3Data.fareReconciliation.cashToDeduct, '7.00');
@@ -211,12 +214,31 @@ test('DIV 3 stages ADA, GoLink, Uber, fares, and an incomplete NSM return before
   assert.equal(response.status, 201, JSON.stringify(response.data));
   const uberProvider = response.data;
 
+  // Reproduce a wrong manual occupant, verify the useful conflict message,
+  // then set it aside so the correct exact-name source can auto-match.
   response = await call('POST', '/division3-driver-matches', {
-    cycleId, sourceName: 'Future Driver', providerId: dartProvider._id, operatorId: dartProvider.operators[0].id,
+    cycleId, sourceName: 'Deferred Driver', service: 'ADA', providerId: dartProvider._id, operatorId: dartProvider.operators[0].id,
   });
   assert.equal(response.status, 200, JSON.stringify(response.data));
   response = await call('POST', '/division3-driver-matches', {
-    cycleId, sourceName: 'Future GoLink', providerId: goLinkProvider._id, operatorId: goLinkProvider.operators[0].id,
+    cycleId, sourceName: 'Future Driver', service: 'ADA', providerId: dartProvider._id, operatorId: dartProvider.operators[0].id,
+  });
+  assert.equal(response.status, 400, JSON.stringify(response.data));
+  assert.match(response.data.error, /already matched to Deferred Driver \(ADA\)/);
+  response = await call('POST', '/division3-driver-exclusions', {
+    cycleId, sourceName: 'Deferred Driver', service: 'ADA',
+  });
+  assert.equal(response.status, 200, JSON.stringify(response.data));
+  response = await call('GET', `/cycles/${cycleId}`);
+  assert.equal(response.status, 200, JSON.stringify(response.data));
+  const deferred = response.data.division3Data.driverMatches.find((match) => match.sourceName === 'Deferred Driver' && match.service === 'ADA');
+  const future = response.data.division3Data.driverMatches.find((match) => match.sourceName === 'Future Driver' && match.service === 'ADA');
+  assert.equal(deferred.status, 'SET_ASIDE');
+  assert.equal(future.status, 'MATCHED');
+  assert.equal(future.matchMethod, 'AUTO_EXACT_NAME');
+  assert.equal(response.data.division3Data.unresolvedCount, 0);
+  response = await call('POST', '/division3-driver-matches', {
+    cycleId, sourceName: 'Future GoLink', service: 'GOLINK', providerId: goLinkProvider._id, operatorId: goLinkProvider.operators[0].id,
   });
   assert.equal(response.status, 200, JSON.stringify(response.data));
   response = await call('POST', '/uber-driver-matches', {
@@ -260,4 +282,21 @@ test('DIV 3 stages ADA, GoLink, Uber, fares, and an incomplete NSM return before
   assert.equal(completedDart.totalDeductions, '5.00');
   assert.equal(completedDart.net, '539.00');
   assert.equal(completedDart.status, 'READY');
+
+  for (const fileId of uberFileIds) {
+    response = await call('DELETE', `/uber-performance-imports/${fileId}`);
+    assert.equal(response.status, 200, JSON.stringify(response.data));
+  }
+  response = await call('GET', `/cycles/${cycleId}`);
+  assert.equal(response.status, 200, JSON.stringify(response.data));
+  assert.equal(response.data.uberPerformance.loaded, false);
+  assert.equal(response.data.uberPerformance.ready, true);
+  assert.equal(response.data.inputRequirements.uberRequired, false);
+
+  response = await call('POST', '/vdps/process', { cycleId });
+  assert.equal(response.status, 200, JSON.stringify(response.data));
+  const withoutUber = (await call('GET', `/vdps?cycleId=${cycleId}`)).data;
+  const incompleteUber = withoutUber.find((vdp) => vdp.provider.name === 'Future Uber Provider');
+  assert.equal(incompleteUber.status, 'NEEDS_REVIEW');
+  assert.match(incompleteUber.exceptions.map((item) => item.code).join(','), /NO_UBER_PERFORMANCE_IMPORT/);
 });

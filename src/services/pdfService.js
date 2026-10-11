@@ -1008,7 +1008,7 @@ function planSummaryRows(version) {
     ['Base pay', version.rateStructureType === 'RATE_CARD' ? 'Defined by matching rate-card components' : `${fmtRate(version.basePay)} per ${unit}`],
     ['Contracted hours', version.contractedHoursMode === 'OPERATOR_PROFILE' ? 'Operator profile' : version.contractedHours ? `${fmtNum(version.contractedHours)} per week` : 'Not configured'],
     ['TUI incentive', version.incentiveEnabled ? `Enabled - ${version.rateStructureType === 'RATE_CARD' ? version.rateCards?.length || 0 : version.incentiveTiers.length} tier(s)` : 'Disabled'],
-    ['Attainment', `${attainment}; ${version.attainmentScope === 'PROVIDER' ? 'provider-wide' : 'per operator'}`],
+    ['Attainment', `${attainment}; ${version.attainmentScope === 'PROVIDER' ? 'provider-wide' : 'per operator'}${version.attainmentPercentageCap ? `; capped at ${fmtNum(version.attainmentPercentageCap)}%` : ''}`],
     ['Bonus', version.bonusEnabled ? `${fmtRate(version.bonusRate)} per ${version.bonusBasis === 'SIXTH_DAY_TRIPS' ? 'qualifying sixth-day trip' : 'hour above contract'}` : 'Disabled'],
     ['Standby guarantee', version.standbyGuaranteeEnabled ? (version.standbyRate ? `${fmtRate(version.standbyRate)} per hour` : 'Enabled; assignment guarantee input') : 'Disabled'],
     ['Performance hours source', metric],

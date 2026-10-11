@@ -13,6 +13,7 @@ import { sum, money } from './money.js';
 import { notFound } from './errors.js';
 import { autoApproveDue } from './vdpService.js';
 import { isDivision3Division, processingDivisionsFor } from './divisionGroups.js';
+import { divisionSourceReadiness } from './divisionSourceService.js';
 
 export async function cycleSummary(cycleId) {
   await autoApproveDue();
@@ -49,14 +50,24 @@ export async function cycleSummary(cycleId) {
   // DIV 2 has a fixed Uber + toll source contract even before its Compass roster
   // has been added. This keeps the file pipeline ready while provider count is zero.
   const division2 = String(division?.divisionNumber || '').trim() === '2';
-  const uberRequired = division2 || division3 || uberProviderCount > 0;
-  const tollsRequired = division2;
+  const division10 = String(division?.divisionNumber || '').trim() === '10';
+  const division12 = String(division?.divisionNumber || '').trim() === '12';
+  // DIV 3 can be processed from ADA/GoLink alone. Uber remains available, and
+  // once any Uber data is supplied both weekly files must still be complete.
+  const uberRequired = division2 || division12 || (!division3 && uberProviderCount > 0);
+  // The finalized DIV 3 and DIV 10 workbooks consume the same Uber driver-week
+  // toll feed. It becomes required only when that optional/conditional Uber
+  // branch is actually in use.
+  const tollsRequired = division2 || division12 || (division3 && uberImports.length > 0) || (division10 && uberProviderCount > 0);
   const driverMatches = matchUberDrivers(uberImports, providers, cycle);
   const tollReadiness = uberTollReadiness({ cycle, tollImports, uberImports });
   const expectedUberWeeks = [isoDate(cycle.week1Start), isoDate(cycle.week2Start)];
   const loadedUberWeeks = [...new Set(uberImports.flatMap((doc) => doc.weeksDetected || []))].sort();
-  const missingUberWeeks = (division2 || division3) ? expectedUberWeeks.filter((week) => !loadedUberWeeks.includes(week)) : [];
-  const division3Data = division3 ? division3Readiness({ cycle, imports: division3Imports, providers }) : null;
+  const missingUberWeeks = (division2 || (division3 && uberImports.length > 0))
+    ? expectedUberWeeks.filter((week) => !loadedUberWeeks.includes(week))
+    : [];
+  const division3Data = division3 ? division3Readiness({ cycle, imports: division3Imports, providers, processingDivisions }) : null;
+  const divisionSources = await divisionSourceReadiness({ cycle, division });
   if (division3Data) {
     for (const source of Object.values(division3Data.sources)) {
       source.files = division3Uploads.filter((upload) => upload.kind === source.kind);
@@ -90,7 +101,7 @@ export async function cycleSummary(cycleId) {
       weeksDetected: loadedUberWeeks,
       expectedWeeks: (division2 || division3) ? expectedUberWeeks : [],
       missingWeeks: missingUberWeeks,
-      ready: uberImports.length > 0 && missingUberWeeks.length === 0,
+      ready: uberImports.length > 0 ? missingUberWeeks.length === 0 : !uberRequired,
       driversDetected: driverMatches.length,
       driverMatches,
       unresolvedCount: driverMatches.filter((match) => match.status !== 'MATCHED').length,
@@ -107,7 +118,19 @@ export async function cycleSummary(cycleId) {
       ...tollReadiness,
     },
     division3Data,
-    inputRequirements: { standardProviderCount, uberProviderCount, uberRequired, tollsRequired, division3Required: division3 },
+    divisionSources,
+    inputRequirements: {
+      standardProviderCount,
+      uberProviderCount,
+      uberRequired,
+      uberOptional: division3,
+      tollsRequired,
+      division3Required: division3,
+      divisionSourcesRequired: divisionSources.configured,
+      // No generic fallback: an unconfigured division must provide sample
+      // source files before Accounting can upload or process it.
+      standardPerformanceRequired: false,
+    },
     providersExpected: expected.length,
     providersWithoutVdp: expected.filter((p) => !vdps.some((v) => String(v.providerId) === String(p._id))).length,
     vdps: {
