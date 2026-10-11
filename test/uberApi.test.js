@@ -93,10 +93,11 @@ test('Uber plan, upload, processing, weekly adjustment, and audit snapshot', { s
   assert.ok(cycle);
 
   const validForm = new FormData();
-  validForm.append('cycleId', cycle._id);
+  validForm.append('divisionId', division._id);
   validForm.append('files', new Blob([workbook([WITT])]), '9.07.26 - 9.14.26.xlsx');
   response = await call('POST', '/uber-performance-imports', undefined, validForm);
   assert.equal(response.status, 201, JSON.stringify(response.data));
+  assert.equal(String(response.data.cycleId), String(cycle._id));
   assert.equal(response.data.files[0].validationStatus, 'VALID');
   assert.equal(response.data.files[0].rowCount, 1);
 
@@ -225,4 +226,50 @@ test('Uber plan, upload, processing, weekly adjustment, and audit snapshot', { s
   assert.equal(vdp.view.settings.uberConfig.value.belowThresholdBehavior, 'FARES_ONLY');
   assert.equal(vdp.view.calculation.uberRows[0].grossVdp, '1600.75');
   assert.equal(vdp.view.calculation.gross, '1621.75');
+});
+
+test('DIV 2 accepts and validates Uber plus toll files before any providers exist', { skip }, async () => {
+  let response = await call('POST', '/divisions', { divisionNumber: '2', name: 'Future DIV 2', timezone: 'America/Chicago' });
+  assert.equal(response.status, 201, JSON.stringify(response.data));
+  const division = response.data;
+  response = await call('POST', '/cycles/generate', { fromDate: '2026-09-07', count: 1 });
+  assert.equal(response.status, 201, JSON.stringify(response.data));
+  const cycles = (await call('GET', `/cycles?divisionId=${division._id}`)).data;
+  const cycle = cycles.find((item) => String(item.cycleStart).startsWith('2026-09-07'));
+  assert.ok(cycle);
+
+  const driverUuid = '11111111-2222-3333-4444-555555555555';
+  for (const [week, fileName] of [
+    ['2026-09-07', '9.07.26 - 9.14.26.xlsx'],
+    ['2026-09-14', '9.14.26 - 9.21.26.xlsx'],
+  ]) {
+    const form = new FormData();
+    form.append('cycleId', cycle._id);
+    form.append('files', new Blob([workbook([{ ...WITT, Week: week, Driver_UUID: driverUuid, First_Name: 'FUTURE', Last_Name: 'DRIVER' }])]), fileName);
+    response = await call('POST', '/uber-performance-imports', undefined, form);
+    assert.equal(response.status, 201, JSON.stringify(response.data));
+    assert.equal(response.data.files[0].validationStatus, 'VALID');
+  }
+
+  const tollForm = new FormData();
+  tollForm.append('cycleId', cycle._id);
+  const tollCsv = (amount) => Buffer.from([
+    'Driver UUID,Driver first name,Driver last name,Refunds & Expenses:Refunds:Toll',
+    `${driverUuid},FUTURE,DRIVER,${amount}`,
+  ].join('\n'));
+  tollForm.append('files', new Blob([tollCsv('2.25')]), '20260907-20260914-payments_driver-Big_Star_Chicago.csv');
+  tollForm.append('files', new Blob([tollCsv('4.10')]), '20260914-20260921-payments_driver-Big_Star_Chicago.csv');
+  response = await call('POST', '/uber-toll-imports', undefined, tollForm);
+  assert.equal(response.status, 201, JSON.stringify(response.data));
+  assert.equal(response.data.files.every((file) => file.validationStatus === 'VALID'), true);
+
+  response = await call('GET', `/cycles/${cycle._id}`);
+  assert.equal(response.status, 200, JSON.stringify(response.data));
+  assert.equal(response.data.providersExpected, 0);
+  assert.equal(response.data.inputRequirements.uberRequired, true);
+  assert.equal(response.data.inputRequirements.tollsRequired, true);
+  assert.equal(response.data.uberPerformance.activeFileCount, 2);
+  assert.equal(response.data.uberTolls.ready, true);
+  assert.equal(response.data.uberTolls.tollTotal, '6.35');
+  assert.deepEqual(response.data.uberTolls.missingWeeks, []);
 });

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  assertSafeCompassSnapshot, compassDivisionNumber, normalizeCompassSnapshot, runCutWeeklyServiceHours,
+  assertSafeCompassSnapshot, compassDivisionNumber, normalizeCompassSnapshot, runCutTuiWindow, runCutWeeklyServiceHours,
 } from '../src/services/compassRosterService.js';
 
 test('Compass division codes map to VDP division numbers', () => {
@@ -23,6 +23,20 @@ test('run-cut daily service hours become weekly contracted hours', () => {
   assert.equal(runCutWeeklyServiceHours({ status: 'active', operator: { _id: 'o1' }, serviceHours: 0, daysOfWeek: ['MON'] }), null);
 });
 
+test('active Compass run cuts expose their TUI windows and weekday overrides', () => {
+  assert.deepEqual(runCutTuiWindow({
+    _id: 'rc1', status: 'active', operator: { _id: 'o1' }, route: { code: '918' },
+    startTime: '3:45', endTime: '15:00', daysOfWeek: ['FRI', 'MON', 'TUE', 'WED', 'THU'],
+    weekdayTimes: [{ day: 'FRI', startTime: '04:00', endTime: '13:30' }],
+  }), {
+    externalRunCutId: 'rc1', route: '918', daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'],
+    startTime: '03:45', endTime: '15:00',
+    weekdayTimes: [{ day: 'FRI', startTime: '04:00', endTime: '13:30' }],
+  });
+  assert.equal(runCutTuiWindow({ status: 'active', operator: { _id: 'o1' }, daysOfWeek: ['MON'] }), null);
+  assert.equal(runCutTuiWindow({ status: 'inactive', operator: { _id: 'o1' }, startTime: '08:00', endTime: '17:00' }), null);
+});
+
 test('Compass operators are grouped by provider and division with active run-cut routes', () => {
   const normalized = normalizeCompassSnapshot({
     retrievedAt: new Date('2026-10-06T12:00:00Z'),
@@ -33,7 +47,7 @@ test('Compass operators are grouped by provider and division with active run-cut
       { _id: 'o2', employeeId: '101', name: 'Two Driver', active: false, division: { _id: 'd10' }, provider: { _id: 'p1' } },
     ],
     runCuts: [
-      { status: 'active', operator: { _id: 'o1' }, route: { code: '918' }, vehicle: { code: 'V1' }, serviceHours: 5, daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] },
+      { _id: 'rc918', status: 'active', operator: { _id: 'o1' }, route: { code: '918' }, vehicle: { code: 'V1' }, serviceHours: 5, startTime: '03:45', endTime: '15:00', daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] },
       { status: 'active', operator: { _id: 'o1' }, route: { code: '919' }, vehicle: { code: 'V1' }, serviceHours: 2.5, daysOfWeek: ['SAT', 'SUN'] },
       { status: 'unassigned', operator: null, route: { code: '920' }, vehicle: null },
     ],
@@ -43,6 +57,11 @@ test('Compass operators are grouped by provider and division with active run-cut
   assert.deepEqual(normalized.divisions[0].providers[0].operators[0].routes, ['918', '919']);
   assert.equal(normalized.divisions[0].providers[0].operators[0].vehicleUnit, 'V1');
   assert.equal(normalized.divisions[0].providers[0].operators[0].contractedHours, '30');
+  assert.deepEqual(normalized.divisions[0].providers[0].operators[0].tuiWindows, [{
+    externalRunCutId: 'rc918', route: '918', daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'],
+    startTime: '03:45', endTime: '15:00', weekdayTimes: [],
+  }]);
+  assert.equal(normalized.activeOperatorsWithoutTuiWindows, 0);
   assert.equal(normalized.unassignedRunCuts, 1);
 });
 

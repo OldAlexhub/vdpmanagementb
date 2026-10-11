@@ -58,7 +58,7 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
       { _id: 'o2', employeeId: '200', name: 'Two Driver', active: true, division: { _id: 'd6' }, provider: { _id: 'p2' } },
     ],
     runCuts: [
-      { status: 'active', operator: { _id: 'o1' }, route: { code: '918' }, vehicle: { code: 'V1' }, serviceHours: 8, daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] },
+      { _id: 'rc1', status: 'active', operator: { _id: 'o1' }, route: { code: '918' }, vehicle: { code: 'V1' }, serviceHours: 8, startTime: '03:45', endTime: '15:00', daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] },
       { status: 'active', operator: { _id: 'o2' }, route: { code: '700' }, vehicle: { code: 'V2' }, serviceHours: 10, daysOfWeek: ['MON', 'TUE', 'WED', 'THU', 'FRI'] },
     ],
   };
@@ -74,6 +74,8 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
   assert.equal(refreshed.operators[0].contractedHours.toString(), '40');
   assert.equal(refreshed.operators[0].liftLease.amount.toString(), '197.50');
   assert.equal(refreshed.operators[0].source.externalId, 'o1');
+  assert.equal(refreshed.operators[0].tuiWindows[0].startTime, '03:45');
+  assert.equal(refreshed.operators[0].tuiWindows[0].endTime, '15:00');
   assert.equal((await Provider.findById(removed._id)).status, 'INACTIVE');
   assert.equal((await Provider.findById(div12Provider._id)).status, 'ACTIVE');
   assert.equal((await Division.findById(div12._id)).source.system, 'MANUAL');

@@ -27,3 +27,21 @@ test('hourly-band Uber plans still require complete band rows', () => {
     /Hourly rate band 1 from hour is required/,
   );
 });
+
+const tuiVersion = (overrides = {}) => ({
+  calculationType: 'STANDARD', paymentType: 'HOURLY', basePay: '25', contractedHours: '40',
+  incentiveEnabled: true,
+  incentiveTiers: [{ minimumPercentage: '0', maximumPercentage: '', rate: '25' }],
+  effectiveFrom: '2026-10-01',
+  ...overrides,
+});
+
+test('new TUI plans use an explicit in-window hours column', () => {
+  const version = versionInput(tuiVersion());
+  assert.equal(version.attainmentHourMetric, 'OTHER');
+  assert.equal(version.attainmentHourColumn, 'Incentive Hours');
+  assert.throws(
+    () => versionInput(tuiVersion({ attainmentHourMetric: 'SAME_AS_PAID' })),
+    /hours worked inside the Compass start\/end window/i,
+  );
+});

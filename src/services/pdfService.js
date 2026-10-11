@@ -498,6 +498,7 @@ export async function statementPdf(m) {
   const calc = v.calculation;
   const uber = calc?.calculationType === 'UBER';
   const perTrip = v.settings?.paymentType?.value === 'PER_TRIP';
+  const standardRateCard = v.settings?.rateStructureType?.value === 'RATE_CARD';
   const doc = newDoc('portrait', { Title: `VDP statement ${v.provider?.name || ''} ${cycleText(v.cycle)}` });
   const L = doc.content.left;
   const W = doc.content.width;
@@ -531,7 +532,7 @@ export async function statementPdf(m) {
     ['Service plan', v.plan?.name || '—'],
     ['Payment type', uber ? 'Uber vehicle / pay unit' : perTrip ? 'Per trip' : 'Hourly'],
     ['Contracted hours', uber ? 'Provider profile by vehicle / pay unit' : s?.contractedHours?.value ? `${fmtNum(s.contractedHours.value)} h / week` : '—'],
-    ['Base rate', uber && uberRateStructure === 'HOURLY_BANDS' ? 'VDP plan hourly bands' : s?.basePay?.value ? `${fmtRate(s.basePay.value)}${perTrip ? ' / trip' : ' / h'}` : '—'],
+    ['Base rate', standardRateCard ? 'VDP plan rate cards' : uber && uberRateStructure === 'HOURLY_BANDS' ? 'VDP plan hourly bands' : s?.basePay?.value ? `${fmtRate(s.basePay.value)}${perTrip ? ' / trip' : ' / h'}` : '—'],
     ['Bonus rate', s?.bonusEnabled?.value ? `${fmtRate(s.bonusRate.value)} / h above contract` : 'None'],
     ...(s?.fuelReimbursementEnabled?.value ? [['Fuel reimbursement', `${fmtRate(s.fuelReimbursementRate.value)} / trip`]] : []),
     ...(s?.fuelMethod?.value === 'SERVICE_MILE_ALLOWANCE' ? [['Fuel', `Service mile allowance · ${fmtNum(s.fuelMpg.value)} MPG`]] : []),
@@ -556,7 +557,15 @@ export async function statementPdf(m) {
   const colW = (W - 190) / weeks.length;
   const cols = [{ header: '', width: 190 }, ...weeks.map((w) => ({ header: `Week ${w.weekNumber}  ${md(w.start)}–${md(w.end)}`, width: colW, align: 'right' }))];
   const row = (label, fn, extra = {}) => ({ cells: [label, ...weeks.map(fn)], labelBold: false, ...extra });
-  const perfRows = perTrip
+  const perfRows = standardRateCard
+    ? [
+        row('Trips provided', (w) => fmtNum(w.trips)),
+        row('Hours worked', (w) => hrs(w.actualHours)),
+        row('Attainment hours', (w) => hrs(w.attainmentHours)),
+        row('Rate card', (w) => w.tierLabel, { style: 'muted' }),
+        row('Calculated pay', (w) => fmtMoney(w.coreEarnings), { boldCols: weeks.map((_, i) => i + 1) }),
+      ]
+    : perTrip
     ? [
         row('Trips provided', (w) => fmtNum(w.trips)),
         row('Hours worked', (w) => hrs(w.actualHours)),
@@ -592,7 +601,9 @@ export async function statementPdf(m) {
       cells: [
         o.plan ? `${o.name} (${o.plan.name})` : o.name,
         (o.routes || []).join(', ') || '—',
-        ...o.weeks.map((w) => ((o.paymentType ? o.paymentType === 'PER_TRIP' : perTrip)
+        ...o.weeks.map((w) => (o.rateStructureType === 'RATE_CARD'
+          ? `${w.tierLabel} · ${fmtMoney(w.weeklyEarnings)}`
+          : (o.paymentType ? o.paymentType === 'PER_TRIP' : perTrip)
           ? `${fmtNum(w.trips)} trips · ${fmtMoney(w.weeklyEarnings)}`
           : `${fmtNum(w.actualHours)} h · ${pctText(w.performancePercentage)} · ${fmtMoney(w.weeklyEarnings)}`)),
         fmtMoney(o.earnings),
@@ -970,6 +981,8 @@ function planSummaryRows(version) {
       ['Below threshold', u.belowThresholdBehavior === 'CORE_ONLY' ? 'Core compensation only' : 'Driver fares only'],
       ['Utilization incentive', u.utilizationEnabled ? `${ratioPct(u.utilizationIncentivePct)} at ${ratioPct(u.utilizationTarget)} utilization` : 'Disabled'],
       ['Core-hours rule', u.coreHoursRuleType === 'PERCENTAGE' ? `${ratioPct(u.coreHoursRequirement)} of contracted hours` : u.coreHoursRuleType === 'CONTINUOUS_COVERAGE' ? 'Continuous coverage validation' : 'None'],
+      ['Incentive scope', u.incentiveScope === 'PROVIDER' ? 'Across active provider pay units' : 'Each pay unit'],
+      ['Core-hours failure', u.coreHoursFailureBehavior === 'INELIGIBLE' ? 'Removes incentives' : 'Review status only'],
     ];
   }
   const fuel = fuelMethodOf(version);
@@ -979,13 +992,25 @@ function planSummaryRows(version) {
     : PERFORMANCE_LABELS[version.performanceHourMetric] || version.performanceHourMetric || '-';
   const fuelText = fuel === 'PER_TRIP'
     ? `${fmtRate(version.fuelReimbursementRate)} per trip reimbursement`
-    : fuel === 'SERVICE_MILE_ALLOWANCE' ? `Service-mile allowance at ${fmtNum(version.fuelMpg)} MPG` : 'None';
+    : fuel === 'SERVICE_MILE_ALLOWANCE' ? `Service-mile allowance at ${fmtNum(version.fuelMpg)} MPG`
+    : fuel === 'ACTUAL_EXPENSE_REIMBURSEMENT' ? 'Verified actual fuel-cost reimbursement'
+    : fuel === 'PRICE_THRESHOLD_SURCHARGE' ? `Price above ${fmtRate(version.fuelPriceThreshold)}/gal at ${fmtNum(version.fuelMpg)} MPG`
+    : 'None';
+  const rateModel = version.rateStructureType === 'RATE_CARD'
+    ? `${version.rateCards?.length || 0} attainment rate card(s)`
+    : PAYMENT_LABELS[version.paymentType] || version.paymentType;
+  const attainment = version.attainmentHourMetric === 'SAME_AS_PAID' || !version.attainmentHourMetric
+    ? 'Same as paid hours'
+    : version.attainmentHourMetric === 'OTHER' ? `Other report column: ${version.attainmentHourColumn || '-'}`
+    : PERFORMANCE_LABELS[version.attainmentHourMetric] || version.attainmentHourMetric;
   return [
-    ['Compensation model', PAYMENT_LABELS[version.paymentType] || version.paymentType],
-    ['Base pay', `${fmtRate(version.basePay)} per ${unit}`],
-    ['Contracted hours', version.contractedHours ? `${fmtNum(version.contractedHours)} per week` : 'Not configured'],
-    ['TUI incentive', version.incentiveEnabled ? `Enabled - ${version.incentiveTiers.length} tier(s)` : 'Disabled'],
-    ['Bonus', version.bonusEnabled ? `${fmtRate(version.bonusRate)} per hour above contract` : 'Disabled'],
+    ['Compensation model', rateModel],
+    ['Base pay', version.rateStructureType === 'RATE_CARD' ? 'Defined by matching rate-card components' : `${fmtRate(version.basePay)} per ${unit}`],
+    ['Contracted hours', version.contractedHoursMode === 'OPERATOR_PROFILE' ? 'Operator profile' : version.contractedHours ? `${fmtNum(version.contractedHours)} per week` : 'Not configured'],
+    ['TUI incentive', version.incentiveEnabled ? `Enabled - ${version.rateStructureType === 'RATE_CARD' ? version.rateCards?.length || 0 : version.incentiveTiers.length} tier(s)` : 'Disabled'],
+    ['Attainment', `${attainment}; ${version.attainmentScope === 'PROVIDER' ? 'provider-wide' : 'per operator'}`],
+    ['Bonus', version.bonusEnabled ? `${fmtRate(version.bonusRate)} per ${version.bonusBasis === 'SIXTH_DAY_TRIPS' ? 'qualifying sixth-day trip' : 'hour above contract'}` : 'Disabled'],
+    ['Standby guarantee', version.standbyGuaranteeEnabled ? (version.standbyRate ? `${fmtRate(version.standbyRate)} per hour` : 'Enabled; assignment guarantee input') : 'Disabled'],
     ['Performance hours source', metric],
     ['Fuel arrangement', fuelText],
   ];
@@ -1011,6 +1036,25 @@ function reportNote(doc, text) {
 }
 
 function standardVersionDetails(doc, version) {
+  if (version.rateStructureType === 'RATE_CARD' && version.rateCards?.length) {
+    version.rateCards.forEach((card) => {
+      doc.fillColor(C.navy).font(F.bold).fontSize(8.5).text(`RATE CARD - ${t(card.name).toUpperCase()}`, doc.content.left, doc.y + 3, { characterSpacing: 0.6 });
+      doc.y += 16;
+      table(doc, [
+        { header: 'Component', width: 160 }, { header: 'Basis / filters', width: doc.content.width - 250 },
+        { header: 'Rate', width: 90, align: 'right' },
+      ], card.components.map((component) => ({
+        cells: [
+          component.name,
+          [component.basis, component.serviceType, component.vehicleType, component.dayType !== 'ANY' && component.dayType].filter(Boolean).join(' · '),
+          fmtRate(component.rate),
+        ],
+        labelBold: false,
+        boldCols: [2],
+      })), { fontSize: 8.2, rowPad: 4 });
+    });
+    return;
+  }
   if (version.incentiveTiers?.length) {
     doc.fillColor(C.navy).font(F.bold).fontSize(8.5).text('TUI INCENTIVE TIERS', doc.content.left, doc.y + 3, { characterSpacing: 0.6 });
     doc.y += 16;

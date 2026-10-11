@@ -11,6 +11,41 @@ import { badRequest } from './errors.js';
 export const compassDivisionNumber = (code) => String(code || '').trim().replace(/^DIV[_\s-]*/i, '');
 const id = (value) => (value === undefined || value === null ? '' : String(value));
 const sorted = (values) => [...new Set(values.filter(Boolean).map(String))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+const WEEKDAYS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'];
+const clock = (value) => {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(String(value || '').trim());
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return null;
+  return `${match[1].padStart(2, '0')}:${match[2]}`;
+};
+const orderedDays = (values) => [...new Set((values || []).map((value) => String(value || '').trim().toUpperCase()).filter(Boolean))]
+  .sort((a, b) => {
+    const ai = WEEKDAYS.indexOf(a);
+    const bi = WEEKDAYS.indexOf(b);
+    if (ai === -1 || bi === -1) return a.localeCompare(b);
+    return ai - bi;
+  });
+
+/** A read-only TUI schedule window from one active Compass Master Run Cut. */
+export function runCutTuiWindow(runCut) {
+  if (runCut?.status !== 'active' || !runCut.operator?._id) return null;
+  const startTime = clock(runCut.startTime);
+  const endTime = clock(runCut.endTime);
+  const weekdayTimes = (runCut.weekdayTimes || []).flatMap((entry) => {
+    const start = clock(entry?.startTime);
+    const end = clock(entry?.endTime);
+    const day = String(entry?.day || '').trim().toUpperCase();
+    return day && start && end ? [{ day, startTime: start, endTime: end }] : [];
+  }).sort((a, b) => orderedDays([a.day, b.day]).indexOf(a.day) - orderedDays([a.day, b.day]).indexOf(b.day));
+  if ((!startTime || !endTime) && !weekdayTimes.length) return null;
+  return {
+    externalRunCutId: id(runCut._id) || null,
+    route: String(runCut.route?.code || '').trim() || null,
+    daysOfWeek: orderedDays([...(runCut.daysOfWeek || []), ...weekdayTimes.map((entry) => entry.day)]),
+    startTime,
+    endTime,
+    weekdayTimes,
+  };
+}
 
 // Compass serviceHours is the service time for one scheduled day. Contracted hours
 // are the weekly sum across the run cut's distinct scheduled days.
@@ -27,6 +62,7 @@ export function normalizeCompassSnapshot(snapshot) {
   const routesByOperator = new Map();
   const vehiclesByOperator = new Map();
   const weeklyHoursByOperator = new Map();
+  const tuiWindowsByOperator = new Map();
   for (const runCut of snapshot.runCuts) {
     const operatorId = id(runCut.operator?._id);
     if (!operatorId || runCut.status !== 'active') continue;
@@ -39,6 +75,11 @@ export function normalizeCompassSnapshot(snapshot) {
     if (runCut.vehicle?.code) {
       if (!vehiclesByOperator.has(operatorId)) vehiclesByOperator.set(operatorId, new Set());
       vehiclesByOperator.get(operatorId).add(String(runCut.vehicle.code).trim());
+    }
+    const tuiWindow = runCutTuiWindow(runCut);
+    if (tuiWindow) {
+      if (!tuiWindowsByOperator.has(operatorId)) tuiWindowsByOperator.set(operatorId, []);
+      tuiWindowsByOperator.get(operatorId).push(tuiWindow);
     }
   }
 
@@ -72,6 +113,8 @@ export function normalizeCompassSnapshot(snapshot) {
     }
     const routes = sorted([...(routesByOperator.get(operatorId) || [])]);
     const vehicleUnits = sorted([...(vehiclesByOperator.get(operatorId) || [])]);
+    const tuiWindows = [...(tuiWindowsByOperator.get(operatorId) || [])]
+      .sort((a, b) => `${a.route || ''}|${a.externalRunCutId || ''}`.localeCompare(`${b.route || ''}|${b.externalRunCutId || ''}`, undefined, { numeric: true }));
     providerInstances.get(key).operators.push({
       externalId: operatorId,
       employeeId: String(operator.employeeId || '').trim() || null,
@@ -83,6 +126,7 @@ export function normalizeCompassSnapshot(snapshot) {
       routes,
       vehicleUnits,
       vehicleUnit: vehicleUnits.length === 1 ? vehicleUnits[0] : null,
+      tuiWindows,
       eligibilities: String(operator.eligibilities || '').trim() || null,
     });
   }
@@ -103,6 +147,7 @@ export function normalizeCompassSnapshot(snapshot) {
     operatorsWithoutEmployeeId: snapshot.operators.filter((operator) => !String(operator.employeeId || '').trim()).length,
     activeOperatorsWithoutRoutes: snapshot.operators.filter((operator) => operator.active !== false && !(routesByOperator.get(id(operator._id))?.size)).length,
     activeOperatorsWithoutContractedHours: snapshot.operators.filter((operator) => operator.active !== false && !weeklyHoursByOperator.has(id(operator._id))).length,
+    activeOperatorsWithoutTuiWindows: snapshot.operators.filter((operator) => operator.active !== false && !(tuiWindowsByOperator.get(id(operator._id))?.length)).length,
     unassignedRunCuts: snapshot.runCuts.filter((runCut) => !runCut.operator?._id).length,
   };
 }
@@ -140,6 +185,7 @@ export async function previewCompassRoster() {
         activeOperatorCount: provider.operators.filter((operator) => operator.status === 'ACTIVE').length,
         operatorsWithRoutes: provider.operators.filter((operator) => operator.routes.length).length,
         operatorsWithContractedHours: provider.operators.filter((operator) => operator.contractedHours !== null).length,
+        operatorsWithTuiWindows: provider.operators.filter((operator) => operator.tuiWindows.length).length,
         mongoProviderMatched: Boolean(match),
         exactOperatorMatches: operatorMatches,
       });
@@ -155,6 +201,7 @@ export async function previewCompassRoster() {
       operatorCount: division.providers.reduce((sum, provider) => sum + provider.operators.length, 0),
       activeOperatorCount: division.providers.reduce((sum, provider) => sum + provider.operators.filter((operator) => operator.status === 'ACTIVE').length, 0),
       operatorsWithContractedHours: division.providers.reduce((sum, provider) => sum + provider.operators.filter((operator) => operator.contractedHours !== null).length, 0),
+      operatorsWithTuiWindows: division.providers.reduce((sum, provider) => sum + provider.operators.filter((operator) => operator.tuiWindows.length).length, 0),
       providersMatched: divisionProviderMatches,
       operatorsMatched: divisionOperatorMatches,
     };
@@ -170,6 +217,7 @@ export async function previewCompassRoster() {
   if (missingFromMongo.length) warnings.push(`Compass divisions not yet present in MongoDB: ${missingFromMongo.join(', ')}.`);
   if (normalized.activeOperatorsWithoutRoutes) warnings.push(`${normalized.activeOperatorsWithoutRoutes} active Compass operators have no active Master Run Cut route.`);
   if (normalized.activeOperatorsWithoutContractedHours) warnings.push(`${normalized.activeOperatorsWithoutContractedHours} active Compass operators have no active run-cut service hours, so contracted hours remain blank.`);
+  if (normalized.activeOperatorsWithoutTuiWindows) warnings.push(`${normalized.activeOperatorsWithoutTuiWindows} active Compass operators have no usable start/end time on an active Master Run Cut, so their TUI window remains blank.`);
   if (normalized.operatorsWithoutEmployeeId) warnings.push(`${normalized.operatorsWithoutEmployeeId} Compass operator record has no employee ID.`);
   if (normalized.providersWithoutOperators) warnings.push(`${normalized.providersWithoutOperators} Compass provider records cannot be assigned to a division because they have no operators.`);
 
@@ -182,6 +230,7 @@ export async function previewCompassRoster() {
       compassOperators: normalized.divisions.reduce((sum, division) => sum + division.providers.reduce((n, provider) => n + provider.operators.length, 0), 0),
       operatorsWithRoutes: normalized.divisions.reduce((sum, division) => sum + division.providers.reduce((n, provider) => n + provider.operators.filter((operator) => operator.routes.length).length, 0), 0),
       operatorsWithContractedHours: normalized.divisions.reduce((sum, division) => sum + division.providers.reduce((n, provider) => n + provider.operators.filter((operator) => operator.contractedHours !== null).length, 0), 0),
+      operatorsWithTuiWindows: normalized.divisions.reduce((sum, division) => sum + division.providers.reduce((n, provider) => n + provider.operators.filter((operator) => operator.tuiWindows.length).length, 0), 0),
       mongoDivisionMatches: divisions.filter((division) => division.mongoDivisionMatched).length,
       exactProviderMatches: matchedProviders,
       exactOperatorMatches: matchedOperators,
@@ -206,9 +255,18 @@ const rosterSignature = (provider) => JSON.stringify({
     routes: [...(operator.routes || [])].sort(),
     vehicleUnit: operator.vehicleUnit || null,
     contractedHours: operator.contractedHours === null || operator.contractedHours === undefined ? null : String(operator.contractedHours),
+    tuiWindows: (operator.tuiWindows || []).map((window) => ({
+      externalRunCutId: window.externalRunCutId || null,
+      route: window.route || null,
+      daysOfWeek: [...(window.daysOfWeek || [])],
+      startTime: window.startTime || null,
+      endTime: window.endTime || null,
+      weekdayTimes: (window.weekdayTimes || []).map((entry) => ({ day: entry.day, startTime: entry.startTime, endTime: entry.endTime })),
+    })),
     liftLease: {
       amount: operator.liftLease?.amount === null || operator.liftLease?.amount === undefined ? null : String(operator.liftLease.amount),
       frequency: operator.liftLease?.frequency || 'NONE',
+      optionId: operator.liftLease?.optionId ? id(operator.liftLease.optionId) : null,
     },
   })),
 });
@@ -246,9 +304,14 @@ function compassOperatorValue(operator, previous, syncedAt, { keepIdentity = tru
     status: operator.status,
     vehicleUnit: operator.vehicleUnit,
     contractedHours: operator.contractedHours,
+    tuiWindows: operator.tuiWindows,
     employeeId: operator.employeeId,
     source: sourceOf(operator.externalId, syncedAt),
-    liftLease: divisionLease || value.liftLease || { amount: null, frequency: 'NONE' },
+    // A deliberately selected saved option is a local VDP setting and survives a
+    // Compass roster refresh. Operators without one inherit the division default.
+    liftLease: value.liftLease?.optionId
+      ? value.liftLease
+      : divisionLease || value.liftLease || { amount: null, frequency: 'NONE' },
   };
 }
 
@@ -285,6 +348,7 @@ async function performCompassSync(snapshot) {
       providersWithoutOperators: normalized.providersWithoutOperators,
       activeOperatorsWithoutRoutes: normalized.activeOperatorsWithoutRoutes,
       activeOperatorsWithoutContractedHours: normalized.activeOperatorsWithoutContractedHours,
+      activeOperatorsWithoutTuiWindows: normalized.activeOperatorsWithoutTuiWindows,
       operatorsWithoutEmployeeId: normalized.operatorsWithoutEmployeeId,
       unassignedRunCuts: normalized.unassignedRunCuts,
     },

@@ -5,23 +5,33 @@ import Vdp from '../models/Vdp.js';
 import VdpPlan from '../models/VdpPlan.js';
 import { activeImportFor, matchRoutes, unresolvedRoutes } from './performanceService.js';
 import { activeUberImportsFor, listUberImports, matchUberDrivers } from './uberPerformanceService.js';
+import { activeUberTollImportsFor, listUberTollImports, uberTollReadiness } from './uberTollService.js';
+import { activeDivision3ImportsFor, listDivision3Imports, division3Readiness } from './division3ImportService.js';
 import { resolveVersion } from './planService.js';
+import { isoDate } from './cycleService.js';
 import { sum, money } from './money.js';
 import { notFound } from './errors.js';
 import { autoApproveDue } from './vdpService.js';
+import { isDivision3Division, processingDivisionsFor } from './divisionGroups.js';
 
 export async function cycleSummary(cycleId) {
   await autoApproveDue();
   const cycle = await VdpCycle.findById(cycleId);
   if (!cycle) throw notFound('VDP cycle');
-  const [division, providers, vdps, importDoc, uberImports, uberUploads, plans] = await Promise.all([
-    Division.findById(cycle.divisionId),
-    Provider.find({ divisionId: cycle.divisionId }),
+  const division = await Division.findById(cycle.divisionId);
+  const processingDivisions = await processingDivisionsFor(division);
+  const divisionIds = processingDivisions.map((item) => item._id);
+  const [providers, vdps, importDoc, uberImports, uberUploads, tollImports, tollUploads, plans, division3Imports, division3Uploads] = await Promise.all([
+    Provider.find({ divisionId: { $in: divisionIds } }),
     Vdp.find({ cycleId: cycle._id }, 'status gross net calculation.totalDeductions calculation.totalAdditions stale providerId exceptions'),
     activeImportFor(cycle._id),
     activeUberImportsFor(cycle._id),
     listUberImports({ cycleId: cycle._id }),
-    VdpPlan.find({ divisionId: cycle.divisionId }),
+    activeUberTollImportsFor(cycle._id),
+    listUberTollImports({ cycleId: cycle._id }),
+    VdpPlan.find({ divisionId: { $in: divisionIds } }),
+    activeDivision3ImportsFor(cycle._id),
+    listDivision3Imports({ cycleId: cycle._id }),
   ]);
 
   const matches = importDoc ? matchRoutes(importDoc, providers) : [];
@@ -34,13 +44,30 @@ export async function cycleSummary(cycleId) {
     return plan ? (resolveVersion(plan, cycle).version?.calculationType || 'STANDARD') : 'STANDARD';
   };
   const uberProviderCount = expected.filter((provider) => planType(provider) === 'UBER').length;
-  const standardProviderCount = expected.length - uberProviderCount;
+  const division3 = isDivision3Division(division);
+  const standardProviderCount = division3 ? 0 : expected.length - uberProviderCount;
+  // DIV 2 has a fixed Uber + toll source contract even before its Compass roster
+  // has been added. This keeps the file pipeline ready while provider count is zero.
+  const division2 = String(division?.divisionNumber || '').trim() === '2';
+  const uberRequired = division2 || division3 || uberProviderCount > 0;
+  const tollsRequired = division2;
   const driverMatches = matchUberDrivers(uberImports, providers, cycle);
+  const tollReadiness = uberTollReadiness({ cycle, tollImports, uberImports });
+  const expectedUberWeeks = [isoDate(cycle.week1Start), isoDate(cycle.week2Start)];
+  const loadedUberWeeks = [...new Set(uberImports.flatMap((doc) => doc.weeksDetected || []))].sort();
+  const missingUberWeeks = (division2 || division3) ? expectedUberWeeks.filter((week) => !loadedUberWeeks.includes(week)) : [];
+  const division3Data = division3 ? division3Readiness({ cycle, imports: division3Imports, providers }) : null;
+  if (division3Data) {
+    for (const source of Object.values(division3Data.sources)) {
+      source.files = division3Uploads.filter((upload) => upload.kind === source.kind);
+    }
+  }
   const calculated = vdps.filter((v) => v.gross !== null && v.gross !== undefined);
 
   return {
     cycle,
     division,
+    processingDivisions,
     performance: importDoc
       ? {
           loaded: true,
@@ -55,17 +82,32 @@ export async function cycleSummary(cycleId) {
         }
       : { loaded: false },
     uberPerformance: {
-      required: uberProviderCount > 0,
+      required: uberRequired,
       loaded: uberImports.length > 0,
       files: uberUploads,
       activeFileCount: uberImports.length,
       rowCount: uberImports.reduce((total, doc) => total + (doc.rowCount || 0), 0),
-      weeksDetected: [...new Set(uberImports.flatMap((doc) => doc.weeksDetected || []))].sort(),
+      weeksDetected: loadedUberWeeks,
+      expectedWeeks: (division2 || division3) ? expectedUberWeeks : [],
+      missingWeeks: missingUberWeeks,
+      ready: uberImports.length > 0 && missingUberWeeks.length === 0,
       driversDetected: driverMatches.length,
       driverMatches,
       unresolvedCount: driverMatches.filter((match) => match.status !== 'MATCHED').length,
     },
-    inputRequirements: { standardProviderCount, uberProviderCount },
+    uberTolls: {
+      required: tollsRequired,
+      loaded: tollImports.length > 0,
+      ready: tollReadiness.ready,
+      files: tollUploads,
+      activeFileCount: tollImports.length,
+      rowCount: tollImports.reduce((total, doc) => total + (doc.rowCount || 0), 0),
+      tollRowCount: tollImports.reduce((total, doc) => total + Number(doc.stats?.tollRowCount || 0), 0),
+      tollTotal: tollImports.reduce((total, doc) => total + Number(doc.stats?.tollTotal || 0), 0).toFixed(2),
+      ...tollReadiness,
+    },
+    division3Data,
+    inputRequirements: { standardProviderCount, uberProviderCount, uberRequired, tollsRequired, division3Required: division3 },
     providersExpected: expected.length,
     providersWithoutVdp: expected.filter((p) => !vdps.some((v) => String(v.providerId) === String(p._id))).length,
     vdps: {

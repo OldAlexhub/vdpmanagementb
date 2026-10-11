@@ -99,6 +99,18 @@ describe('Uber performance parser', () => {
     assert.equal(parsedCsv.rowCount, 1);
   });
 
+  test('accepts the DIV 3 database-style Uber export', async () => {
+    const parsed = await parseUberPerformanceFile(bufferFor([{
+      week_start: '2026-09-07', week_end: '2026-09-13', driver_uuid: 'div3-driver', driver_name: 'Alex Driver',
+      supply_hours: 52, online_hours: 49.5, trips_accepted: 100, trips_rejected: 2, trips_expired: 1,
+      trips_canceled: 3, hours_7am_9pm: 48, earnings_excl_tips: 1200, tips: 40,
+    }]), 'div3.csv');
+    assert.equal(parsed.rows[0].totalSupplyHours, '49.5');
+    assert.equal(parsed.rows[0].pausedHours, '0');
+    assert.equal(parsed.rows[0].coreHoursTotalSupplyHours, '48');
+    assert.equal(parsed.rows[0].sourceFirstName, 'Alex Driver');
+  });
+
   test('required and optional column contracts stay explicit', () => {
     assert.equal(REQUIRED_UBER_COLUMNS.length, 11);
     assert.deepEqual(OPTIONAL_UBER_COLUMNS, ['Utilized Hours']);

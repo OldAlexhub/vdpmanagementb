@@ -29,6 +29,24 @@ const FIELD_NAMES = {
   Driver_Tips: 'driverTips',
 };
 
+// Uber has supplied two report layouts. DIV 2 uses the display-name columns
+// above; DIV 3 uses database-style names. Keep one canonical row contract so
+// the calculation engine and audit snapshots do not depend on file layout.
+const COLUMN_ALIASES = {
+  'Total Supply Hours': ['Total Supply Hours', 'online_hours'],
+  'Paused Hours': ['Paused Hours'],
+  'Core Hours_Total Supply Hours': ['Core Hours_Total Supply Hours', 'hours_7am_9pm'],
+  'Utilized Hours': ['Utilized Hours'],
+  Total_Accepts: ['Total_Accepts', 'trips_accepted'],
+  Total_Rejects: ['Total_Rejects', 'trips_rejected'],
+  Total_Expired_Offers: ['Total_Expired_Offers', 'trips_expired'],
+  Total_Cancels: ['Total_Cancels', 'trips_canceled'],
+  Driver_Earnings_Excl_Tips: ['Driver_Earnings_Excl_Tips', 'earnings_excl_tips'],
+  Driver_Tips: ['Driver_Tips', 'tips'],
+  Driver_UUID: ['Driver_UUID', 'driver_uuid'],
+  Week: ['Week', 'week_start'],
+};
+
 export class UberFileValidationError extends Error {
   constructor(message, details = {}) {
     super(message);
@@ -101,14 +119,20 @@ export async function parseUberPerformanceFile(buffer, fileName) {
   const { sheetName, rows } = workbookRows(buffer, fileName);
   if (!rows.length) throw new UberFileValidationError('The Uber data file is empty.', { code: 'EMPTY_FILE' });
 
-  const requiredKeys = new Set(REQUIRED_UBER_COLUMNS.map(normalizedHeader));
-  const headerIndex = rows.slice(0, 20).findIndex((row) => row.filter((cell) => requiredKeys.has(normalizedHeader(cell))).length >= 4);
+  const recognizedKeys = new Set(Object.values(COLUMN_ALIASES).flat().map(normalizedHeader));
+  const headerIndex = rows.slice(0, 20).findIndex((row) => row.filter((cell) => recognizedKeys.has(normalizedHeader(cell))).length >= 4);
   if (headerIndex < 0) {
     throw new UberFileValidationError('Could not find the Uber data header row.', { code: 'HEADER_NOT_FOUND', missingColumns: REQUIRED_UBER_COLUMNS });
   }
   const headers = rows[headerIndex].map((header) => String(header ?? '').trim());
   const byNormalized = new Map(headers.map((header, index) => [normalizedHeader(header), index]));
-  const missingColumns = REQUIRED_UBER_COLUMNS.filter((column) => !byNormalized.has(normalizedHeader(column)));
+  const columnIndex = (column) => (COLUMN_ALIASES[column] || [column])
+    .map((alias) => byNormalized.get(normalizedHeader(alias)))
+    .find((index) => index !== undefined);
+  // DIV 3 has no pause column. Its online_hours value is already the payable
+  // online-hours measure, so a missing pause column is an explicit zero.
+  const databaseLayout = byNormalized.has(normalizedHeader('week_start'));
+  const missingColumns = REQUIRED_UBER_COLUMNS.filter((column) => !(databaseLayout && column === 'Paused Hours') && columnIndex(column) === undefined);
   if (missingColumns.length) {
     throw new UberFileValidationError(`Missing required Uber column${missingColumns.length === 1 ? '' : 's'}: ${missingColumns.join(', ')}.`, {
       code: 'MISSING_COLUMNS', missingColumns, detectedColumns: headers.filter(Boolean), sheetName,
@@ -123,18 +147,26 @@ export async function parseUberPerformanceFile(buffer, fileName) {
     const source = rows[i];
     if (!source.some((value) => value !== null && String(value).trim() !== '')) continue;
     const rowNumber = i + 1;
-    const valueFor = (column) => source[byNormalized.get(normalizedHeader(column))];
+    const valueFor = (column) => source[columnIndex(column)];
     const optionalValueFor = (...columns) => {
       const column = columns.find((candidate) => byNormalized.has(normalizedHeader(candidate)));
       return column ? source[byNormalized.get(normalizedHeader(column))] : null;
     };
     const driverUuid = String(valueFor('Driver_UUID') ?? '').trim();
-    const week = isoWeek(valueFor('Week'));
+    const rawWeek = valueFor('Week');
+    // Database-style exports can end with a non-driver summary row. It is not
+    // performance data and the source workbook ignores it as well.
+    if (databaseLayout && !driverUuid && (rawWeek === null || String(rawWeek ?? '').trim() === '')) continue;
+    const week = isoWeek(rawWeek);
     if (!driverUuid) errors.push(`Row ${rowNumber}, Driver_UUID: value is required.`);
-    if (!week) errors.push(`Row ${rowNumber}, Week: expected a valid date, found "${String(valueFor('Week') ?? '')}".`);
+    if (!week) errors.push(`Row ${rowNumber}, Week: expected a valid date, found "${String(rawWeek ?? '')}".`);
     const numeric = {};
     const sourceZeroFields = [];
     for (const column of NUMERIC_COLUMNS) {
+      if (databaseLayout && column === 'Paused Hours' && columnIndex(column) === undefined) {
+        numeric[FIELD_NAMES[column]] = '0';
+        continue;
+      }
       const value = valueFor(column);
       const sourceNull = isUberNull(value);
       const parsedNumber = sourceNull ? '0' : exactNumber(value);
@@ -145,7 +177,7 @@ export async function parseUberPerformanceFile(buffer, fileName) {
       }
     }
     for (const column of OPTIONAL_UBER_COLUMNS) {
-      if (!byNormalized.has(normalizedHeader(column))) {
+      if (columnIndex(column) === undefined) {
         numeric[FIELD_NAMES[column]] = null;
         continue;
       }
@@ -177,6 +209,10 @@ export async function parseUberPerformanceFile(buffer, fileName) {
       sourceZeroFields,
       ...numeric,
     });
+    if (!parsed[parsed.length - 1].sourceFirstName && !parsed[parsed.length - 1].sourceLastName) {
+      const fullName = String(optionalValueFor('driver_name', 'Driver Name', 'DriverName') ?? '').trim();
+      parsed[parsed.length - 1].sourceFirstName = fullName;
+    }
   }
   if (errors.length) {
     const shown = errors.slice(0, 20);

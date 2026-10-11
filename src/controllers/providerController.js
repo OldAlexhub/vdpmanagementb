@@ -1,6 +1,7 @@
 import Provider from '../models/Provider.js';
 import VdpPlan from '../models/VdpPlan.js';
 import Division from '../models/Division.js';
+import LiftLeaseOption from '../models/LiftLeaseOption.js';
 import { resolveSettings, currentVersion } from '../services/planService.js';
 import Vdp from '../models/Vdp.js';
 import VdpCycle from '../models/VdpCycle.js';
@@ -21,7 +22,42 @@ function leaseInput(lease, label) {
   if (!['WEEKLY', 'PER_VDP_CYCLE', 'NONE'].includes(freq)) throw badRequest(`${label}: invalid lift lease frequency.`);
   const amount = decimalInput(lease?.amount, `${label}: lift lease amount`, { maxDp: 2 });
   if (freq !== 'NONE' && amount === null) throw badRequest(`${label}: enter the lift lease amount or set the frequency to None.`);
-  return { amount: freq === 'NONE' ? null : amount, frequency: freq };
+  return {
+    amount: freq === 'NONE' ? null : amount,
+    frequency: freq,
+    optionId: lease?.optionId || null,
+    optionName: String(lease?.optionName || '').trim() || null,
+  };
+}
+
+async function resolveLeaseOptions(provider, { division = null, defaultWhenUnset = false } = {}) {
+  const optionIds = [...new Set(provider.operators
+    .map((operator) => operator.liftLease?.optionId && String(operator.liftLease.optionId))
+    .filter(Boolean))];
+  const options = optionIds.length ? await LiftLeaseOption.find({ _id: { $in: optionIds } }) : [];
+  const byId = new Map(options.map((option) => [String(option._id), option]));
+  for (const operator of provider.operators) {
+    const optionId = operator.liftLease?.optionId && String(operator.liftLease.optionId);
+    if (optionId) {
+      const option = byId.get(optionId);
+      if (!option || String(option.divisionId) !== String(provider.divisionId)) {
+        throw badRequest(`${operator.name}: choose a lift lease option from this provider’s division.`);
+      }
+      operator.liftLease = {
+        optionId: option._id,
+        optionName: option.name,
+        amount: option.amount,
+        frequency: option.frequency,
+      };
+    } else if (defaultWhenUnset && division?.liftLease?.configured) {
+      operator.liftLease = {
+        optionId: null,
+        optionName: null,
+        amount: division.liftLease.amount,
+        frequency: division.liftLease.frequency,
+      };
+    }
+  }
 }
 
 function operatorInput(o, i) {
@@ -78,7 +114,7 @@ function applyOperators(provider, list) {
   provider.operators = [...operators, ...movedAway];
 }
 
-function applyCompassOperatorSettings(provider, list, { leaseManaged = false } = {}) {
+function applyCompassOperatorSettings(provider, list) {
   if (!Array.isArray(list)) throw badRequest('Operators must be a list.');
   const inputById = new Map(list.filter((operator) => operator?._id).map((operator) => [String(operator._id), operator]));
   provider.operators.forEach((operator, index) => {
@@ -93,7 +129,7 @@ function applyCompassOperatorSettings(provider, list, { leaseManaged = false } =
     }, index);
     operator.basePay = parsed.basePay;
     // Contracted hours for Compass operators are derived from active run-cut service hours.
-    if (!leaseManaged) operator.liftLease = parsed.liftLease;
+    operator.liftLease = parsed.liftLease;
     operator.planId = parsed.planId;
     operator.notes = parsed.notes;
   });
@@ -128,6 +164,7 @@ export async function applyInput(provider, body) {
       if (body.liftLease) provider.liftLease = leaseInput(body.liftLease, 'Lift lease');
     }
   }
+  await resolveLeaseOptions(provider);
   // An operator's own plan must be a plan of the provider's division; the same plan as the provider = none.
   const opPlans = [...new Set(provider.operators.map((o) => o.planId && String(o.planId)).filter(Boolean))];
   for (const planId of opPlans) {
@@ -192,7 +229,8 @@ async function withPayment(provider) {
 
 export async function list(req, res) {
   const filter = {};
-  if (req.query.divisionId) filter.divisionId = req.query.divisionId;
+  if (req.query.divisionIds) filter.divisionId = { $in: String(req.query.divisionIds).split(',').map((id) => id.trim()).filter(Boolean) };
+  else if (req.query.divisionId) filter.divisionId = req.query.divisionId;
   if (req.query.status) filter.status = req.query.status;
   if (req.query.planId) filter.planId = req.query.planId;
   if (req.query.search) {
@@ -228,7 +266,8 @@ export async function update(req, res) {
   if (p.source?.system === 'COMPASS') {
     const division = await Division.findById(p.divisionId);
     if (req.body.operators !== undefined) {
-      applyCompassOperatorSettings(p, req.body.operators, { leaseManaged: Boolean(division?.liftLease?.configured) });
+      applyCompassOperatorSettings(p, req.body.operators);
+      await resolveLeaseOptions(p, { division, defaultWhenUnset: true });
     }
     await applyInput(p, pick(req.body, ['providerNumber', 'serviceType', 'notes', 'planId', 'overrides', 'contact']));
   } else {

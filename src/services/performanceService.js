@@ -8,9 +8,10 @@ import { isoDate } from './cycleService.js';
 import { runsRouteOn } from './operators.js';
 import { bestRouteMatches, routeKey } from './routeMatching.js';
 import { badRequest, conflict, notFound, actor } from './errors.js';
+import { inferCycleFromDates } from './cycleInference.js';
 
 // Existing records predate `kind`, so STANDARD includes a missing kind value.
-export const activeImportFor = (cycleId) => PerformanceImport.findOne({ cycleId, status: 'ACTIVE', kind: { $ne: 'UBER' } });
+export const activeImportFor = (cycleId) => PerformanceImport.findOne({ cycleId, status: 'ACTIVE', kind: 'STANDARD' });
 
 /**
  * Route → provider association for an import.
@@ -106,40 +107,57 @@ async function markCycleVdpsStale(cycleId) {
   await Vdp.updateMany({ cycleId, status: { $in: ['DRAFT', 'NEEDS_REVIEW', 'READY'] } }, { $set: { stale: true } });
 }
 
-export async function importReport({ cycleId, file, replace = false, replaceReason, user }) {
+export async function importReport({ cycleId, divisionId, file, replace = false, replaceReason, user }) {
   if (!file) throw badRequest('Choose the Performance Report file to upload.');
-  const cycle = await VdpCycle.findById(cycleId);
-  if (!cycle) throw notFound('VDP cycle');
+  let cycle = cycleId ? await VdpCycle.findById(cycleId) : null;
+  if (cycleId && !cycle) throw notFound('VDP cycle');
+
+  let parsed;
+  if (!cycle) {
+    try {
+      parsed = await parsePerformanceFile(file.buffer, file.originalname);
+    } catch (err) {
+      if (err instanceof ReportFormatError) throw badRequest(err.message);
+      throw badRequest(`The file could not be read: ${err.message}`);
+    }
+    const range = parsed.reportRange || parsed.dataRange;
+    cycle = await inferCycleFromDates({
+      divisionId,
+      dates: range ? [range.from, range.to] : parsed.rows.map((row) => row.date),
+      label: 'Performance Report',
+    });
+  }
 
   const fileHash = crypto.createHash('sha256').update(file.buffer).digest('hex');
   const current = await activeImportFor(cycle._id);
 
-  const sameFile = await PerformanceImport.findOne({ cycleId: cycle._id, fileHash, status: 'ACTIVE', kind: { $ne: 'UBER' } });
+  const sameFile = await PerformanceImport.findOne({ cycleId: cycle._id, fileHash, status: 'ACTIVE', kind: 'STANDARD' });
   if (sameFile) {
     throw conflict(
       `This exact file (${sameFile.originalFileName}) is already loaded for this cycle. Nothing was imported.`,
-      { code: 'DUPLICATE_UPLOAD', importId: sameFile._id },
+      { code: 'DUPLICATE_UPLOAD', importId: sameFile._id, cycleId: cycle._id },
     );
   }
   if (current && !replace) {
     throw conflict(
       `A Performance Report (${current.originalFileName}) is already loaded for this cycle. Confirm replacement to load a corrected report.`,
-      { code: 'REPLACEMENT_REQUIRED', importId: current._id },
+      { code: 'REPLACEMENT_REQUIRED', importId: current._id, cycleId: cycle._id },
     );
   }
   if (current && replace && !String(replaceReason || '').trim()) {
     throw badRequest('Give a reason for replacing the loaded Performance Report.');
   }
 
-  let parsed;
-  try {
-    parsed = await parsePerformanceFile(file.buffer, file.originalname, {
-      from: isoDate(cycle.cycleStart),
-      to: isoDate(cycle.cycleEnd),
-    });
-  } catch (err) {
-    if (err instanceof ReportFormatError) throw badRequest(err.message);
-    throw badRequest(`The file could not be read: ${err.message}`);
+  if (!parsed) {
+    try {
+      parsed = await parsePerformanceFile(file.buffer, file.originalname, {
+        from: isoDate(cycle.cycleStart),
+        to: isoDate(cycle.cycleEnd),
+      });
+    } catch (err) {
+      if (err instanceof ReportFormatError) throw badRequest(err.message);
+      throw badRequest(`The file could not be read: ${err.message}`);
+    }
   }
   if (parsed.rows.length === 0) {
     const range = parsed.reportRange ? ` The report covers ${parsed.reportRange.from} to ${parsed.reportRange.to}.` : '';

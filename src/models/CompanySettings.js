@@ -1,6 +1,20 @@
 import mongoose from 'mongoose';
 import { jsonOptions } from './common.js';
 
+const processingGroupSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    divisionIds: {
+      type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Division' }],
+      validate: {
+        validator: (ids) => ids.length >= 2 && ids.length <= 3,
+        message: 'A processing group must contain two or three divisions.',
+      },
+    },
+  },
+  { _id: true },
+);
+
 // Company-wide settings (a single document). VDP cycles run on one schedule for every division.
 const companySettingsSchema = new mongoose.Schema(
   {
@@ -20,6 +34,7 @@ const companySettingsSchema = new mongoose.Schema(
       lastError: { type: String, default: null },
       lastSummary: { type: mongoose.Schema.Types.Mixed, default: null },
     },
+    processingGroups: { type: [processingGroupSchema], default: [] },
   },
   jsonOptions,
 );

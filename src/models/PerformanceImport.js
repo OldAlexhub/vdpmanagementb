@@ -75,11 +75,90 @@ const uberDriverMatchSchema = new Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
 );
 
+const uberTollRowSchema = new Schema(
+  {
+    week: { type: String, required: true },
+    endExclusive: { type: String, required: true },
+    driverUuid: { type: String, required: true, trim: true },
+    sourceFirstName: String,
+    sourceLastName: String,
+    amount: dec({ required: true }),
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
+// DIV 3 duty exports are reduced to the driver/day grain used by the source
+// workbook. This keeps the 40k+ row GoLink exports below MongoDB's document
+// limit while preserving every value needed to reproduce weekly results.
+const division3DutyRowSchema = new Schema(
+  {
+    service: { type: String, enum: ['ADA', 'GOLINK'], required: true },
+    date: { type: String, required: true },
+    driverName: { type: String, required: true },
+    dutyCount: { type: Number, required: true },
+    paidHours: dec({ required: true }),
+    attainmentHours: dec({ required: true }),
+    revenueHours: dec({ required: true }),
+    pauseHours: dec({ required: true }),
+    breakHours: dec({ required: true }),
+    scheduledStart: String,
+    scheduledEnd: String,
+    firstSeen: String,
+    lastSeen: String,
+    lateStart: { type: Boolean, default: false },
+    earlyEnd: { type: Boolean, default: false },
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
+const division3FareRowSchema = new Schema(
+  {
+    date: { type: String, required: true },
+    driverName: { type: String, required: true },
+    tripCount: { type: Number, required: true },
+    adultRiders: dec({ required: true }),
+    fareCost: dec({ required: true }),
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
+const division3ReturnedFareRowSchema = new Schema(
+  {
+    partnerName: { type: String, required: true },
+    driverName: { type: String, required: true },
+    date: { type: String, required: true },
+    fareToCollect: dec({ required: true }),
+    route1029: dec({ required: true }),
+    orangeCouponCount: dec({ required: true }),
+    greenCouponCount: dec({ required: true }),
+    orangeCoupon: dec({ required: true }),
+    greenCoupon: dec({ required: true }),
+    stripe: dec({ required: true }),
+    wallet: dec({ required: true }),
+    cashToDeduct: dec({ required: true }),
+    schemaComplete: { type: Boolean, default: false },
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
+const division3DriverMatchSchema = new Schema(
+  {
+    sourceName: { type: String, required: true },
+    providerId: { type: Schema.Types.ObjectId, ref: 'Provider', required: true },
+    operatorId: { type: String, required: true },
+    method: { type: String, enum: ['AUTO_EXACT_NAME', 'MANUAL'], required: true },
+    confidence: dec({ default: null }),
+    matchedBy: actorSchema,
+    matchedAt: { type: Date, default: Date.now },
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
 const importSchema = new Schema(
   {
     divisionId: { type: Schema.Types.ObjectId, ref: 'Division', required: true },
     cycleId: { type: Schema.Types.ObjectId, ref: 'VdpCycle', required: true },
-    kind: { type: String, enum: ['STANDARD', 'UBER'], default: 'STANDARD', index: true },
+    kind: { type: String, enum: ['STANDARD', 'UBER', 'UBER_TOLLS', 'DIV3_ADA', 'DIV3_GOLINK', 'DIV3_ADA_FARE', 'DIV3_RETURNED_FARE'], default: 'STANDARD', index: true },
     originalFileName: { type: String, required: true },
     fileHash: { type: String, required: true },
     fileSize: Number,
@@ -100,6 +179,12 @@ const importSchema = new Schema(
     rows: { type: [rowSchema], default: [] },
     uberRows: { type: [uberRowSchema], default: [] },
     uberDriverMatches: { type: [uberDriverMatchSchema], default: [] },
+    uberTollRows: { type: [uberTollRowSchema], default: [] },
+    division3DutyRows: { type: [division3DutyRowSchema], default: [] },
+    division3FareRows: { type: [division3FareRowSchema], default: [] },
+    division3ReturnedFareRows: { type: [division3ReturnedFareRowSchema], default: [] },
+    division3DriverMatches: { type: [division3DriverMatchSchema], default: [] },
+    datesDetected: { type: [String], default: [] },
     weeksDetected: { type: [String], default: [] },
     driversDetected: { type: Number, default: 0 },
     routeResolutions: { type: [routeResolutionSchema], default: [] },

@@ -130,6 +130,7 @@ const vdpSchema = new Schema(
     planVersionId: { type: Schema.Types.ObjectId, default: null },
     performanceImportId: { type: Schema.Types.ObjectId, ref: 'PerformanceImport', default: null },
     uberPerformanceImportIds: { type: [{ type: Schema.Types.ObjectId, ref: 'PerformanceImport' }], default: [] },
+    division3ImportIds: { type: [{ type: Schema.Types.ObjectId, ref: 'PerformanceImport' }], default: [] },
     status: { type: String, enum: VDP_STATUSES, default: 'DRAFT' },
 
     // Reviewer choices that are inputs, not results.

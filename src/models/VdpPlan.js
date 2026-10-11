@@ -41,6 +41,34 @@ const uberHourlyRateBandSchema = new Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
 );
 
+// A rate card is selected by weekly attainment, then every matching component
+// is applied to each supplied service line. This covers mixed hourly/trip/mile
+// contracts, weekend differentials, vehicle-specific pricing and distance bands.
+const rateComponentSchema = new Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    basis: { type: String, enum: ['HOURS', 'TRIPS', 'MILES', 'EXCESS_MILES'], required: true },
+    rate: dec({ required: true }),
+    serviceType: { type: String, trim: true, default: null },
+    vehicleType: { type: String, trim: true, default: null },
+    dayType: { type: String, enum: ['ANY', 'WEEKDAY', 'WEEKEND'], default: 'ANY' },
+    minimumDistance: dec({ default: null }),
+    maximumDistance: dec({ default: null }),
+    includedMiles: dec({ default: null }),
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
+const rateCardSchema = new Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    minimumPercentage: dec({ required: true }),
+    maximumPercentage: dec({ default: null }),
+    components: { type: [rateComponentSchema], default: [] },
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
 const uberConfigSchema = new Schema(
   {
     coreRatePct: dec({ default: null }),
@@ -48,6 +76,8 @@ const uberConfigSchema = new Schema(
     minimumFulfillmentForIncentives: dec({ default: null }),
     belowThresholdBehavior: { type: String, enum: ['FARES_ONLY', 'CORE_ONLY', null], default: null },
     rateStructureType: { type: String, enum: ['FLAT', 'HOURLY_BANDS', null], default: null },
+    rateStructureScope: { type: String, enum: ['PAY_UNIT', 'PROVIDER'], default: 'PAY_UNIT' },
+    rateBandOverflowBehavior: { type: String, enum: ['ERROR', 'FIRST_BAND'], default: 'ERROR' },
     hourlyRateBands: { type: [uberHourlyRateBandSchema], default: [] },
     contractHoursIncentiveTiers: { type: [uberMinimumTierSchema], default: [] },
     acceptanceIncentiveTiers: { type: [uberMinimumTierSchema], default: [] },
@@ -57,6 +87,8 @@ const uberConfigSchema = new Schema(
     utilizationIncentivePct: dec({ default: null }),
     coreHoursRuleType: { type: String, enum: ['PERCENTAGE', 'CONTINUOUS_COVERAGE', 'NONE', null], default: null },
     coreHoursRequirement: dec({ default: null }),
+    incentiveScope: { type: String, enum: ['PAY_UNIT', 'PROVIDER'], default: 'PAY_UNIT' },
+    coreHoursFailureBehavior: { type: String, enum: ['STATUS_ONLY', 'INELIGIBLE'], default: 'STATUS_ONLY' },
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
 );
@@ -70,21 +102,36 @@ const versionSchema = new Schema(
     effectiveTo: { type: Date, default: null },
     calculationType: { type: String, enum: ['STANDARD', 'UBER'], default: 'STANDARD' },
     paymentType: { type: String, enum: ['HOURLY', 'PER_TRIP'], required: true },
+    rateStructureType: { type: String, enum: ['SIMPLE', 'RATE_CARD'], default: 'SIMPLE' },
+    rateCards: { type: [rateCardSchema], default: [] },
     // Standard plans own base pay. Uber rates live on each operator profile.
     basePay: dec({ default: null }),
     contractedHours: dec({ default: null }),
+    contractedHoursMode: { type: String, enum: ['PLAN_DEFAULT', 'OPERATOR_PROFILE'], default: 'PLAN_DEFAULT' },
     incentiveEnabled: { type: Boolean, default: false }, // TUI eligibility for everyone on the plan
     incentiveTiers: { type: [tierSchema], default: [] },
     bonusEnabled: { type: Boolean, default: false },
     bonusRate: dec({ default: null }),
+    bonusBasis: { type: String, enum: ['HOURS_ABOVE_CONTRACT', 'SIXTH_DAY_TRIPS'], default: 'HOURS_ABOVE_CONTRACT' },
+    bonusQualificationMetric: { type: String, enum: ['PAID_HOURS', 'ATTAINMENT_HOURS'], default: 'PAID_HOURS' },
+    bonusQualificationPercentage: dec({ default: 100 }),
+    contractedDays: dec({ default: null }),
+    bonusRequiresContractedDays: { type: Boolean, default: false },
+    standbyGuaranteeEnabled: { type: Boolean, default: false },
+    standbyRate: dec({ default: null }), // null = the selected weekly rate
     // Fuel arrangement. NONE; PER_TRIP = trips × rate added after Gross; SERVICE_MILE_ALLOWANCE =
     // each day's service miles ÷ MPG (fuelMpg, e.g. 19) × that day's fuel price (plan.fuelPrices) is the
     // most fuel may cost, and only the actual expense above it is deducted. Versions saved before
     // fuelMethod existed: see fuelMethodOf().
-    fuelMethod: { type: String, enum: ['NONE', 'PER_TRIP', 'SERVICE_MILE_ALLOWANCE', null], default: null },
+    fuelMethod: {
+      type: String,
+      enum: ['NONE', 'PER_TRIP', 'SERVICE_MILE_ALLOWANCE', 'ACTUAL_EXPENSE_REIMBURSEMENT', 'PRICE_THRESHOLD_SURCHARGE', null],
+      default: null,
+    },
     fuelReimbursementEnabled: { type: Boolean, default: false }, // = fuelMethod PER_TRIP
     fuelReimbursementRate: dec({ default: null }), // $ per trip
     fuelMpg: dec({ default: null }), // miles per gallon for SERVICE_MILE_ALLOWANCE
+    fuelPriceThreshold: dec({ default: null }),
     fuelMileageSource: { type: String, enum: ['SERVICE_MILES'], default: 'SERVICE_MILES' },
     performanceHourMetric: {
       type: String,
@@ -92,6 +139,13 @@ const versionSchema = new Schema(
       default: 'TOTAL_HOURS',
     },
     performanceHourColumn: { type: String, default: null }, // only for OTHER
+    attainmentHourMetric: {
+      type: String,
+      enum: ['SAME_AS_PAID', 'TOTAL_HOURS', 'SERVICE_HOURS', 'REVENUE_HOURS', 'OTHER'],
+      default: 'SAME_AS_PAID',
+    },
+    attainmentHourColumn: { type: String, default: null }, // only for OTHER
+    attainmentScope: { type: String, enum: ['OPERATOR', 'PROVIDER'], default: 'OPERATOR' },
     uberConfig: { type: uberConfigSchema, default: undefined },
     notes: String,
     createdBy: actorSchema,

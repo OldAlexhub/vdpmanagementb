@@ -291,22 +291,78 @@ describe('configuration-driven Uber division rules', () => {
     assert.equal(Number(row.coreCompensation) / 50, 22.8);
   });
 
-  test('DIV 2 hourly bands price 70 hours at $31.45 and the next 20 at $0', () => {
+  test('DIV 2 hourly bands price 70 hours at $31.45 and the next 20 at $41.40', () => {
     const settings = {
       ...SETTINGS,
       contractedWeeklyHours: '90',
       rateStructureType: 'HOURLY_BANDS',
       hourlyRateBands: [
         { fromHour: '0', toHour: '70', hourlyRate: '31.45' },
-        { fromHour: '70', toHour: '90', hourlyRate: '0' },
+        { fromHour: '70', toHour: '90', hourlyRate: '41.40' },
       ],
     };
     const row = run(baseRow({ totalSupplyHours: '90', pausedHours: '0' }), { settings }).uberRows[0];
-    assert.equal(row.baseCompensation, '2201.50');
+    assert.equal(row.baseCompensation, '3029.50');
     assert.deepEqual(row.baseCompensationBreakdown, [
       { fromHour: '0', toHour: '70', hours: '70', hourlyRate: '31.45', amount: '2201.50' },
-      { fromHour: '70', toHour: '90', hours: '20', hourlyRate: '0.00', amount: '0.00' },
+      { fromHour: '70', toHour: '90', hours: '20', hourlyRate: '41.40', amount: '828.00' },
     ]);
+  });
+
+  test('DIV 2 provider bands scale by pay units and price overflow at the normal rate', () => {
+    const settings = {
+      ...SETTINGS,
+      contractedWeeklyHours: '110',
+      rateStructureType: 'HOURLY_BANDS',
+      rateStructureScope: 'PROVIDER',
+      rateBandUnitCount: '1',
+      rateBandOverflowBehavior: 'FIRST_BAND',
+      hourlyRateBands: [
+        { fromHour: '0', toHour: '70', hourlyRate: '31.45' },
+        { fromHour: '70', toHour: '90', hourlyRate: '41.40' },
+      ],
+    };
+    const row = run(baseRow({ totalSupplyHours: '110', pausedHours: '0' }), { settings }).uberRows[0];
+    assert.equal(row.baseCompensation, '3658.50');
+    assert.deepEqual(row.baseCompensationBreakdown, [
+      { fromHour: '0', toHour: '70', hours: '70', hourlyRate: '31.45', amount: '2201.50' },
+      { fromHour: '70', toHour: '90', hours: '20', hourlyRate: '41.40', amount: '828.00' },
+      { fromHour: '90', toHour: '110', hours: '20', hourlyRate: '31.45', amount: '629.00', overflow: true },
+    ]);
+  });
+
+  test('DIV 2 Q-Tell week 1 reconciles to the updated workbook at payment precision', () => {
+    const settings = {
+      ...SETTINGS,
+      contractedWeeklyHours: '200',
+      rateStructureType: 'HOURLY_BANDS',
+      rateStructureScope: 'PROVIDER',
+      rateBandUnitCount: '2',
+      rateBandOverflowBehavior: 'FIRST_BAND',
+      hourlyRateBands: [
+        { fromHour: '0', toHour: '70', hourlyRate: '31.50' },
+        { fromHour: '70', toHour: '90', hourlyRate: '41.50' },
+      ],
+      incentiveScope: 'PROVIDER',
+    };
+    const result = run(baseRow({
+      totalSupplyHours: '199.39', pausedHours: '2.18', coreHoursTotalSupplyHours: '78.72', utilizedHours: '151.64',
+      totalAccepts: '217', totalRejects: '3', totalExpiredOffers: '2', totalCancels: '8',
+      driverEarningsExclTips: '3617.10', driverTips: '187.40',
+    }), {
+      settings,
+      weeklyAdjustments: [{
+        driverUuid: '68f0b1e8-da78-4d64-b477-0f1b68333483', week: '2026-09-07',
+        passThroughs: [{ type: 'TOLL', amount: '26.75', description: 'Uber toll reimbursement' }],
+      }],
+    });
+    const row = result.uberRows[0];
+    assert.equal(row.payableHours, '197.21');
+    assert.equal(row.baseCompensation, '6612.12');
+    assert.equal(row.hourIncentivePct, '0.2');
+    assert.equal(row.acceptanceCancellationPct, '0.1');
+    assert.equal(row.utilizationIncentivePct, '0.05');
+    assert.equal(row.grossVdp, '6826.27');
   });
 
   test('legacy Uber settings get safe DIV 12 defaults and flat-rate behavior', () => {

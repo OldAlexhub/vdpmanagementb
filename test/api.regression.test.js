@@ -219,6 +219,7 @@ test('DIV 10 end-to-end regression — RIMO / route 918 / 08/24–09/06/2026', {
     r = await call('PUT', `/vdp-plans/${plan._id}/versions/${version._id}`, { ...version, basePay: '30' });
     assert.equal(r.status, 409, 'approved VDP locks its plan version');
     r = await call('POST', `/vdp-plans/${plan._id}/versions`, { ...version, effectiveFrom: '2027-01-01', basePay: '26.50',
+      attainmentHourMetric: 'OTHER', attainmentHourColumn: 'Incentive Hours',
       incentiveTiers: version.incentiveTiers.map((t2, i) => ({ ...t2, rate: i === 0 ? '26.50' : t2.rate })) });
     assert.equal(r.status, 201, JSON.stringify(r.data));
 

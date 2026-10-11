@@ -7,9 +7,22 @@ import { toDateOnly } from '../services/cycleService.js';
 import { D } from '../services/money.js';
 import { badRequest, conflict, notFound, actor } from '../services/errors.js';
 import { decimalInput } from './validate.js';
+import { planTemplates } from '../services/planTemplates.js';
+
+export function templates(req, res) {
+  res.json(planTemplates());
+}
 
 export function versionInput(body) {
   const calculationType = body.calculationType || 'STANDARD';
+  const rateStructureType = body.rateStructureType || 'SIMPLE';
+  const incentiveEnabled = calculationType === 'STANDARD' && Boolean(body.incentiveEnabled);
+  const attainmentHourMetric = incentiveEnabled
+    ? (body.attainmentHourMetric || 'OTHER')
+    : (body.attainmentHourMetric || 'SAME_AS_PAID');
+  if (incentiveEnabled && attainmentHourMetric !== 'OTHER') {
+    throw badRequest('TUI fulfillment must use an uploaded column containing only hours worked inside the Compass start/end window. Paid, total, service, or revenue hours cannot activate TUI tiers.');
+  }
   const tiers = (body.incentiveTiers || [])
     .map((t, i) => ({
       minimumPercentage: decimalInput(t.minimumPercentage, `Tier ${i + 1} minimum %`, { required: true }),
@@ -33,25 +46,61 @@ export function versionInput(body) {
       rate: decimalInput(t.rate, `${label} tier ${i + 1} rate`, { required: true, maxDp: 8 }),
     }))
     .sort((a, b) => D(a.maximum).cmp(D(b.maximum)));
+  const rateCards = (body.rateCards || []).map((card, cardIndex) => ({
+    name: String(card.name || '').trim(),
+    minimumPercentage: decimalInput(card.minimumPercentage, `Rate card ${cardIndex + 1} minimum %`, { required: true }),
+    maximumPercentage: decimalInput(card.maximumPercentage, `Rate card ${cardIndex + 1} maximum %`),
+    components: (card.components || []).map((component, componentIndex) => ({
+      name: String(component.name || '').trim(),
+      basis: component.basis,
+      rate: decimalInput(component.rate, `Rate card ${cardIndex + 1}, component ${componentIndex + 1} rate`, { required: true }),
+      serviceType: String(component.serviceType || '').trim() || null,
+      vehicleType: String(component.vehicleType || '').trim() || null,
+      dayType: component.dayType || 'ANY',
+      minimumDistance: decimalInput(component.minimumDistance, `Rate card ${cardIndex + 1}, component ${componentIndex + 1} minimum distance`),
+      maximumDistance: decimalInput(component.maximumDistance, `Rate card ${cardIndex + 1}, component ${componentIndex + 1} maximum distance`),
+      includedMiles: decimalInput(component.includedMiles, `Rate card ${cardIndex + 1}, component ${componentIndex + 1} included miles`),
+    })),
+  })).sort((a, b) => D(a.minimumPercentage).cmp(D(b.minimumPercentage)));
   const v = {
     calculationType,
     paymentType: calculationType === 'UBER' ? 'HOURLY' : body.paymentType,
+    rateStructureType: calculationType === 'UBER' ? 'SIMPLE' : rateStructureType,
+    rateCards: calculationType === 'STANDARD' && rateStructureType === 'RATE_CARD' ? rateCards : [],
     // Uber rates and hours are operator profile data, not plan-version data.
-    basePay: calculationType === 'UBER' ? null : decimalInput(body.basePay, 'Base pay', { required: true }),
+    basePay: calculationType === 'UBER' || rateStructureType === 'RATE_CARD'
+      ? null
+      : decimalInput(body.basePay, 'Base pay', { required: true }),
     // Uber contract hours belong to each operator on the provider profile. They
     // are deliberately not stored as a plan rule or used as a fallback.
     contractedHours: calculationType === 'UBER' ? null : decimalInput(body.contractedHours, 'Contracted hours'),
-    incentiveEnabled: calculationType === 'UBER' ? false : Boolean(body.incentiveEnabled),
+    contractedHoursMode: calculationType === 'UBER' ? 'OPERATOR_PROFILE' : body.contractedHoursMode || 'PLAN_DEFAULT',
+    incentiveEnabled,
     incentiveTiers: calculationType === 'UBER' ? [] : tiers,
     bonusEnabled: calculationType === 'UBER' ? false : Boolean(body.bonusEnabled),
     bonusRate: calculationType === 'UBER' ? null : decimalInput(body.bonusRate, 'Bonus rate'),
+    bonusBasis: body.bonusBasis || 'HOURS_ABOVE_CONTRACT',
+    bonusQualificationMetric: body.bonusQualificationMetric || 'PAID_HOURS',
+    bonusQualificationPercentage: decimalInput(body.bonusQualificationPercentage ?? '100', 'Bonus qualification percentage'),
+    contractedDays: decimalInput(body.contractedDays, 'Contracted days'),
+    bonusRequiresContractedDays: Boolean(body.bonusRequiresContractedDays),
+    standbyGuaranteeEnabled: calculationType === 'STANDARD' && Boolean(body.standbyGuaranteeEnabled),
+    standbyRate: calculationType === 'STANDARD' ? decimalInput(body.standbyRate, 'Standby rate') : null,
     fuelMethod: calculationType === 'UBER' ? 'NONE' : fuelMethod,
     fuelReimbursementEnabled: calculationType === 'STANDARD' && fuelMethod === 'PER_TRIP',
     fuelReimbursementRate: calculationType === 'STANDARD' && fuelMethod === 'PER_TRIP' ? decimalInput(body.fuelReimbursementRate, 'Fuel reimbursement rate') : null,
-    fuelMpg: calculationType === 'STANDARD' && fuelMethod === 'SERVICE_MILE_ALLOWANCE' ? decimalInput(body.fuelMpg, 'Fuel efficiency (MPG)') : null,
+    fuelMpg: calculationType === 'STANDARD' && ['SERVICE_MILE_ALLOWANCE', 'PRICE_THRESHOLD_SURCHARGE'].includes(fuelMethod)
+      ? decimalInput(body.fuelMpg, 'Fuel efficiency (MPG)') : null,
+    fuelPriceThreshold: calculationType === 'STANDARD' && fuelMethod === 'PRICE_THRESHOLD_SURCHARGE'
+      ? decimalInput(body.fuelPriceThreshold, 'Fuel price threshold') : null,
     fuelMileageSource: 'SERVICE_MILES',
     performanceHourMetric: body.performanceHourMetric || 'TOTAL_HOURS',
     performanceHourColumn: body.performanceHourMetric === 'OTHER' ? body.performanceHourColumn : null,
+    attainmentHourMetric,
+    attainmentHourColumn: attainmentHourMetric === 'OTHER'
+      ? (String(body.attainmentHourColumn || '').trim() || (incentiveEnabled ? 'Incentive Hours' : null))
+      : null,
+    attainmentScope: body.attainmentScope || 'OPERATOR',
     uberConfig: uberSource
       ? {
           coreRatePct: decimalInput(uberSource.coreRatePct, 'Uber core rate percentage', { required: true, maxDp: 8 }),
@@ -59,6 +108,8 @@ export function versionInput(body) {
           minimumFulfillmentForIncentives: decimalInput(uberSource.minimumFulfillmentForIncentives, 'Uber minimum fulfillment for incentives', { required: true, maxDp: 8 }),
           belowThresholdBehavior: uberSource.belowThresholdBehavior || 'FARES_ONLY',
           rateStructureType: uberRateStructureType,
+          rateStructureScope: uberSource.rateStructureScope || 'PAY_UNIT',
+          rateBandOverflowBehavior: uberSource.rateBandOverflowBehavior || 'ERROR',
           // A client can retain band rows while the flat-rate option is selected.
           // They are inactive configuration and must not block or leak into the saved version.
           hourlyRateBands: uberRateStructureType === 'HOURLY_BANDS'
@@ -78,6 +129,8 @@ export function versionInput(body) {
           utilizationIncentivePct: decimalInput(uberSource.utilizationIncentivePct, 'Uber utilization incentive percentage', { required: uberSource.utilizationEnabled !== false, maxDp: 8 }),
           coreHoursRuleType: uberSource.coreHoursRuleType || 'PERCENTAGE',
           coreHoursRequirement: decimalInput(uberSource.coreHoursRequirement, 'Uber core-hours requirement', { required: (uberSource.coreHoursRuleType || 'PERCENTAGE') === 'PERCENTAGE', maxDp: 8 }),
+          incentiveScope: uberSource.incentiveScope || 'PAY_UNIT',
+          coreHoursFailureBehavior: uberSource.coreHoursFailureBehavior || 'STATUS_ONLY',
         }
       : undefined,
     effectiveFrom: body.effectiveFrom ? toDateOnly(body.effectiveFrom) : null,

@@ -8,6 +8,8 @@ import { activeOperators } from './operators.js';
 import { isoDate } from './cycleService.js';
 import { actor, badRequest, conflict, notFound } from './errors.js';
 import { suggestOperator } from './uberDriverMatching.js';
+import { inferCycleFromDates } from './cycleInference.js';
+import { processingDivisionIdsForCycle } from './divisionGroups.js';
 
 export const activeUberImportsFor = (cycleId) => PerformanceImport.find({
   cycleId,
@@ -18,6 +20,8 @@ export const activeUberImportsFor = (cycleId) => PerformanceImport.find({
 
 const importSummary = (doc) => ({
   _id: doc._id,
+  divisionId: doc.divisionId,
+  cycleId: doc.cycleId,
   fileName: doc.originalFileName,
   fileSize: doc.fileSize,
   uploadedAt: doc.uploadedAt,
@@ -89,13 +93,28 @@ function automaticNameMatches(rows, candidates, reservedOperators = new Map()) {
   return matches;
 }
 
-export async function uploadUberFiles({ cycleId, files, user }) {
+export async function uploadUberFiles({ cycleId, divisionId, files, user }) {
   if (!files?.length) throw badRequest('Choose at least one Uber .xlsx, .xls, or .csv file.');
-  const cycle = await VdpCycle.findById(cycleId);
-  if (!cycle) throw notFound('VDP cycle');
+  let cycle = cycleId ? await VdpCycle.findById(cycleId) : null;
+  if (cycleId && !cycle) throw notFound('VDP cycle');
+  const preparsed = new Map();
+  if (!cycle) {
+    for (const file of files) {
+      try {
+        preparsed.set(file, await parseUberPerformanceFile(file.buffer, file.originalname));
+      } catch (error) {
+        throw badRequest(`The pay period could not be identified from ${file.originalname}: ${error.message}`);
+      }
+    }
+    cycle = await inferCycleFromDates({
+      divisionId,
+      dates: [...preparsed.values()].flatMap((parsed) => parsed.weeksDetected),
+      label: 'Uber dataset',
+    });
+  }
   const [existing, providers] = await Promise.all([
     activeUberImportsFor(cycle._id),
-    Provider.find({ divisionId: cycle.divisionId }),
+    processingDivisionIdsForCycle(cycle).then(({ divisionIds }) => Provider.find({ divisionId: { $in: divisionIds } })),
   ]);
   const existingHashes = new Set(existing.map((doc) => doc.fileHash));
   const candidates = operatorCandidates(providers, cycle);
@@ -117,7 +136,7 @@ export async function uploadUberFiles({ cycleId, files, user }) {
       details = { code: 'DUPLICATE_UPLOAD' };
     } else {
       try {
-        parsed = await parseUberPerformanceFile(file.buffer, file.originalname);
+        parsed = preparsed.get(file) || await parseUberPerformanceFile(file.buffer, file.originalname);
         const outside = parsed.weeksDetected.filter((week) => week < isoDate(cycle.cycleStart) || week > isoDate(cycle.cycleEnd));
         if (outside.length) errors.push(`Week${outside.length === 1 ? '' : 's'} outside this VDP cycle: ${outside.join(', ')}.`);
         const overlaps = parsed.rows
@@ -312,8 +331,9 @@ export async function assignUberDriver({ cycleId, driverUuid, providerId, operat
   if (!imports.some((doc) => doc.uberRows.some((row) => row.driverUuid.toLowerCase() === normalized))) {
     throw badRequest('This driver UUID is not in the active Uber uploads.');
   }
-  const provider = await Provider.findOne({ _id: providerId, divisionId: cycle.divisionId });
-  if (!provider) throw badRequest('Choose a provider in this division.');
+  const { divisionIds } = await processingDivisionIdsForCycle(cycle);
+  const provider = await Provider.findOne({ _id: providerId, divisionId: { $in: divisionIds } });
+  if (!provider) throw badRequest('Choose a provider in this processing group.');
   const operator = activeOperators(provider, cycle).find((item) => item.id === String(operatorId));
   if (!operator) throw badRequest('Choose a valid active operator.');
   const targetKey = operatorKey(provider._id, operator.id);

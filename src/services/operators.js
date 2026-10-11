@@ -20,7 +20,12 @@ export function operatorsOf(provider) {
       vehicleUnit: o.vehicleUnit || null,
       basePay: str(o.basePay),
       contractedHours: str(o.contractedHours),
-      liftLease: { amount: str(o.liftLease?.amount), frequency: o.liftLease?.frequency || 'NONE' },
+      liftLease: {
+        amount: str(o.liftLease?.amount),
+        frequency: o.liftLease?.frequency || 'NONE',
+        optionId: o.liftLease?.optionId ? String(o.liftLease.optionId) : null,
+        optionName: o.liftLease?.optionName || null,
+      },
       planId: o.planId ? String(o.planId) : null,
       notes: o.notes || '',
       startDate: o.startDate || null,
@@ -28,6 +33,18 @@ export function operatorsOf(provider) {
       transferredFrom: transferOf(o.transferredFrom),
       transferredTo: transferOf(o.transferredTo),
       employeeId: o.employeeId || null,
+      tuiWindows: (o.tuiWindows || []).map((window) => ({
+        externalRunCutId: window.externalRunCutId || null,
+        route: window.route || null,
+        daysOfWeek: [...(window.daysOfWeek || [])],
+        startTime: window.startTime || null,
+        endTime: window.endTime || null,
+        weekdayTimes: (window.weekdayTimes || []).map((entry) => ({
+          day: entry.day,
+          startTime: entry.startTime,
+          endTime: entry.endTime,
+        })),
+      })),
       source: o.source ? {
         system: o.source.system || 'MANUAL',
         externalId: o.source.externalId || null,
@@ -44,7 +61,12 @@ export function operatorsOf(provider) {
     vehicleUnit: null,
     basePay: null,
     contractedHours: null,
-    liftLease: { amount: str(provider.liftLease?.amount), frequency: provider.liftLease?.frequency || 'NONE' },
+    liftLease: {
+      amount: str(provider.liftLease?.amount),
+      frequency: provider.liftLease?.frequency || 'NONE',
+      optionId: provider.liftLease?.optionId ? String(provider.liftLease.optionId) : null,
+      optionName: provider.liftLease?.optionName || null,
+    },
     planId: null,
     notes: '',
     startDate: null,
@@ -52,6 +74,7 @@ export function operatorsOf(provider) {
     transferredFrom: null,
     transferredTo: null,
     employeeId: null,
+    tuiWindows: [],
     source: { system: 'MANUAL', externalId: null, lastSyncedAt: null },
   }];
 }

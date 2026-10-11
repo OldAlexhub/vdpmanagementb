@@ -33,8 +33,12 @@ function normalizeSettings(settings = {}) {
     belowThresholdBehavior: settings.belowThresholdBehavior || 'FARES_ONLY',
     utilizationEnabled: settings.utilizationEnabled ?? true,
     rateStructureType: settings.rateStructureType || 'FLAT',
+    rateStructureScope: settings.rateStructureScope || 'PAY_UNIT',
+    rateBandOverflowBehavior: settings.rateBandOverflowBehavior || 'ERROR',
     hourlyRateBands: settings.hourlyRateBands || [],
     coreHoursRuleType: settings.coreHoursRuleType || 'PERCENTAGE',
+    incentiveScope: settings.incentiveScope || 'PAY_UNIT',
+    coreHoursFailureBehavior: settings.coreHoursFailureBehavior || 'STATUS_ONLY',
   };
 }
 
@@ -49,24 +53,37 @@ export function calculateBaseCompensation(payableHours, settings) {
       }],
     };
   }
+  const bandUnits = settings.rateStructureScope === 'PROVIDER' ? D(settings.rateBandUnitCount || 1) : D(1);
   const breakdown = settings.hourlyRateBands.map((band) => {
-    const fromHour = D(band.fromHour);
-    const toHour = D(band.toHour);
+    const fromHour = D(band.fromHour).times(bandUnits);
+    const toHour = D(band.toHour).times(bandUnits);
     const available = min(hours, toHour).minus(fromHour);
     const bandHours = available.gt(0) ? available : D(0);
     return {
-      fromHour,
-      toHour,
+      fromHour: D(band.fromHour),
+      toHour: D(band.toHour),
       hours: bandHours,
       hourlyRate: D(band.hourlyRate),
       amount: cents(bandHours.times(band.hourlyRate)),
     };
   });
   const coveredThrough = settings.hourlyRateBands.length
-    ? D(settings.hourlyRateBands.at(-1).toHour)
+    ? D(settings.hourlyRateBands.at(-1).toHour).times(bandUnits)
     : D(0);
   if (hours.gt(coveredThrough)) {
-    throw new UberCalculationError(`Uber hourly rate bands cover ${fmtNum(coveredThrough)} hours, but ${fmtNum(hours)} payable hours were calculated.`);
+    if (settings.rateBandOverflowBehavior !== 'FIRST_BAND' || !settings.hourlyRateBands.length) {
+      throw new UberCalculationError(`Uber hourly rate bands cover ${fmtNum(coveredThrough)} hours, but ${fmtNum(hours)} payable hours were calculated.`);
+    }
+    const overflowHours = hours.minus(coveredThrough);
+    const hourlyRate = D(settings.hourlyRateBands[0].hourlyRate);
+    breakdown.push({
+      fromHour: coveredThrough,
+      toHour: hours,
+      hours: overflowHours,
+      hourlyRate,
+      amount: cents(overflowHours.times(hourlyRate)),
+      overflow: true,
+    });
   }
   return { amount: cents(sum(breakdown.map((band) => band.amount))), breakdown };
 }
@@ -161,7 +178,8 @@ function groupCalculationRows(rows) {
     const sourceFiles = [...new Set(group.rows.map((row) => row.sourceFileName).filter(Boolean))];
     const operatorHours = new Map();
     group.rows.forEach((row) => operatorHours.set(row.operatorId || row.driverUuid, row.settings?.contractedWeeklyHours));
-    const contractedWeeklyHours = first.vehicleUnit && operatorHours.size > 1
+    const combinedContract = (first.vehicleUnit || first.combineContractedHours) && operatorHours.size > 1;
+    const contractedWeeklyHours = combinedContract
       ? str(sum([...operatorHours.values()].map((value) => D(value))))
       : first.settings?.contractedWeeklyHours;
     return {
@@ -169,7 +187,7 @@ function groupCalculationRows(rows) {
       settings: first.settings ? {
         ...first.settings,
         contractedWeeklyHours,
-        contractedWeeklyHoursSource: first.vehicleUnit && operatorHours.size > 1 ? 'OPERATOR_PROFILE_SUM' : first.settings.contractedWeeklyHoursSource,
+        contractedWeeklyHoursSource: combinedContract ? 'OPERATOR_PROFILE_SUM' : first.settings.contractedWeeklyHoursSource,
       } : undefined,
       calculationUnitId: group.unitId,
       calculationUnitLabel: first.calculationUnitLabel || first.vehicleUnit || operatorNames.join(' + ') || group.unitId,
@@ -189,10 +207,51 @@ function groupCalculationRows(rows) {
   });
 }
 
+function providerIncentiveScopes(rows, planSettings) {
+  const groups = new Map();
+  rows.forEach((row) => {
+    const settings = normalizeSettings({ ...planSettings, ...(row.settings || {}) });
+    if (settings.incentiveScope !== 'PROVIDER') return;
+    const groupId = row.incentiveGroup || 'provider-plan';
+    const key = `${row.week}|${groupId}`;
+    const group = groups.get(key) || { key, rows: [] };
+    group.rows.push({ row, settings });
+    groups.set(key, group);
+  });
+  const byRow = new Map();
+  for (const group of groups.values()) {
+    const value = {
+      key: group.key,
+      contractedHours: sum(group.rows.map(({ settings }) => D(settings.contractedWeeklyHours))),
+      qualifyingSupplyHours: sum(group.rows.map(({ row }) => D(row.totalSupplyHours).minus(row.pausedHours))),
+      accepts: sum(group.rows.map(({ row }) => D(row.totalAccepts))),
+      rejects: sum(group.rows.map(({ row }) => D(row.totalRejects))),
+      expiredOffers: sum(group.rows.map(({ row }) => D(row.totalExpiredOffers))),
+      cancels: sum(group.rows.map(({ row }) => D(row.totalCancels))),
+      utilizedHours: group.rows.some(({ row }) => missing(row.utilizedHours))
+        ? null : sum(group.rows.map(({ row }) => D(row.utilizedHours))),
+      coreHours: group.rows.some(({ row }) => missing(row.coreHoursTotalSupplyHours))
+        ? null : sum(group.rows.map(({ row }) => D(row.coreHoursTotalSupplyHours))),
+      coreHoursCoveragePassed: group.rows.every(({ row }) => typeof row.coreHoursCoveragePassed === 'boolean')
+        ? group.rows.every(({ row }) => row.coreHoursCoveragePassed) : null,
+    };
+    group.rows.forEach(({ row }) => byRow.set(keyOf(row.calculationUnitId, row.week), value));
+  }
+  return byRow;
+}
+
 function adjustmentFor(row, adjustments) {
   const direct = adjustments.get(keyOf(row.calculationUnitId, row.week));
-  if (direct) return direct;
   const legacy = (row.driverUuids || []).map((driverUuid) => adjustments.get(keyOf(driverUuid, row.week))).filter(Boolean);
+  if (direct) {
+    return {
+      ...direct,
+      passThroughs: [
+        ...(direct.passThroughs || []),
+        ...legacy.flatMap((entry) => entry.passThroughs || []),
+      ],
+    };
+  }
   if (!legacy.length) return {};
   const extras = [...new Set(legacy.map((entry) => entry.approvedExtraHours).filter((value) => value !== null && value !== undefined && value !== ''))];
   if (extras.length > 1) throw new UberCalculationError(`Shared vehicle ${row.calculationUnitLabel} has conflicting approved extra hours for ${row.week}. Enter one vehicle/week adjustment.`);
@@ -209,7 +268,11 @@ function validatePlanSettings(settings) {
   if (!settings.cancellationIncentiveTiers?.length) throw new UberCalculationError('Uber cancellation incentive tiers are missing.');
   if (!['FARES_ONLY', 'CORE_ONLY'].includes(settings.belowThresholdBehavior)) throw new UberCalculationError('Uber below-threshold behavior is invalid.');
   if (!['FLAT', 'HOURLY_BANDS'].includes(settings.rateStructureType)) throw new UberCalculationError('Uber rate structure is invalid.');
+  if (!['PAY_UNIT', 'PROVIDER'].includes(settings.rateStructureScope)) throw new UberCalculationError('Uber rate-structure scope is invalid.');
+  if (!['ERROR', 'FIRST_BAND'].includes(settings.rateBandOverflowBehavior)) throw new UberCalculationError('Uber hourly-band overflow behavior is invalid.');
   if (!['PERCENTAGE', 'CONTINUOUS_COVERAGE', 'NONE'].includes(settings.coreHoursRuleType)) throw new UberCalculationError('Uber core-hours rule is invalid.');
+  if (!['PAY_UNIT', 'PROVIDER'].includes(settings.incentiveScope)) throw new UberCalculationError('Uber incentive scope is invalid.');
+  if (!['STATUS_ONLY', 'INELIGIBLE'].includes(settings.coreHoursFailureBehavior)) throw new UberCalculationError('Uber core-hours failure behavior is invalid.');
   if (D(settings.minimumFulfillmentForIncentives).lt(0)) throw new UberCalculationError('Uber minimum fulfillment for incentives cannot be negative.');
   if (settings.rateStructureType === 'HOURLY_BANDS') {
     if (!settings.hourlyRateBands.length) throw new UberCalculationError('Uber hourly rate bands are missing.');
@@ -235,7 +298,7 @@ function validateSettings(settings) {
   }
 }
 
-function calculateRow(settings, row, adjustment = {}) {
+function calculateRow(settings, row, adjustment = {}, scope = null) {
   settings = normalizeSettings({ ...settings, ...(row.settings || {}) });
   validateSettings(settings);
   const totalSupplyHours = D(row.totalSupplyHours);
@@ -250,18 +313,19 @@ function calculateRow(settings, row, adjustment = {}) {
   if (approvedExtraHours.lt(0)) throw new UberCalculationError('Approved extra hours cannot be negative.');
 
   const qualifyingSupplyHours = totalSupplyHours.minus(pausedHours);
-  const fulfillment = qualifyingSupplyHours.div(contractedHours);
+  const metricContractedHours = scope?.contractedHours ?? contractedHours;
+  const metricQualifyingSupplyHours = scope?.qualifyingSupplyHours ?? qualifyingSupplyHours;
+  const fulfillment = metricQualifyingSupplyHours.div(metricContractedHours);
   const payableHours = min(qualifyingSupplyHours, contractedHours.plus(approvedExtraHours));
   const hourTier = determineFulfillmentTier(fulfillment, settings.contractHoursIncentiveTiers);
   const qualificationThreshold = D(settings.minimumFulfillmentForIncentives);
-  const qualifiedForIncentives = fulfillment.gte(qualificationThreshold);
+  const qualifiedByFulfillment = fulfillment.gte(qualificationThreshold);
   const candidateHourIncentivePct = D(hourTier?.rate || 0);
-  const hourIncentivePct = qualifiedForIncentives ? candidateHourIncentivePct : D(0);
 
-  const accepts = D(row.totalAccepts);
-  const rejects = D(row.totalRejects);
-  const expiredOffers = D(row.totalExpiredOffers);
-  const cancels = D(row.totalCancels);
+  const accepts = D(scope?.accepts ?? row.totalAccepts);
+  const rejects = D(scope?.rejects ?? row.totalRejects);
+  const expiredOffers = D(scope?.expiredOffers ?? row.totalExpiredOffers);
+  const cancels = D(scope?.cancels ?? row.totalCancels);
   if ([accepts, rejects, expiredOffers, cancels].some((value) => value.lt(0))) {
     throw new UberCalculationError(`${row.driverUuid} (${row.week}) has a negative offer/cancellation count.`);
   }
@@ -269,28 +333,38 @@ function calculateRow(settings, row, adjustment = {}) {
   const acceptanceRate = totalOffers.gt(0) ? accepts.div(totalOffers) : D(0);
   const cancellationRate = accepts.gt(0) ? cancels.div(accepts) : D(0);
   const performanceTier = determineAcceptanceCancellationTier(acceptanceRate, cancellationRate, accepts, settings);
-  const acceptanceIncentivePct = qualifiedForIncentives ? performanceTier.acceptancePct : D(0);
-  const cancellationIncentivePct = qualifiedForIncentives ? performanceTier.cancellationPct : D(0);
-  const acceptanceCancellationPct = qualifiedForIncentives ? performanceTier.combinedPct : D(0);
 
   let coreHoursPct = null;
   let coreHoursPassed = null;
   let coreHoursValidationStatus = 'NOT_APPLICABLE';
   if (settings.coreHoursRuleType === 'PERCENTAGE') {
-    const coreHours = D(row.coreHoursTotalSupplyHours);
+    const coreHours = D(scope?.coreHours ?? row.coreHoursTotalSupplyHours);
     if (coreHours.lt(0)) throw new UberCalculationError(`${row.driverUuid} (${row.week}) has negative core hours.`);
-    coreHoursPct = coreHours.div(contractedHours);
+    coreHoursPct = coreHours.div(metricContractedHours);
     coreHoursPassed = coreHoursPct.gte(settings.coreHoursRequirement);
     coreHoursValidationStatus = coreHoursPassed ? 'PASS' : 'BELOW_REQUIREMENT';
   } else if (settings.coreHoursRuleType === 'CONTINUOUS_COVERAGE') {
-    coreHoursValidationStatus = 'REQUIRES_COVERAGE_VALIDATION';
+    const coveragePassed = scope?.coreHoursCoveragePassed ?? row.coreHoursCoveragePassed;
+    if (typeof coveragePassed === 'boolean') {
+      coreHoursPassed = coveragePassed;
+      coreHoursValidationStatus = coreHoursPassed ? 'PASS' : 'BELOW_REQUIREMENT';
+    } else {
+      coreHoursValidationStatus = 'REQUIRES_COVERAGE_VALIDATION';
+    }
   }
+
+  const coreDisqualified = settings.coreHoursFailureBehavior === 'INELIGIBLE' && coreHoursPassed === false;
+  const qualifiedForIncentives = qualifiedByFulfillment && !coreDisqualified;
+  const hourIncentivePct = qualifiedForIncentives ? candidateHourIncentivePct : D(0);
+  const acceptanceIncentivePct = qualifiedForIncentives ? performanceTier.acceptancePct : D(0);
+  const cancellationIncentivePct = qualifiedForIncentives ? performanceTier.cancellationPct : D(0);
+  const acceptanceCancellationPct = qualifiedForIncentives ? performanceTier.combinedPct : D(0);
 
   const base = calculateBaseCompensation(payableHours, settings);
   const baseCompensation = base.amount;
   const coreCompensation = calculateCoreCompensation(baseCompensation, settings.coreRatePct);
   const contractHoursIncentive = cents(baseCompensation.times(hourIncentivePct));
-  const utilization = calculateUtilizationIncentive(baseCompensation, qualifyingSupplyHours, row.utilizedHours, settings);
+  const utilization = calculateUtilizationIncentive(baseCompensation, metricQualifyingSupplyHours, scope?.utilizedHours ?? row.utilizedHours, settings);
   const utilizationRate = utilization.utilizationRate;
   const utilizationIncentivePct = qualifiedForIncentives ? utilization.utilizationIncentivePct : D(0);
   const utilizationIncentive = qualifiedForIncentives ? utilization.utilizationIncentive : D(0);
@@ -379,6 +453,9 @@ function calculateRow(settings, row, adjustment = {}) {
     belowThresholdBehavior: settings.belowThresholdBehavior,
     utilizationEnabled: settings.utilizationEnabled,
     coreHoursRuleType: settings.coreHoursRuleType,
+    incentiveScope: settings.incentiveScope,
+    incentiveScopeKey: scope?.key || row.calculationUnitId || `driver:${row.driverUuid}`,
+    coreHoursFailureBehavior: settings.coreHoursFailureBehavior,
     coreHoursValidationStatus,
     minimumFulfillmentForIncentives: qualificationThreshold,
     totalSupplyHours,
@@ -388,6 +465,7 @@ function calculateRow(settings, row, adjustment = {}) {
     approvedExtraHours,
     payableHours,
     fulfillment,
+    qualifiedByFulfillment,
     qualified: qualifiedForIncentives,
     qualifiedForIncentives,
     qualificationThreshold,
@@ -470,7 +548,13 @@ export function calculateUberVdp({ settings, rows, weeklyAdjustments = [], lease
   validatePlanSettings(settings);
   const byKey = new Map(weeklyAdjustments.map((a) => [keyOf(a.calculationUnitId || a.driverUuid, a.week), a]));
   const groupedRows = groupCalculationRows(rows);
-  const calculatedRows = groupedRows.map((row) => calculateRow(settings, row, adjustmentFor(row, byKey)))
+  const scopes = providerIncentiveScopes(groupedRows, settings);
+  const calculatedRows = groupedRows.map((row) => calculateRow(
+    settings,
+    row,
+    adjustmentFor(row, byKey),
+    scopes.get(keyOf(row.calculationUnitId, row.week)) || null,
+  ))
     .sort((a, b) => a.week.localeCompare(b.week) || a.calculationUnitId.localeCompare(b.calculationUnitId));
 
   const weekMap = new Map();
@@ -577,6 +661,7 @@ export function serializeUberResult(result) {
         hours: str(band.hours),
         hourlyRate: money(band.hourlyRate),
         amount: money(band.amount),
+        ...(band.overflow ? { overflow: true } : {}),
       })),
       baseCompensation: money(row.baseCompensation),
       coreCompensation: money(row.coreCompensation),

@@ -6,8 +6,11 @@ import * as divisions from '../controllers/divisionController.js';
 import * as plans from '../controllers/planController.js';
 import * as providers from '../controllers/providerController.js';
 import * as cycles from '../controllers/cycleController.js';
+import * as processingGroups from '../controllers/processingGroupController.js';
 import * as performance from '../controllers/performanceController.js';
 import * as uberPerformance from '../controllers/uberPerformanceController.js';
+import * as uberTolls from '../controllers/uberTollController.js';
+import * as division3Imports from '../controllers/division3ImportController.js';
 import * as vdps from '../controllers/vdpController.js';
 import * as portal from '../controllers/portalController.js';
 import * as imports from '../controllers/importController.js';
@@ -17,7 +20,10 @@ import { cycleWorkbook } from '../services/exportService.js';
 import { registerPdf, cycleSchedulePdf, planReportPdf } from '../services/pdfService.js';
 import { leadershipReport, providerReport } from '../services/analyticsService.js';
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+// Compass duty exports (especially DIV 3 GoLink) can exceed 25 MB before they
+// are reduced to driver/day records. The buffer is short-lived and the stored
+// Mongo document contains only normalized aggregates.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
 const api = Router();
 
 api.get('/health', (_req, res) => res.json({ ok: true }));
@@ -56,6 +62,8 @@ api.post('/compass/sync', requireAdmin, compass.sync);
 api.put('/compass/settings', requireAdmin, compass.updateSettings);
 
 api.get('/lift-leases', liftLeases.list);
+api.post('/lift-leases/options', requireAdmin, liftLeases.createOption);
+api.put('/lift-leases/options/:optionId', requireAdmin, liftLeases.updateOption);
 api.put('/lift-leases/:divisionId', requireAdmin, liftLeases.update);
 
 api.get('/divisions', divisions.list);
@@ -66,6 +74,7 @@ api.patch('/divisions/:id/status', requireAdmin, divisions.setStatus);
 
 api.get('/vdp-plans', plans.list);
 api.post('/vdp-plans', requireAdmin, plans.create);
+api.get('/vdp-plan-templates', plans.templates);
 api.get('/vdp-plans/:id', plans.get);
 api.get('/vdp-plans/:id/report.pdf', async (req, res) => {
   const { buffer, fileName } = await planReportPdf(req.params.id);
@@ -92,6 +101,8 @@ api.post('/imports/:kind/commit', upload.single('file'), imports.commit);
 // VDP cycles are company-wide: one schedule, every period exists for every active division.
 api.get('/settings/cycle-schedule', cycles.getSchedule);
 api.put('/settings/cycle-schedule', requireAdmin, cycles.updateSchedule);
+api.get('/settings/processing-groups', processingGroups.list);
+api.put('/settings/processing-groups', requireAdmin, processingGroups.update);
 api.get('/cycles', cycles.list);
 api.get('/cycles/periods', cycles.periods);
 api.post('/cycles/generate', cycles.generate);
@@ -109,6 +120,17 @@ api.post('/uber-performance-imports', upload.array('files', 20), uberPerformance
 api.delete('/uber-performance-imports/invalid', uberPerformance.clearInvalid);
 api.delete('/uber-performance-imports/:id', uberPerformance.remove);
 api.post('/uber-driver-matches', uberPerformance.assignDriver);
+
+api.get('/division3-imports', division3Imports.list);
+api.post('/division3-imports', upload.array('files', 20), division3Imports.upload);
+api.delete('/division3-imports/invalid', division3Imports.clearInvalid);
+api.delete('/division3-imports/:id', division3Imports.remove);
+api.post('/division3-driver-matches', division3Imports.assignDriver);
+
+api.get('/uber-toll-imports', uberTolls.list);
+api.post('/uber-toll-imports', upload.array('files', 20), uberTolls.upload);
+api.delete('/uber-toll-imports/invalid', uberTolls.clearInvalid);
+api.delete('/uber-toll-imports/:id', uberTolls.remove);
 
 api.get('/vdps', vdps.list);
 api.get('/vdps/adjustment-types', vdps.adjustmentTypes);

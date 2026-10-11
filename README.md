@@ -50,11 +50,21 @@ changing roster records, and never returns the API token to the client. Division
 successful Compass response are left untouched, so a MongoDB-only division such as DIV 12 is not
 deactivated. Keep the token in deployment environment variables, not in source control.
 
-Compass does not supply lift-lease pricing. The **Lift Leases** tab lists the Compass divisions and
-lets an administrator assign one weekly, per-cycle, or no-lease price to every operator/pay unit in
-a division. The value is stored on the division in MongoDB, applied to current operators, and copied
-to new operators during later Compass refreshes. Open VDPs are marked stale; approved and paid
-statements keep their frozen values.
+Compass does not supply lift-lease pricing. The **Lift Leases** tab supports any number of named,
+division-scoped weekly, per-cycle, or no-lease options. Adding an option does not assign it; an
+administrator explicitly selects it for an operator on the provider edit screen. Compass divisions
+can also have a fallback default for operators without an explicit option. Saved option assignments
+survive later Compass refreshes, while new operators inherit the fallback. Editing an assigned option
+or the applicable default marks open VDPs stale; approved and paid statements keep frozen values.
+
+## VDP processing pipeline
+
+Processing starts with a division, then moves through required datasets, additional datasets,
+validation/calculation, and VDP review. A Performance Report or Uber dataset may be uploaded with
+the division only; the server infers the pay period from source dates and binds the import to the
+single generated cycle containing all dates. It refuses ambiguous, cross-period, or unmatched date
+ranges. The additional-data stage is intentionally ready for division-specific requirements without
+assuming toll, fare, or other feeds before those divisions are configured.
 
 On the **Providers** tab, administrators can filter to a division and batch assign one of that
 division's existing active VDP plans. The selection also becomes the default for providers discovered

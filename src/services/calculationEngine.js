@@ -25,12 +25,51 @@ const step = (label, detail, value, tone = 'info') => ({ label, detail, value, t
 const fmtPct = (d) => `${d.toDecimalPlaces(3).toString()}%`;
 const fmtHours = (d) => `${fmtNum(d)} h`;
 
+const contractedForWeek = (settings, week) => D(isBlank(week.contractedHours) ? settings.contractedHours : week.contractedHours);
+const attainmentForWeek = (week) => D(isBlank(week.attainmentHours) ? week.actualHours : week.attainmentHours);
+
+function attainmentPercentage(settings, week, contractedHours) {
+  if (!isBlank(week.performancePercentageOverride)) return D(week.performancePercentageOverride);
+  return attainmentForWeek(week).div(contractedHours).times(100);
+}
+
+function bonusQualification(settings, week, actualHours, attainmentHours, contractedHours) {
+  const metric = settings.bonusQualificationMetric === 'ATTAINMENT_HOURS' ? attainmentHours : actualHours;
+  const threshold = D(settings.bonusQualificationPercentage ?? 100);
+  const hoursPassed = metric.div(contractedHours).times(100).gte(threshold);
+  const daysPassed = !settings.bonusRequiresContractedDays
+    || (!isBlank(week.workedDays) && !isBlank(settings.contractedDays) && D(week.workedDays).gte(settings.contractedDays));
+  return { passed: hoursPassed && daysPassed, hoursPassed, daysPassed, metric, threshold };
+}
+
+function applyStandby(settings, week, normalEarnings, selectedRate) {
+  const status = week.standbyStatus || 'NOT_APPLICABLE';
+  if (!settings.standbyGuaranteeEnabled || status === 'NOT_APPLICABLE' || status === 'FORFEITED') {
+    return { status, guaranteedHours: D(0), rate: D(0), proration: D(0), guaranteedEarnings: D(0), topUp: D(0), weeklyEarnings: normalEarnings };
+  }
+  if (!['QUALIFIED', 'FORCE_MAJEURE'].includes(status)) throw new CalculationError(`Unknown standby status "${status}".`);
+  const directAmount = isBlank(week.standbyGuaranteeAmount) ? null : D(week.standbyGuaranteeAmount);
+  const guaranteedHours = directAmount === null
+    ? D(isBlank(week.standbyGuaranteedHours) ? contractedForWeek(settings, week) : week.standbyGuaranteedHours)
+    : D(0);
+  const rate = directAmount === null ? D(isBlank(settings.standbyRate) ? selectedRate : settings.standbyRate) : D(0);
+  const proration = status === 'FORCE_MAJEURE' ? D(week.standbyProration ?? 1) : D(1);
+  if (guaranteedHours.lt(0) || rate.lt(0) || proration.lt(0) || proration.gt(1)) {
+    throw new CalculationError('Standby hours, rate, or proration are invalid.');
+  }
+  if (directAmount?.lt(0)) throw new CalculationError('Standby guarantee amount cannot be negative.');
+  const guaranteedEarnings = cents((directAmount ?? guaranteedHours.times(rate)).times(proration));
+  const topUp = max(guaranteedEarnings.minus(normalEarnings), 0);
+  return { status, guaranteedHours, rate, proration, guaranteedEarnings, topUp, weeklyEarnings: normalEarnings.plus(topUp) };
+}
+
 function calculateHourlyWeek(settings, week) {
   const actualHours = D(week.actualHours);
-  const contractedHours = D(settings.contractedHours);
+  const attainmentHours = attainmentForWeek(week);
+  const contractedHours = contractedForWeek(settings, week);
   if (contractedHours.lte(0)) throw new CalculationError('Contracted hours must be greater than zero.');
 
-  const pct = actualHours.div(contractedHours).times(100);
+  const pct = attainmentPercentage(settings, week, contractedHours);
   let rate = D(settings.basePay);
   let label = 'Base rate (TUI not applied)';
   let tierIndex = null;
@@ -42,18 +81,21 @@ function calculateHourlyWeek(settings, week) {
     tierIndex = tier.index;
   }
 
-  const bonusApplies = settings.bonusEnabled && actualHours.gt(contractedHours);
+  const qualification = bonusQualification(settings, week, actualHours, attainmentHours, contractedHours);
+  const bonusApplies = settings.bonusEnabled && qualification.passed && actualHours.gt(contractedHours);
   const corePaidHours = settings.bonusEnabled ? min(actualHours, contractedHours) : actualHours;
   const bonusHours = bonusApplies ? max(actualHours.minus(contractedHours), 0) : D(0);
   const bonusRate = settings.bonusEnabled ? D(settings.bonusRate) : D(0);
   const coreEarnings = cents(corePaidHours.times(rate));
   const bonusEarnings = cents(bonusHours.times(bonusRate));
-  const weeklyEarnings = coreEarnings.plus(bonusEarnings);
+  const normalEarnings = coreEarnings.plus(bonusEarnings);
+  const standby = applyStandby(settings, week, normalEarnings, rate);
+  const weeklyEarnings = standby.weeklyEarnings;
 
   const explanation = [
     `Actual hours: ${fmtNum(actualHours)}`,
     `Contracted hours: ${fmtNum(contractedHours)}`,
-    `Performance: ${fmtNum(actualHours)} ÷ ${fmtNum(contractedHours)} × 100 = ${pct.toFixed(3)}%`,
+    `Incentive attainment: ${fmtNum(attainmentHours)} ÷ ${fmtNum(contractedHours)} × 100 = ${pct.toFixed(3)}%`,
     settings.tuiEligible
       ? `Incentive tier ${label} → rate ${fmtRate(rate)}`
       : `TUI not applied → base rate ${fmtRate(rate)}`,
@@ -62,13 +104,14 @@ function calculateHourlyWeek(settings, week) {
       (settings.bonusEnabled ? ` (hours above ${fmtNum(contractedHours)})` : ' (bonus not part of this plan)'),
     `Core: ${fmtNum(corePaidHours)} × ${fmtRate(rate)} = ${fmtMoney(coreEarnings)}`,
     `Bonus: ${fmtNum(bonusHours)} × ${fmtRate(bonusRate)} = ${fmtMoney(bonusEarnings)}`,
-    `Week ${week.weekNumber}: ${fmtMoney(coreEarnings)} + ${fmtMoney(bonusEarnings)} = ${fmtMoney(weeklyEarnings)}`,
+    ...(standby.topUp.gt(0) ? [`Standby guarantee top-up: ${fmtMoney(standby.topUp)}`] : []),
+    `Week ${week.weekNumber}: ${fmtMoney(weeklyEarnings)}`,
   ];
 
   const steps = [
     step('Hours worked', 'Performance Report', fmtHours(actualHours)),
     step('Contracted hours', 'per week', fmtHours(contractedHours)),
-    step('Performance', `${fmtNum(actualHours)} ÷ ${fmtNum(contractedHours)}`, fmtPct(pct)),
+    step('Incentive attainment', `${fmtNum(attainmentHours)} ÷ ${fmtNum(contractedHours)}`, fmtPct(pct)),
     step('Rate', settings.tuiEligible ? `Incentive tier ${label}` : 'Base rate (no TUI)', `${fmtRate(rate)} / h`),
     step(
       'Core pay',
@@ -82,15 +125,19 @@ function calculateHourlyWeek(settings, week) {
   if (settings.bonusEnabled) {
     steps.push(step(
       'Bonus pay',
-      bonusApplies ? `${fmtNum(bonusHours)} h above contract × ${fmtRate(bonusRate)}` : 'No hours above contract',
+      bonusApplies ? `${fmtNum(bonusHours)} h above contract × ${fmtRate(bonusRate)}` : qualification.passed ? 'No hours above contract' : 'Bonus qualification not met',
       fmtMoney(bonusEarnings),
       'money',
     ));
+  }
+  if (standby.topUp.gt(0)) {
+    steps.push(step('Standby guarantee', `${fmtNum(standby.guaranteedHours)} h × ${fmtRate(standby.rate)} × ${fmtNum(standby.proration)}`, fmtMoney(standby.topUp), 'plus'));
   }
   steps.push(step(`Week ${week.weekNumber} total`, '', fmtMoney(weeklyEarnings), 'total'));
 
   return {
     performancePercentage: pct,
+    attainmentHours,
     tierLabel: label,
     tierIndex,
     steps,
@@ -100,6 +147,8 @@ function calculateHourlyWeek(settings, week) {
     bonusRate,
     coreEarnings,
     bonusEarnings,
+    bonusQualified: qualification.passed,
+    standby,
     weeklyEarnings,
     explanation,
   };
@@ -108,8 +157,10 @@ function calculateHourlyWeek(settings, week) {
 function calculatePerTripWeek(settings, week) {
   const trips = D(week.trips);
   const actualHours = D(week.actualHours);
-  const contracted = isBlank(settings.contractedHours) ? null : D(settings.contractedHours);
-  const pct = contracted && contracted.gt(0) ? actualHours.div(contracted).times(100) : null;
+  const attainmentHours = attainmentForWeek(week);
+  const rawContracted = isBlank(week.contractedHours) ? settings.contractedHours : week.contractedHours;
+  const contracted = isBlank(rawContracted) ? null : D(rawContracted);
+  const pct = contracted && contracted.gt(0) ? attainmentPercentage(settings, week, contracted) : null;
 
   let rate = D(settings.basePay);
   let label = 'Base per-trip rate (TUI not applied)';
@@ -123,35 +174,165 @@ function calculatePerTripWeek(settings, week) {
     tierIndex = tier.index;
   }
   const coreEarnings = cents(trips.times(rate));
+  const qualification = contracted && contracted.gt(0)
+    ? bonusQualification(settings, week, actualHours, attainmentHours, contracted)
+    : { passed: false };
+  const bonusTrips = settings.bonusEnabled && settings.bonusBasis === 'SIXTH_DAY_TRIPS' && qualification.passed
+    ? D(week.bonusTrips || 0) : D(0);
+  const bonusRate = settings.bonusEnabled ? D(settings.bonusRate || 0) : D(0);
+  const bonusEarnings = cents(bonusTrips.times(bonusRate));
+  const standby = applyStandby(settings, week, coreEarnings.plus(bonusEarnings), rate);
   const explanation = [
     `Trips provided: ${fmtNum(trips)}`,
-    `Hours: ${fmtNum(actualHours)}` + (pct ? ` (${pct.toFixed(3)}% of ${fmtNum(contracted)} contracted)` : ''),
+    `Attainment hours: ${fmtNum(attainmentHours)}` + (pct ? ` (${pct.toFixed(3)}% of ${fmtNum(contracted)} contracted)` : ''),
     settings.tuiEligible
       ? `Incentive tier ${label} → ${fmtRate(rate)} per trip`
       : `TUI not applied → ${fmtRate(rate)} per trip`,
     `Trips: ${fmtNum(trips)} × ${fmtRate(rate)} = ${fmtMoney(coreEarnings)}`,
-    `Week ${week.weekNumber}: ${fmtMoney(coreEarnings)}`,
+    ...(bonusTrips.gt(0) ? [`Sixth-day bonus: ${fmtNum(bonusTrips)} trips × ${fmtRate(bonusRate)} = ${fmtMoney(bonusEarnings)}`] : []),
+    ...(standby.topUp.gt(0) ? [`Standby guarantee top-up: ${fmtMoney(standby.topUp)}`] : []),
+    `Week ${week.weekNumber}: ${fmtMoney(standby.weeklyEarnings)}`,
   ];
   const steps = [
     step('Trips provided', 'Performance Report', `${fmtNum(trips)} trips`),
-    step('Hours worked', pct ? `${fmtPct(pct)} of ${fmtNum(contracted)} h` : 'Performance Report', fmtHours(actualHours)),
+    step('Incentive attainment', pct ? `${fmtPct(pct)} of ${fmtNum(contracted)} h` : 'Performance Report', fmtHours(attainmentHours)),
     step('Rate', settings.tuiEligible ? `Tier ${label}` : 'Per-trip rate (no TUI)', `${fmtRate(rate)} / trip`),
     step('Trip pay', `${fmtNum(trips)} trips × ${fmtRate(rate)}`, fmtMoney(coreEarnings), 'money'),
-    step(`Week ${week.weekNumber} total`, '', fmtMoney(coreEarnings), 'total'),
   ];
+  if (settings.bonusEnabled && settings.bonusBasis === 'SIXTH_DAY_TRIPS') {
+    steps.push(step('Sixth-day bonus', qualification.passed ? `${fmtNum(bonusTrips)} qualifying trips × ${fmtRate(bonusRate)}` : 'Bonus qualification not met', fmtMoney(bonusEarnings), 'money'));
+  }
+  if (standby.topUp.gt(0)) {
+    steps.push(step('Standby guarantee', `${fmtNum(standby.guaranteedHours)} h × ${fmtRate(standby.rate)}`, fmtMoney(standby.topUp), 'plus'));
+  }
+  steps.push(step(`Week ${week.weekNumber} total`, '', fmtMoney(standby.weeklyEarnings), 'total'));
   return {
     performancePercentage: pct,
+    attainmentHours,
     tierLabel: label,
     tierIndex,
     steps,
     incentiveRate: rate,
     corePaidHours: actualHours,
+    bonusHours: bonusTrips,
+    bonusRate,
+    coreEarnings,
+    bonusEarnings,
+    bonusQualified: qualification.passed,
+    standby,
+    weeklyEarnings: standby.weeklyEarnings,
+    explanation,
+  };
+}
+
+const sameText = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+
+function lineDayType(line) {
+  if (line.dayType) return line.dayType;
+  if (!line.date) return 'ANY';
+  const day = new Date(`${line.date}T12:00:00Z`).getUTCDay();
+  return day === 0 || day === 6 ? 'WEEKEND' : 'WEEKDAY';
+}
+
+function componentMatches(component, line) {
+  if (component.serviceType && !sameText(component.serviceType, line.serviceType)) return false;
+  if (component.vehicleType && !sameText(component.vehicleType, line.vehicleType)) return false;
+  if (component.dayType && component.dayType !== 'ANY' && component.dayType !== lineDayType(line)) return false;
+  if (!isBlank(component.minimumDistance) || !isBlank(component.maximumDistance)) {
+    const trips = D(line.trips || 0);
+    const distance = !isBlank(line.distance) ? D(line.distance)
+      : trips.gt(0) && !isBlank(line.miles) ? D(line.miles).div(trips) : null;
+    if (distance === null) return false;
+    if (!isBlank(component.minimumDistance) && distance.lt(component.minimumDistance)) return false;
+    if (!isBlank(component.maximumDistance) && distance.gt(component.maximumDistance)) return false;
+  }
+  return true;
+}
+
+function componentQuantity(component, line) {
+  if (component.basis === 'HOURS') return D(line.hours || 0);
+  if (component.basis === 'TRIPS') return D(line.trips || 0);
+  if (component.basis === 'MILES') return D(line.miles || 0);
+  if (component.basis === 'EXCESS_MILES') {
+    return max(D(line.miles || 0).minus(D(line.trips || 0).times(component.includedMiles || 0)), 0);
+  }
+  throw new CalculationError(`Unknown rate-card basis "${component.basis}".`);
+}
+
+function calculateRateCardWeek(settings, week) {
+  const actualHours = D(week.actualHours || 0);
+  const attainmentHours = attainmentForWeek(week);
+  const contracted = isBlank(week.contractedHours) ? settings.contractedHours : week.contractedHours;
+  const needsAttainment = settings.tuiEligible || (settings.rateCards || []).length > 1;
+  if (needsAttainment && (isBlank(contracted) || D(contracted).lte(0))) {
+    throw new CalculationError('Contracted hours are required to select an attainment rate card.');
+  }
+  const pct = isBlank(contracted) || D(contracted).lte(0) ? null : attainmentPercentage(settings, week, D(contracted));
+  const cards = settings.rateCards || [];
+  const selected = settings.tuiEligible || cards.length > 1
+    ? selectTier(cards.map((card) => ({ ...card, rate: '0' })), pct)
+    : (cards[0] ? { ...cards[0], index: 0 } : null);
+  if (!selected) throw new CalculationError(`No rate card covers ${pct?.toFixed(3) ?? 'this week'}%.`);
+
+  const lines = week.lineItems?.length ? week.lineItems : [{
+    hours: week.actualHours || 0,
+    trips: week.trips || 0,
+    miles: week.serviceMiles || 0,
+    serviceType: week.serviceType,
+    vehicleType: week.vehicleType,
+    dayType: week.dayType || 'ANY',
+  }];
+  const breakdown = [];
+  lines.forEach((line, lineIndex) => {
+    const matches = (selected.components || []).filter((component) => componentMatches(component, line));
+    if (!matches.length && [line.hours, line.trips, line.miles].some((value) => !isBlank(value) && D(value).gt(0))) {
+      throw new CalculationError(`Rate card "${selected.name}" has no matching component for service line ${lineIndex + 1}.`);
+    }
+    matches.forEach((component) => {
+      const quantity = componentQuantity(component, line);
+      const amount = cents(quantity.times(component.rate));
+      breakdown.push({
+        line: lineIndex + 1,
+        name: component.name,
+        basis: component.basis,
+        quantity,
+        rate: D(component.rate),
+        amount,
+        serviceType: line.serviceType || null,
+        vehicleType: line.vehicleType || null,
+        dayType: lineDayType(line),
+      });
+    });
+  });
+  const coreEarnings = sum(breakdown.map((entry) => entry.amount));
+  const standby = applyStandby(settings, week, coreEarnings, settings.standbyRate || 0);
+  const steps = [
+    ...(pct === null ? [] : [step('Incentive attainment', `${fmtNum(attainmentHours)} / ${fmtNum(contracted)}`, fmtPct(pct))]),
+    ...breakdown.map((entry) => step(entry.name, `${fmtNum(entry.quantity)} ${entry.basis.toLowerCase()} x ${fmtRate(entry.rate)}`, fmtMoney(entry.amount), 'money')),
+    ...(standby.topUp.gt(0) ? [step('Standby guarantee', `${fmtNum(standby.guaranteedHours)} h x ${fmtRate(standby.rate)}`, fmtMoney(standby.topUp), 'plus')] : []),
+    step(`Week ${week.weekNumber} total`, selected.name, fmtMoney(standby.weeklyEarnings), 'total'),
+  ];
+  return {
+    performancePercentage: pct,
+    attainmentHours,
+    tierLabel: selected.name,
+    tierIndex: selected.index,
+    incentiveRate: null,
+    corePaidHours: actualHours,
     bonusHours: D(0),
     bonusRate: D(0),
     coreEarnings,
     bonusEarnings: D(0),
-    weeklyEarnings: coreEarnings,
-    explanation,
+    bonusQualified: false,
+    standby,
+    rateCardBreakdown: breakdown,
+    weeklyEarnings: standby.weeklyEarnings,
+    steps,
+    explanation: [
+      `Rate card: ${selected.name}${pct === null ? '' : ` at ${pct.toFixed(3)}% attainment`}`,
+      ...breakdown.map((entry) => `${entry.name}: ${fmtNum(entry.quantity)} x ${fmtRate(entry.rate)} = ${fmtMoney(entry.amount)}`),
+      `Week ${week.weekNumber}: ${fmtMoney(standby.weeklyEarnings)}`,
+    ],
   };
 }
 
@@ -281,20 +462,57 @@ export function calculateFuelAllowance({ mpg, days, actualExpense }) {
   };
 }
 
+export function calculateFuelPriceSurcharge({ mpg, threshold, days }) {
+  if (!days?.length) throw new CalculationError('Service-mile fuel surcharge needs daily service miles and fuel prices.');
+  const daily = days.map((day) => {
+    const m = D(day.mpg ?? mpg);
+    const floor = D(day.threshold ?? threshold);
+    if (m.lte(0)) throw new CalculationError('Fuel MPG configuration is missing.');
+    if (isBlank(day.serviceMiles)) throw new CalculationError(`Service Miles are missing for ${day.date}.`);
+    if (isBlank(day.pricePerGallon)) throw new CalculationError(`No fuel price configured for ${day.date}.`);
+    const serviceMiles = D(day.serviceMiles);
+    const pricePerGallon = D(day.pricePerGallon);
+    const excessPrice = max(pricePerGallon.minus(floor), 0);
+    const gallons = serviceMiles.div(m);
+    return {
+      date: day.date,
+      week: day.week,
+      operator: day.operator ?? null,
+      serviceMiles,
+      mpg: m,
+      threshold: floor,
+      pricePerGallon,
+      excessPrice,
+      gallons,
+      amount: gallons.times(excessPrice),
+    };
+  });
+  const amount = cents(sum(daily.map((day) => day.amount)));
+  return {
+    enabled: true,
+    amount,
+    days: daily,
+    detail: `${fmtNum(sum(daily.map((day) => day.serviceMiles)))} service miles; price above ${fmtRate(threshold)}/gal`,
+    explanation: `Fuel price-threshold surcharge: ${fmtMoney(amount)}`,
+  };
+}
+
 // One operator: every week measured against this operator's own contract.
 function calculateOperator(settings, unit) {
   // An operator on a different VDP plan than the provider brings that plan's settings.
   const base = unit.settings || settings;
   if (!PAYMENT_TYPES.includes(base.paymentType)) throw new CalculationError(`Unsupported payment type "${base.paymentType}".`);
   const s = isBlank(unit.contractedHours) ? base : { ...base, contractedHours: unit.contractedHours };
-  const weekFn = s.paymentType === 'HOURLY' ? calculateHourlyWeek : calculatePerTripWeek;
+  const weekFn = s.rateStructureType === 'RATE_CARD'
+    ? calculateRateCardWeek
+    : s.paymentType === 'HOURLY' ? calculateHourlyWeek : calculatePerTripWeek;
   const weeks = unit.weeks.map((w) => ({
     weekNumber: w.weekNumber,
     start: w.start,
     end: w.end,
     trips: D(w.trips),
     actualHours: D(w.actualHours),
-    contractedHours: isBlank(s.contractedHours) ? null : D(s.contractedHours),
+    contractedHours: isBlank(w.contractedHours) ? (isBlank(s.contractedHours) ? null : D(s.contractedHours)) : D(w.contractedHours),
     ...weekFn(s, w),
   }));
   return {
@@ -308,6 +526,34 @@ function calculateOperator(settings, unit) {
   };
 }
 
+function withProviderAttainment(settings, units) {
+  const prepared = units.map((unit) => ({ ...unit, weeks: unit.weeks.map((week) => ({ ...week })) }));
+  const groups = new Map();
+  prepared.forEach((unit) => {
+    const effective = unit.settings || settings;
+    if (effective.attainmentScope !== 'PROVIDER') return;
+    const key = unit.attainmentGroup || unit.plan?.id || (unit.settings ? `settings:${JSON.stringify(effective)}` : 'provider-plan');
+    const list = groups.get(key) || [];
+    list.push({ unit, effective });
+    groups.set(key, list);
+  });
+  for (const list of groups.values()) {
+    const weekCount = Math.max(...list.map(({ unit }) => unit.weeks.length));
+    for (let index = 0; index < weekCount; index += 1) {
+      const rows = list.map(({ unit, effective }) => ({ unit, effective, week: unit.weeks[index] })).filter(({ week }) => week);
+      const attainment = sum(rows.map(({ week }) => attainmentForWeek(week)));
+      const contracted = sum(rows.map(({ unit, effective, week }) => contractedForWeek(
+        isBlank(unit.contractedHours) ? effective : { ...effective, contractedHours: unit.contractedHours },
+        week,
+      )));
+      if (contracted.lte(0)) throw new CalculationError('Provider-wide attainment needs contracted hours greater than zero.');
+      const percentage = attainment.div(contracted).times(100).toString();
+      rows.forEach(({ week }) => { week.performancePercentageOverride = percentage; });
+    }
+  }
+  return prepared;
+}
+
 // Several operators: the provider's week is the sum of its operators' weeks.
 // Tier, rate and % stay per operator (they would be meaningless summed).
 function combineWeeks(ops) {
@@ -316,7 +562,9 @@ function combineWeeks(ops) {
     const total = (k) => sum(parts.map(({ w }) => w[k] ?? 0));
     const contracted = parts.every(({ w }) => w.contractedHours === null) ? null : total('contractedHours');
     const weeklyEarnings = total('weeklyEarnings');
-    const line = ({ o, w }) => (o.settings.paymentType === 'PER_TRIP'
+    const line = ({ o, w }) => (o.settings.rateStructureType === 'RATE_CARD'
+      ? `${w.tierLabel} rate card`
+      : o.settings.paymentType === 'PER_TRIP'
       ? `${fmtNum(w.trips)} trips × ${fmtRate(w.incentiveRate)}`
       : `${fmtNum(w.actualHours)} h of ${fmtNum(w.contractedHours)} (${w.performancePercentage.toFixed(1)}%) · ${w.tierLabel}`);
     return {
@@ -325,6 +573,7 @@ function combineWeeks(ops) {
       end: first.end,
       trips: total('trips'),
       actualHours: total('actualHours'),
+      attainmentHours: total('attainmentHours'),
       contractedHours: contracted,
       performancePercentage: null,
       tierLabel: 'Per operator',
@@ -335,6 +584,7 @@ function combineWeeks(ops) {
       bonusRate: null,
       coreEarnings: total('coreEarnings'),
       bonusEarnings: total('bonusEarnings'),
+      standbyTopUp: sum(parts.map(({ w }) => w.standby?.topUp || 0)),
       weeklyEarnings,
       steps: [
         ...parts.map((p) => step(p.o.name, line(p), fmtMoney(p.w.weeklyEarnings), 'money')),
@@ -361,7 +611,8 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
   if (!PAYMENT_TYPES.includes(settings.paymentType)) {
     throw new CalculationError(`Unsupported payment type "${settings.paymentType}".`);
   }
-  const units = operators?.length ? operators : [{ name: null, weeks, lease }];
+  const rawUnits = operators?.length ? operators : [{ name: null, weeks, lease }];
+  const units = withProviderAttainment(settings, rawUnits);
   const ops = units.map((u) => calculateOperator(settings, u));
   const many = ops.length > 1;
   const weekResults = many ? combineWeeks(ops) : ops[0].weeks;
@@ -378,6 +629,20 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
   const allowance = ops.some((o) => o.settings.fuelMethod === 'SERVICE_MILE_ALLOWANCE')
     ? calculateFuelAllowance({ mpg: settings.fuelMpg, days: fuelInput?.days || [], actualExpense: fuelInput?.actualExpense })
     : null;
+  const usesActualFuel = ops.some((o) => o.settings.fuelMethod === 'ACTUAL_EXPENSE_REIMBURSEMENT');
+  if (usesActualFuel && isBlank(fuelInput?.actualExpense)) {
+    throw new CalculationError('Actual fuel expense is required for fuel-cost reimbursement.');
+  }
+  const fuelActualReimbursement = usesActualFuel ? cents(fuelInput.actualExpense) : D(0);
+  if (fuelActualReimbursement.lt(0)) throw new CalculationError('Actual fuel expense cannot be negative.');
+  const surchargeSettings = ops.find((o) => o.settings.fuelMethod === 'PRICE_THRESHOLD_SURCHARGE')?.settings;
+  const fuelSurcharge = surchargeSettings
+    ? calculateFuelPriceSurcharge({
+      mpg: surchargeSettings.fuelMpg,
+      threshold: surchargeSettings.fuelPriceThreshold,
+      days: fuelInput?.days || [],
+    })
+    : null;
   const fuelOverspend = allowance ? allowance.overspend : D(0);
 
   const groups = { fares: D(0), otherDeductions: D(0), reimbursements: D(0), otherIncome: D(0) };
@@ -391,7 +656,8 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
 
   // The overspend is the only fuel deduction; the actual expense itself is never deducted.
   const totalDeductions = leaseResult.amount.plus(groups.fares).plus(groups.otherDeductions).plus(fuelOverspend);
-  const totalAdditions = fuel.amount.plus(groups.reimbursements).plus(groups.otherIncome);
+  const totalAdditions = fuel.amount.plus(fuelActualReimbursement).plus(fuelSurcharge?.amount || 0)
+    .plus(groups.reimbursements).plus(groups.otherIncome);
   const net = gross.minus(totalDeductions).plus(totalAdditions);
 
   const explanation = [
@@ -400,6 +666,8 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
     leaseResult.explanation,
     ...(fuel.enabled ? [fuel.explanation] : []),
     ...(allowance ? [allowance.explanation] : []),
+    ...(usesActualFuel ? [`Actual fuel-cost reimbursement: ${fmtMoney(fuelActualReimbursement)}`] : []),
+    ...(fuelSurcharge ? [fuelSurcharge.explanation] : []),
     `Fares collected: ${fmtMoney(groups.fares)}`,
     `Other deductions: ${fmtMoney(groups.otherDeductions)}`,
     `Reimbursements: ${fmtMoney(groups.reimbursements)}`,
@@ -428,6 +696,8 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
       : step('Fuel overspend', allowance.entered ? `${allowance.detail} — within allowance` : allowance.detail, fmtMoney(0)));
   }
   if (fuel.enabled) steps.push(step('Fuel reimbursement', fuel.detail, `+${fmtMoney(fuel.amount)}`, 'plus'));
+  if (usesActualFuel) steps.push(step('Actual fuel-cost reimbursement', 'Entered expense supported by receipts', `+${fmtMoney(fuelActualReimbursement)}`, 'plus'));
+  if (fuelSurcharge) steps.push(step('Fuel price-threshold surcharge', fuelSurcharge.detail, `+${fmtMoney(fuelSurcharge.amount)}`, 'plus'));
   if (groups.reimbursements.gt(0)) steps.push(step('Reimbursements', entries('reimbursements'), `+${fmtMoney(groups.reimbursements)}`, 'plus'));
   if (groups.otherIncome.gt(0)) steps.push(step('Other income', entries('otherIncome'), `+${fmtMoney(groups.otherIncome)}`, 'plus'));
   steps.push(step('Net VDP payment', '', fmtMoney(net), 'total'));
@@ -436,7 +706,7 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
     weeks: weekResults,
     gross,
     lease: leaseResult.amount,
-    operators: ops.map((o) => ({ name: o.name, routes: o.routes, plan: o.plan, paymentType: o.settings.paymentType, weeks: o.weeks, earnings: o.earnings, lease: o.lease.amount, leaseDetail: o.lease.detail })),
+    operators: ops.map((o) => ({ name: o.name, routes: o.routes, plan: o.plan, paymentType: o.settings.paymentType, rateStructureType: o.settings.rateStructureType || 'SIMPLE', weeks: o.weeks, earnings: o.earnings, lease: o.lease.amount, leaseDetail: o.lease.detail })),
     leaseWeeksCharged: leaseResult.weeksCharged ?? null,
     fares: groups.fares,
     otherDeductions: groups.otherDeductions,
@@ -445,6 +715,8 @@ export function calculateVdp({ settings, weeks, lease, operators, adjustments = 
     fuelReimbursementRate: fuel.enabled ? fuel.rate : null,
     fuelReimbursementDetail: fuel.enabled ? fuel.detail : null,
     fuelAllowance: allowance,
+    fuelActualReimbursement,
+    fuelSurcharge,
     fuelOverspend,
     reimbursements: groups.reimbursements,
     otherIncome: groups.otherIncome,
@@ -463,6 +735,7 @@ const serializeWeek = (w) => ({
   end: w.end,
   trips: str(w.trips),
   actualHours: str(w.actualHours),
+  attainmentHours: str(w.attainmentHours),
   contractedHours: str(w.contractedHours),
   performancePercentage: w.performancePercentage === null ? null : w.performancePercentage.toDecimalPlaces(6).toString(),
   tierLabel: w.tierLabel,
@@ -472,6 +745,21 @@ const serializeWeek = (w) => ({
   bonusRate: str(w.bonusRate),
   coreEarnings: money(w.coreEarnings),
   bonusEarnings: money(w.bonusEarnings),
+  bonusQualified: w.bonusQualified ?? false,
+  standby: w.standby ? {
+    status: w.standby.status,
+    guaranteedHours: str(w.standby.guaranteedHours),
+    rate: str(w.standby.rate),
+    proration: str(w.standby.proration),
+    guaranteedEarnings: money(w.standby.guaranteedEarnings),
+    topUp: money(w.standby.topUp),
+  } : null,
+  rateCardBreakdown: (w.rateCardBreakdown || []).map((entry) => ({
+    ...entry,
+    quantity: str(entry.quantity),
+    rate: str(entry.rate),
+    amount: money(entry.amount),
+  })),
   weeklyEarnings: money(w.weeklyEarnings),
   tierIndex: w.tierIndex,
   steps: w.steps,
@@ -506,6 +794,25 @@ function serializeAllowance(a) {
   };
 }
 
+function serializeSurcharge(surcharge) {
+  if (!surcharge) return null;
+  return {
+    method: 'PRICE_THRESHOLD_SURCHARGE',
+    amount: money(surcharge.amount),
+    detail: surcharge.detail,
+    days: surcharge.days.map((day) => ({
+      ...day,
+      serviceMiles: str(day.serviceMiles),
+      mpg: str(day.mpg),
+      threshold: str(day.threshold),
+      pricePerGallon: str(day.pricePerGallon),
+      excessPrice: str(day.excessPrice),
+      gallons: str(day.gallons),
+      amount: str(day.amount),
+    })),
+  };
+}
+
 export function serializeResult(r) {
   return {
     weeks: r.weeks.map(serializeWeek),
@@ -514,6 +821,7 @@ export function serializeResult(r) {
       routes: o.routes,
       plan: o.plan ?? null,
       paymentType: o.paymentType,
+      rateStructureType: o.rateStructureType,
       earnings: money(o.earnings),
       lease: money(o.lease),
       leaseDetail: o.leaseDetail,
@@ -529,6 +837,8 @@ export function serializeResult(r) {
     fuelReimbursementRate: str(r.fuelReimbursementRate),
     fuelReimbursementDetail: r.fuelReimbursementDetail ?? null,
     fuelAllowance: serializeAllowance(r.fuelAllowance),
+    fuelActualReimbursement: money(r.fuelActualReimbursement ?? 0),
+    fuelSurcharge: serializeSurcharge(r.fuelSurcharge),
     fuelOverspend: money(r.fuelOverspend ?? 0),
     reimbursements: money(r.reimbursements),
     otherIncome: money(r.otherIncome),

@@ -15,6 +15,10 @@ const sourceSchema = new Schema(
 const leaseSchema = {
   amount: dec({ default: null }),
   frequency: { type: String, enum: ['WEEKLY', 'PER_VDP_CYCLE', 'NONE'], default: 'NONE' },
+  // Saved option selected in Lift Leases. Amount/frequency are copied here as an
+  // audit-safe snapshot and refreshed when the saved option is edited.
+  optionId: { type: Schema.Types.ObjectId, ref: 'LiftLeaseOption', default: null },
+  optionName: { type: String, trim: true, default: null },
 };
 
 const transferSchema = new Schema(
@@ -25,6 +29,30 @@ const transferSchema = new Schema(
     note: String,
     by: { id: { type: Schema.Types.ObjectId, ref: 'User' }, name: String },
     at: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
+// TUI eligibility is measured only during these Compass Master Run Cut windows.
+// weekdayTimes contains per-day overrides when a run cut does not use one common
+// start/end time for every scheduled day.
+const tuiWeekdayTimeSchema = new Schema(
+  {
+    day: { type: String, required: true, trim: true, uppercase: true },
+    startTime: { type: String, required: true, trim: true },
+    endTime: { type: String, required: true, trim: true },
+  },
+  { _id: false },
+);
+
+const tuiWindowSchema = new Schema(
+  {
+    externalRunCutId: { type: String, trim: true, default: null },
+    route: { type: String, trim: true, default: null },
+    daysOfWeek: { type: [String], default: [] },
+    startTime: { type: String, trim: true, default: null },
+    endTime: { type: String, trim: true, default: null },
+    weekdayTimes: { type: [tuiWeekdayTimeSchema], default: [] },
   },
   { _id: false },
 );
@@ -52,6 +80,8 @@ const operatorSchema = new Schema(
     transferredFrom: transferSchema,
     transferredTo: transferSchema,
     employeeId: { type: String, trim: true, default: null },
+    // Read-only in VDP. Refreshed from the operator's active Compass run cuts.
+    tuiWindows: { type: [tuiWindowSchema], default: [] },
     source: { type: sourceSchema, default: () => ({}) },
   },
   { toJSON: { getters: true, versionKey: false }, toObject: { getters: true } },
