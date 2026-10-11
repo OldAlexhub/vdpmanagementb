@@ -242,7 +242,20 @@ export async function update(req, res) {
 export async function assignDivisionPlan(req, res) {
   const division = await Division.findById(req.params.divisionId);
   if (!division) throw notFound('Division');
-  if (!req.body.planId) throw badRequest('Choose a VDP plan to assign.');
+  if (!Object.prototype.hasOwnProperty.call(req.body, 'planId')) throw badRequest('Choose a VDP plan to assign or unassign.');
+  const providerIds = (await Provider.find({ divisionId: division._id }, '_id')).map((provider) => provider._id);
+  if (!req.body.planId) {
+    division.defaultPlanId = null;
+    await division.save();
+    const result = await Provider.updateMany({ divisionId: division._id }, { $set: { planId: null } });
+    if (providerIds.length) await markStale({ providerId: { $in: providerIds } });
+    res.json({
+      divisionId: division._id,
+      plan: null,
+      applied: { providers: result.matchedCount },
+    });
+    return;
+  }
   const plan = await VdpPlan.findById(req.body.planId);
   if (!plan) throw badRequest('Choose a valid VDP plan.');
   if (plan.status !== 'ACTIVE') throw badRequest('Choose an active VDP plan.');
@@ -250,7 +263,7 @@ export async function assignDivisionPlan(req, res) {
   division.defaultPlanId = plan._id;
   await division.save();
   const result = await Provider.updateMany({ divisionId: division._id }, { $set: { planId: plan._id } });
-  if (result.matchedCount) await markStale({ providerId: { $in: (await Provider.find({ divisionId: division._id }, '_id')).map((provider) => provider._id) } });
+  if (providerIds.length) await markStale({ providerId: { $in: providerIds } });
   res.json({
     divisionId: division._id,
     plan: { _id: plan._id, name: plan.name },

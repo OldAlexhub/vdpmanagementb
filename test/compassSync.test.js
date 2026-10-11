@@ -141,4 +141,14 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
   assert.equal(String(exception.planId), String(exceptionPlan._id));
   const later = await Provider.findOne({ 'source.externalId': 'p3' });
   assert.equal(String(later.planId), String(divisionPlan._id));
+
+  const div10ProviderCount = await Provider.countDocuments({ divisionId: div10._id });
+  await assignDivisionPlan(
+    { params: { divisionId: div10._id }, body: { planId: null } },
+    { json: (value) => { response = value; } },
+  );
+  assert.equal(response.plan, null);
+  assert.deepEqual(response.applied, { providers: div10ProviderCount });
+  assert.equal((await Division.findById(div10._id)).defaultPlanId, null);
+  assert.equal(await Provider.countDocuments({ divisionId: div10._id, planId: { $ne: null } }), 0);
 });
