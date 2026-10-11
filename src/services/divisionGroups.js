@@ -13,7 +13,7 @@ export const isDivision3Division = (division) => isDivision3Number(division?.div
 export async function processingDivisionsFor(division) {
   if (!division) return [];
   const settings = await getCompanySettings();
-  const group = settings.processingGroups.find((item) => item.divisionIds.some((id) => String(id) === String(division._id)));
+  const group = (settings.processingGroups || []).find((item) => item.divisionIds.some((id) => String(id) === String(division._id)));
   if (!group) return [division];
   const members = await Division.find({ _id: { $in: group.divisionIds }, status: 'ACTIVE' });
   const byId = new Map(members.map((item) => [String(item._id), item]));

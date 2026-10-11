@@ -4,10 +4,11 @@ import { badRequest } from '../services/errors.js';
 
 const view = async () => {
   const settings = await getCompanySettings();
-  const ids = settings.processingGroups.flatMap((group) => group.divisionIds.map(String));
+  const groups = settings.processingGroups || [];
+  const ids = groups.flatMap((group) => group.divisionIds.map(String));
   const divisions = await Division.find({ _id: { $in: ids } }, 'divisionNumber name status');
   const byId = new Map(divisions.map((division) => [String(division._id), division]));
-  return settings.processingGroups.map((group) => ({
+  return groups.map((group) => ({
     _id: group._id,
     name: group.name,
     divisionIds: group.divisionIds.map(String),
@@ -20,7 +21,7 @@ export async function list(_req, res) {
 }
 
 export async function update(req, res) {
-  if (!Array.isArray(req.body.groups)) throw badRequest('Send the complete processing group list.');
+  if (!Array.isArray(req.body?.groups)) throw badRequest('Send the complete processing group list.');
   const groups = req.body.groups.map((group, index) => ({
     name: String(group.name || '').trim(),
     divisionIds: [...new Set((group.divisionIds || []).map(String).filter(Boolean))],
