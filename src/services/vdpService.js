@@ -515,7 +515,7 @@ export async function computeVdp(vdp, preloaded = {}) {
           const detail = tolls.missingWeeks.length
             ? ` Missing week${tolls.missingWeeks.length === 1 ? '' : 's'}: ${tolls.missingWeeks.join(', ')}.`
             : ` ${tolls.unmatchedRows.length} non-zero toll row(s) do not match the Uber Report.`;
-          exceptions.push(exception('DIV2_TOLL_DATA_INCOMPLETE', `DIV ${String(division.divisionNumber).trim()} needs one valid Uber toll reimbursement CSV for each week.${detail}`));
+          exceptions.push(exception('DIV2_TOLL_DATA_INCOMPLETE', `DIV ${String(division.divisionNumber).trim()} needs one valid Uber toll reimbursement file for each week.${detail}`));
         }
       }
     }
@@ -837,7 +837,7 @@ export async function processCycle(cycleId, user, { partial = false } = {}) {
   }
   if (needsUber && division10) {
     const tolls = uberTollReadiness({ cycle, tollImports: uberTollImports, uberImports });
-    if (!tolls.ready) throw badRequest(`Upload one valid DIV ${division2 ? '2' : '10'} Uber toll reimbursement CSV for each week before processing.${tolls.missingWeeks.length ? ` Missing: ${tolls.missingWeeks.join(', ')}.` : ''}`);
+    if (!tolls.ready) throw badRequest(`Upload one valid DIV ${division2 ? '2' : '10'} Uber toll reimbursement file for each week before processing.${tolls.missingWeeks.length ? ` Missing: ${tolls.missingWeeks.join(', ')}.` : ''}`);
   }
   const matches = importDoc ? matchRoutes(importDoc, providers) : [];
   const unresolved = unresolvedRoutes(matches);

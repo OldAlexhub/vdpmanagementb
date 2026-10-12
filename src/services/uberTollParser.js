@@ -60,21 +60,21 @@ function exactMoney(value) {
 
 export async function parseUberTollFile(buffer, fileName) {
   const extension = String(fileName || '').toLowerCase().split('.').pop();
-  if (extension !== 'csv') {
-    throw new UberTollFileValidationError('Uber toll reimbursement files must be .csv exports.', { code: 'UNSUPPORTED_FILE_TYPE' });
+  if (!['csv', 'xlsx', 'xls'].includes(extension)) {
+    throw new UberTollFileValidationError('Uber toll reimbursement files must be .csv, .xlsx, or .xls.', { code: 'UNSUPPORTED_FILE_TYPE' });
   }
   const period = periodFromFileName(fileName);
   let workbook;
   try {
     workbook = XLSX.read(buffer, { type: 'buffer', raw: true });
   } catch (error) {
-    throw new UberTollFileValidationError(`The toll CSV could not be read: ${error.message}`, { code: 'UNREADABLE_FILE' });
+    throw new UberTollFileValidationError(`The toll reimbursement file could not be read: ${error.message}`, { code: 'UNREADABLE_FILE' });
   }
   const sheetName = workbook.SheetNames[0];
   const sourceRows = sheetName
     ? XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, raw: true, defval: null, blankrows: false })
     : [];
-  if (!sourceRows.length) throw new UberTollFileValidationError('The toll CSV is empty.', { code: 'EMPTY_FILE' });
+  if (!sourceRows.length) throw new UberTollFileValidationError('The toll reimbursement file is empty.', { code: 'EMPTY_FILE' });
   const required = new Set(REQUIRED_UBER_TOLL_COLUMNS.map(normalizedHeader));
   const headerIndex = sourceRows.slice(0, 10).findIndex((row) => row.filter((cell) => required.has(normalizedHeader(cell))).length >= 3);
   if (headerIndex < 0) throw new UberTollFileValidationError('Could not find the Uber driver-payment header row.', { code: 'HEADER_NOT_FOUND' });
@@ -117,7 +117,7 @@ export async function parseUberTollFile(buffer, fileName) {
       code: 'MALFORMED_ROWS', errors, detectedColumns: headers.filter(Boolean),
     });
   }
-  if (!rows.length) throw new UberTollFileValidationError('The Uber toll CSV has no driver rows.', { code: 'NO_DATA_ROWS' });
+  if (!rows.length) throw new UberTollFileValidationError('The Uber toll reimbursement file has no driver rows.', { code: 'NO_DATA_ROWS' });
   const tollTotal = rows.reduce((total, row) => total + Number(row.amount), 0).toFixed(2);
   return {
     rows,

@@ -257,8 +257,14 @@ test('DIV 2 accepts and validates Uber plus toll files before any providers exis
     'Driver UUID,Driver first name,Driver last name,Refunds & Expenses:Refunds:Toll',
     `${driverUuid},FUTURE,DRIVER,${amount}`,
   ].join('\n'));
+  const tollWorkbook = (amount) => workbook([{
+    'Driver UUID': driverUuid,
+    'Driver first name': 'FUTURE',
+    'Driver last name': 'DRIVER',
+    'Refunds & Expenses:Refunds:Toll': amount,
+  }]);
   tollForm.append('files', new Blob([tollCsv('2.25')]), '20260907-20260914-payments_driver-Big_Star_Chicago.csv');
-  tollForm.append('files', new Blob([tollCsv('4.10')]), '20260914-20260921-payments_driver-Big_Star_Chicago.csv');
+  tollForm.append('files', new Blob([tollWorkbook(4.10)]), '20260914-20260921-payments_driver-Big_Star_Chicago.xlsx');
   response = await call('POST', '/uber-toll-imports', undefined, tollForm);
   assert.equal(response.status, 201, JSON.stringify(response.data));
   assert.equal(response.data.files.every((file) => file.validationStatus === 'VALID'), true);

@@ -46,7 +46,7 @@ function invalidDetails(error) {
 }
 
 export async function uploadUberTollFiles({ cycleId, divisionId, files, user }) {
-  if (!files?.length) throw badRequest('Choose at least one Uber toll reimbursement .csv file.');
+  if (!files?.length) throw badRequest('Choose at least one Uber toll reimbursement .csv, .xlsx, or .xls file.');
   let cycle = cycleId ? await VdpCycle.findById(cycleId) : null;
   if (cycleId && !cycle) throw notFound('VDP cycle');
   const preparsed = new Map();
