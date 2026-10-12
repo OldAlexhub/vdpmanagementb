@@ -55,11 +55,9 @@ export async function cycleSummary(cycleId) {
   // DIV 3 can be processed from ADA/GoLink alone. Uber remains available, and
   // once any Uber data is supplied both weekly files must still be complete.
   const uberRequired = division2 || division12 || (!division3 && uberProviderCount > 0);
-  // The finalized DIV 3 and DIV 10 workbooks consume the same Uber driver-week
-  // toll feed. It becomes required only when that optional/conditional Uber
-  // branch is actually in use.
-  const tollsRequired = division2 || (division3 && uberImports.length > 0) || (division10 && uberProviderCount > 0);
-  const tollsAvailable = division2 || division3 || division10 || division12;
+  // DIV 10 does not use the Uber driver-week toll reimbursement feed.
+  const tollsRequired = division2 || (division3 && uberImports.length > 0);
+  const tollsAvailable = division2 || division3 || division12;
   const driverMatches = matchUberDrivers(uberImports, providers, cycle);
   const tollReadiness = uberTollReadiness({ cycle, tollImports, uberImports });
   const expectedUberWeeks = [isoDate(cycle.week1Start), isoDate(cycle.week2Start)];
@@ -80,8 +78,6 @@ export async function cycleSummary(cycleId) {
       dataset.applicable = actualFuelAssignments.some(({ plan, provider }) => plan.blueprint?.id === 'div7-lakeside' || /lakeside/i.test(`${plan.name} ${provider.name}`));
     } else if (dataset.id === 'DIV7_COAST_FUEL') {
       dataset.applicable = actualFuelAssignments.some(({ plan, provider }) => plan.blueprint?.id !== 'div7-lakeside' && !/lakeside/i.test(`${plan.name} ${provider.name}`));
-    } else if (dataset.id === 'DIV10_COAST_FUEL') {
-      dataset.applicable = actualFuelAssignments.length > 0;
     }
   }
   if (division3Data) {

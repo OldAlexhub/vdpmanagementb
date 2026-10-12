@@ -171,8 +171,8 @@ const CONTRACTS = {
     }),
     source({
       id: 'DIV10_COAST_FUEL',
-      title: 'Coast fuel transactions',
-      hint: 'Only for providers whose plan reimburses Coast fuel transactions.',
+      title: 'Coast Fuel Report',
+      hint: 'Optional. Upload the Coast Fuel Report for this VDP period. Completed transaction amounts are matched to provider operators and used as fuel expenses.',
       stage: 'ADDITIONAL',
       required: false,
       requiredCells: ['Date', 'User', 'Vehicle', 'Amount', 'Fuel Grade', 'Gallons', 'Cost Per Gallon'],

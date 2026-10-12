@@ -63,6 +63,16 @@ test('launch division parsers normalize the representative source artifacts', as
     assert.ok(result.division10ManifestRows.length > 0);
   });
 
+  await t.test('DIV 10 Coast report produces fuel-expense facts', async () => {
+    const result = await parse(
+      ['DIV10', 'VDP AUTOMATION', 'Coast Transactions', 'Coast Fuel Report - 08.24.26 - 09.6.26.csv'],
+      '10', 'DIV10_COAST_FUEL',
+    );
+    assert.equal(result.adapterVersion, 'DIV10_V2');
+    assert.ok(result.division10FuelRows.length > 0);
+    assert.ok(result.division10FuelRows.every((row) => row.date && row.operatorName && Number(row.amount) > 0));
+  });
+
   await t.test('DIV 11 shift report produces performance facts and observed windows', async () => {
     const result = await parse(
       ['DIV11', 'VDP AUTOMATION', 'Shift Hours and Mileage', '9.0 Shift Hours Mileage Report 9.7 - 9.13.xlsx'],

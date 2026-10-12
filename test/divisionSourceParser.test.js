@@ -15,6 +15,7 @@ test('division source contracts expose only recurring source datasets', () => {
   assert.equal(contractForDivisionNumber('13').length, 0);
   assert.equal(definitionForDataset('6', 'DIV5_BIG_EXPORT'), null);
   assert.equal(publicContractForDivision({ divisionNumber: '10' }).targetWorkbook, 'VDP_DIV10 UPDATED TEMPLATE.xlsm');
+  assert.equal(definitionForDataset('10', 'DIV10_COAST_FUEL').title, 'Coast Fuel Report');
 });
 
 test('a matching division source workbook is accepted and dated', async () => {
@@ -70,6 +71,25 @@ test('DIV 10 Trapeze pivots are reduced to route/day calculation rows', async ()
     date: '2026-08-24', route: '901', trips: '16', totalHours: '11.4',
     serviceHours: '10.7', revenueHours: '10.9', serviceMiles: '139.771',
     otherHours: { 'Trapeze Lunch Hours': '0.5' },
+  }]);
+});
+
+test('DIV 10 Coast reports are reduced to completed operator/day fuel expenses', async () => {
+  const csv = Buffer.from([
+    'Date,Time (EST),User,Vehicle,Description,Type,Amount,Status,Fuel Grade,Gallons,Cost Per Gallon',
+    '8/24/2026,12:30AM,Lisa Moore,8815,Station One,Purchase,$57.41,Completed,Diesel,9.413,$6.10',
+    '8/24/2026,10:57PM,Lisa Moore,8815,Station Two,Purchase,$60.00,Completed,Biodiesel,9.29,$6.46',
+    '8/25/2026,01:51AM,Lisa Moore,8815,Station Three,Purchase,$42.00,Declined,Diesel,6.3,$6.67',
+  ].join('\n'));
+  const parsed = await parseDivisionSourceFile(
+    csv,
+    'Coast Fuel Report - 08.24.26 - 09.6.26.csv',
+    '10',
+    'DIV10_COAST_FUEL',
+    { cycle: { cycleStart: new Date('2026-08-24T00:00:00Z'), cycleEnd: new Date('2026-09-06T23:59:59Z') } },
+  );
+  assert.deepEqual(parsed.division10FuelRows, [{
+    date: '2026-08-24', operatorName: 'Lisa Moore', amount: '117.41',
   }]);
 });
 

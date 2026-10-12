@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import Division from '../models/Division.js';
 import PerformanceImport from '../models/PerformanceImport.js';
 import VdpCycle from '../models/VdpCycle.js';
 import Vdp from '../models/Vdp.js';
@@ -63,6 +64,10 @@ export async function uploadUberTollFiles({ cycleId, divisionId, files, user }) 
       dates: [...preparsed.values()].flatMap((parsed) => parsed.weeksDetected),
       label: 'Uber toll dataset',
     });
+  }
+  const division = await Division.findById(cycle.divisionId).select('divisionNumber');
+  if (String(division?.divisionNumber || '').trim() === '10') {
+    throw badRequest('Division 10 does not use Uber toll reimbursements.');
   }
   const [existing, uberImports] = await Promise.all([
     activeUberTollImportsFor(cycle._id),

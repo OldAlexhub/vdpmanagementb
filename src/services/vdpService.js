@@ -10,7 +10,7 @@ import { calculateUberVdp, serializeUberResult, UberCalculationError } from './u
 import { resolveVersion, resolveSettings, engineSettings, uberEngineSettings, validateVersion, SERVICE_MILE_ALLOWANCE } from './planService.js';
 import { activeImportFor, matchRoutes, unresolvedRoutes } from './performanceService.js';
 import { activeUberImportsFor, matchUberDrivers, uberRowsForCycle } from './uberPerformanceService.js';
-import { activeUberTollImportsFor, tollWeeklyAdjustments, uberTollReadiness } from './uberTollService.js';
+import { activeUberTollImportsFor, tollWeeklyAdjustments } from './uberTollService.js';
 import { activeDivision3ImportsFor, division3Readiness, division3RowsForCalculation } from './division3ImportService.js';
 import { hoursForMetric, HOUR_METRICS } from './performanceParser.js';
 import { weekOf, isoDate, endOfDayIn } from './cycleService.js';
@@ -435,6 +435,7 @@ export async function computeVdp(vdp, preloaded = {}) {
   }
   const isUber = settings?.calculationType?.value === 'UBER';
   const isDivision3 = isDivision3Division(division);
+  const isDivision10 = String(division?.divisionNumber || '').trim() === '10';
 
   for (const o of activeOperators(provider, cycle)) {
     const lease = o.liftLease;
@@ -469,7 +470,9 @@ export async function computeVdp(vdp, preloaded = {}) {
         `Uber contracted hours are missing for operator${missingContractedHours.length === 1 ? '' : 's'} ${missingContractedHours.map((operator) => operator.name).join(', ')}. Add weekly contracted hours to each operator on the provider profile.`));
     }
     uberImports = preloaded.uberImports !== undefined ? preloaded.uberImports : await activeUberImportsFor(cycle._id);
-    uberTollImports = preloaded.uberTollImports !== undefined ? preloaded.uberTollImports : await activeUberTollImportsFor(cycle._id);
+    uberTollImports = isDivision10
+      ? []
+      : preloaded.uberTollImports !== undefined ? preloaded.uberTollImports : await activeUberTollImportsFor(cycle._id);
     if (!uberImports.length) {
       exceptions.push(exception('NO_UBER_PERFORMANCE_IMPORT', 'No valid Uber weekly data has been uploaded for this cycle.'));
     } else {
@@ -508,15 +511,6 @@ export async function computeVdp(vdp, preloaded = {}) {
       };
       if (!rows.length) {
         exceptions.push(exception('NO_UBER_PERFORMANCE_DATA', `No uploaded Uber rows are matched to ${provider.name}'s operators.`));
-      }
-      if (String(division?.divisionNumber || '').trim() === '10') {
-        const tolls = uberTollReadiness({ cycle, tollImports: uberTollImports, uberImports });
-        if (!tolls.ready) {
-          const detail = tolls.missingWeeks.length
-            ? ` Missing week${tolls.missingWeeks.length === 1 ? '' : 's'}: ${tolls.missingWeeks.join(', ')}.`
-            : ` ${tolls.unmatchedRows.length} non-zero toll row(s) do not match the Uber Report.`;
-          exceptions.push(exception('DIV2_TOLL_DATA_INCOMPLETE', `DIV ${String(division.divisionNumber).trim()} needs one valid Uber toll reimbursement file for each week.${detail}`));
-        }
       }
     }
   } else if (!isUber) {
@@ -825,7 +819,7 @@ export async function processCycle(cycleId, user, { partial = false } = {}) {
   const [importDoc, uberImports, uberTollImports, division3Imports] = await Promise.all([
     needsStandard ? activeImportFor(cycle._id) : Promise.resolve(null),
     needsUber ? activeUberImportsFor(cycle._id) : Promise.resolve([]),
-    needsUber && (division2 || division10) ? activeUberTollImportsFor(cycle._id) : Promise.resolve([]),
+    needsUber && division2 ? activeUberTollImportsFor(cycle._id) : Promise.resolve([]),
     division3 ? activeDivision3ImportsFor(cycle._id) : Promise.resolve([]),
   ]);
   if (needsStandard && !importDoc) throw badRequest('Upload the Performance Report for this cycle before processing standard VDP plans.');
@@ -834,10 +828,6 @@ export async function processCycle(cycleId, user, { partial = false } = {}) {
     const loadedWeeks = new Set(uberImports.flatMap((doc) => doc.weeksDetected || []));
     const missingWeeks = [isoDate(cycle.week1Start), isoDate(cycle.week2Start)].filter((week) => !loadedWeeks.has(week));
     if (missingWeeks.length) throw badRequest(`Upload the DIV ${division2 ? '2' : division10 ? '10' : '3'} Uber Report for both weeks before processing. Missing: ${missingWeeks.join(', ')}.`);
-  }
-  if (needsUber && division10) {
-    const tolls = uberTollReadiness({ cycle, tollImports: uberTollImports, uberImports });
-    if (!tolls.ready) throw badRequest(`Upload one valid DIV ${division2 ? '2' : '10'} Uber toll reimbursement file for each week before processing.${tolls.missingWeeks.length ? ` Missing: ${tolls.missingWeeks.join(', ')}.` : ''}`);
   }
   const matches = importDoc ? matchRoutes(importDoc, providers) : [];
   const unresolved = unresolvedRoutes(matches);
