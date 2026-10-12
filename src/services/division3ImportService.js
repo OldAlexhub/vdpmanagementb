@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import PerformanceImport from '../models/PerformanceImport.js';
 import VdpCycle from '../models/VdpCycle.js';
 import Division from '../models/Division.js';
@@ -67,6 +68,19 @@ async function parse(kind, buffer, fileName) {
   if (kind === 'DIV3_ADA_FARE') return parseDivision3FareFile(buffer, fileName);
   if (kind === 'DIV3_RETURNED_FARE') return parseDivision3ReturnedFareFile(buffer, fileName);
   throw badRequest('Choose a valid Division 3 dataset type.');
+}
+
+const uploadSource = (file) => file.path || file.buffer;
+
+async function uploadHash(file) {
+  if (file.buffer) return crypto.createHash('sha256').update(file.buffer).digest('hex');
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(file.path);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
 }
 
 async function requireDivision3(divisionId) {
@@ -161,7 +175,7 @@ export async function uploadDivision3Files({ cycleId, divisionId, kind, files, u
     await requireDivision3(divisionId);
     for (const file of files) {
       try {
-        preparsed.set(file, await parse(kind, file.buffer, file.originalname));
+        preparsed.set(file, await parse(kind, uploadSource(file), file.originalname));
       } catch (error) {
         throw badRequest(`The pay period could not be identified from ${file.originalname}: ${error.message}`);
       }
@@ -188,7 +202,7 @@ export async function uploadDivision3Files({ cycleId, divisionId, kind, files, u
   const results = [];
 
   for (const file of files) {
-    const fileHash = crypto.createHash('sha256').update(file.buffer).digest('hex');
+    const fileHash = await uploadHash(file);
     let parsed = null;
     let errors = [];
     let details = {};
@@ -197,7 +211,7 @@ export async function uploadDivision3Files({ cycleId, divisionId, kind, files, u
       details = { code: 'DUPLICATE_UPLOAD' };
     } else {
       try {
-        parsed = preparsed.get(file) || await parse(kind, file.buffer, file.originalname);
+        parsed = preparsed.get(file) || await parse(kind, uploadSource(file), file.originalname);
         const from = isoDate(cycle.cycleStart);
         const to = isoDate(cycle.cycleEnd);
         const outside = parsed.datesDetected.filter((date) => date < from || date > to);
@@ -234,7 +248,7 @@ export async function uploadDivision3Files({ cycleId, divisionId, kind, files, u
       kind,
       originalFileName: file.originalname,
       fileHash,
-      fileSize: file.size ?? file.buffer.length,
+      fileSize: file.size ?? file.buffer?.length,
       uploadedBy: actor(user),
       rowCount: valid ? parsed.rowCount : 0,
       status: valid ? 'ACTIVE' : 'INVALID',

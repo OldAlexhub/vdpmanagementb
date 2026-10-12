@@ -1,5 +1,8 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import mongoose from 'mongoose';
 import XLSX from 'xlsx';
 import {
@@ -40,6 +43,21 @@ describe('Division 3 source parsers', () => {
     assert.equal(parsed.rows[0].attainmentHours, parsed.rows[0].paidHours);
     assert.equal(parsed.rows[0].lateStart, true);
     assert.equal(parsed.rows[0].earlyEnd, true);
+  });
+
+  test('streams a staged GoLink XLSX file to the same driver/day result', async () => {
+    const buffer = workbook([duty()]);
+    const expected = await parseDivision3DutyFile(buffer, 'golink.xlsx', 'GOLINK');
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'vdp-golink-test-'));
+    const file = path.join(directory, 'golink.xlsx');
+    try {
+      await fs.writeFile(file, buffer);
+      const streamed = await parseDivision3DutyFile(file, 'golink.xlsx', 'GOLINK');
+      assert.deepEqual(streamed.rows, expected.rows);
+      assert.equal(streamed.sourceRowCount, expected.sourceRowCount);
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true });
+    }
   });
 
   test('normalizes repeating minute conversions for MongoDB Decimal128', async () => {

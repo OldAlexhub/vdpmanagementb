@@ -63,7 +63,7 @@ export async function cycleSummary(cycleId) {
   const tollReadiness = uberTollReadiness({ cycle, tollImports, uberImports });
   const expectedUberWeeks = [isoDate(cycle.week1Start), isoDate(cycle.week2Start)];
   const loadedUberWeeks = [...new Set(uberImports.flatMap((doc) => doc.weeksDetected || []))].sort();
-  const missingUberWeeks = (division2 || (division3 && uberImports.length > 0))
+  const missingUberWeeks = (division2 || division10 || (division3 && uberImports.length > 0))
     ? expectedUberWeeks.filter((week) => !loadedUberWeeks.includes(week))
     : [];
   const division3Data = division3 ? division3Readiness({ cycle, imports: division3Imports, providers, processingDivisions }) : null;
@@ -99,7 +99,7 @@ export async function cycleSummary(cycleId) {
       activeFileCount: uberImports.length,
       rowCount: uberImports.reduce((total, doc) => total + (doc.rowCount || 0), 0),
       weeksDetected: loadedUberWeeks,
-      expectedWeeks: (division2 || division3) ? expectedUberWeeks : [],
+      expectedWeeks: (division2 || division3 || division10) ? expectedUberWeeks : [],
       missingWeeks: missingUberWeeks,
       ready: uberImports.length > 0 ? missingUberWeeks.length === 0 : !uberRequired,
       driversDetected: driverMatches.length,

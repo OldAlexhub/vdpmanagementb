@@ -1,4 +1,6 @@
 import XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
+import fs from 'node:fs';
 import Decimal from 'decimal.js';
 import { normalizeName } from './uberDriverMatching.js';
 
@@ -98,14 +100,17 @@ const isoTime = (value) => {
   return parsed ? parsed.toISOString() : null;
 };
 
-function workbookRows(buffer, fileName) {
+function workbookRows(input, fileName) {
   const extension = String(fileName || '').toLowerCase().split('.').pop();
   if (!['xlsx', 'xls', 'csv'].includes(extension)) {
     throw new Division3FileValidationError('Division 3 data files must be .xlsx, .xls, or .csv.', { code: 'UNSUPPORTED_FILE_TYPE' });
   }
   let workbook;
   try {
-    workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true, raw: true });
+    const options = { cellDates: true, raw: true, dense: true, sheets: 0 };
+    workbook = typeof input === 'string'
+      ? XLSX.readFile(input, options)
+      : XLSX.read(input, { ...options, type: 'buffer' });
   } catch (error) {
     throw new Division3FileValidationError(`The workbook could not be read: ${error.message}`, { code: 'UNREADABLE_FILE' });
   }
@@ -117,8 +122,8 @@ function workbookRows(buffer, fileName) {
   };
 }
 
-function table(buffer, fileName, required, aliases = {}) {
-  const { rows, sheetName } = workbookRows(buffer, fileName);
+function table(input, fileName, required, aliases = {}) {
+  const { rows, sheetName } = workbookRows(input, fileName);
   const names = new Set(required.flatMap((name) => [name, ...(aliases[name] || [])]).map(normalizedHeader));
   const headerIndex = rows.slice(0, 25).findIndex((row) => row.filter((cell) => names.has(normalizedHeader(cell))).length >= Math.min(4, required.length));
   if (headerIndex < 0) throw new Division3FileValidationError('Could not find the Division 3 data header row.', { code: 'HEADER_NOT_FOUND' });
@@ -143,6 +148,71 @@ function table(buffer, fileName, required, aliases = {}) {
   };
 }
 
+async function visitTable(input, fileName, required, aliases, visitor) {
+  const extension = String(fileName || '').toLowerCase().split('.').pop();
+  // ExcelJS reads the worksheet row-by-row from disk, which keeps 60+ MB
+  // Compass exports out of the Node heap. Buffers and legacy XLS/CSV files use
+  // the existing parser so API and unit-test compatibility is preserved.
+  if (typeof input !== 'string' || extension !== 'xlsx') {
+    const source = table(input, fileName, required, aliases);
+    for (const record of source.records) await visitor(record);
+    return { sheetName: source.sheetName, headers: source.headers };
+  }
+
+  const names = new Set(required.flatMap((name) => [name, ...(aliases[name] || [])]).map(normalizedHeader));
+  let sheetName = null;
+  let headers = null;
+  let indexOf = null;
+  try {
+    const workbook = new ExcelJS.stream.xlsx.WorkbookReader(input, {
+      entries: 'emit', sharedStrings: 'cache', hyperlinks: 'ignore', styles: 'ignore', worksheets: 'emit',
+    });
+    for await (const worksheet of workbook) {
+      sheetName = worksheet.name;
+      for await (const excelRow of worksheet) {
+        const row = Array.isArray(excelRow.values) ? excelRow.values.slice(1) : [];
+        if (!headers) {
+          if (excelRow.number > 25) break;
+          if (row.filter((cell) => names.has(normalizedHeader(cell))).length < Math.min(4, required.length)) continue;
+          headers = row.map((header) => String(header ?? '').trim());
+          const indexes = new Map(headers.map((header, index) => [normalizedHeader(header), index]));
+          indexOf = (name) => [name, ...(aliases[name] || [])]
+            .map(normalizedHeader).map((key) => indexes.get(key)).find((index) => index !== undefined);
+          const missingColumns = required.filter((name) => indexOf(name) === undefined);
+          if (missingColumns.length) {
+            throw new Division3FileValidationError(`Missing required column${missingColumns.length === 1 ? '' : 's'}: ${missingColumns.join(', ')}.`, {
+              code: 'MISSING_COLUMNS', missingColumns, detectedColumns: headers.filter(Boolean), sheetName,
+            });
+          }
+          continue;
+        }
+        if (!row.some((value) => !blank(value))) continue;
+        await visitor({
+          row,
+          rowNumber: excelRow.number,
+          get: (name) => row[indexOf(name)],
+          has: (name) => indexOf(name) !== undefined,
+        });
+      }
+      break;
+    }
+  } catch (error) {
+    if (error instanceof Division3FileValidationError) throw error;
+    // Some very small XLSX producers place worksheet ZIP entries before the
+    // workbook relationship entry. ExcelJS cannot stream that uncommon order;
+    // a bounded fallback is safe for small files and keeps tests/exports from
+    // those producers compatible without ever materializing a large Compass file.
+    if (!headers && /reading 'sheets'/.test(error.message) && fs.statSync(input).size <= 10 * 1024 * 1024) {
+      const source = table(input, fileName, required, aliases);
+      for (const record of source.records) await visitor(record);
+      return { sheetName: source.sheetName, headers: source.headers };
+    }
+    throw new Division3FileValidationError(`The workbook could not be read: ${error.message}`, { code: 'UNREADABLE_FILE' });
+  }
+  if (!headers) throw new Division3FileValidationError('Could not find the Division 3 data header row.', { code: 'HEADER_NOT_FOUND' });
+  return { sheetName, headers };
+}
+
 const DUTY_COLUMNS = [
   'Driver Name', 'Provider', 'Duty ID', 'Duty Scheduled Start Time', 'Duty Scheduled End Time',
   'Duty Status', 'First Seen In Service Area Time', 'Last Seen In Service Area Time',
@@ -158,21 +228,20 @@ const decimal = (value) => new Decimal(value || 0);
 // are normalized at a precision far beyond what payroll rounding consumes.
 const calculatedHours = (value) => decimal(value).toDecimalPlaces(12, Decimal.ROUND_HALF_UP).toString();
 
-export async function parseDivision3DutyFile(buffer, fileName, service) {
+export async function parseDivision3DutyFile(input, fileName, service) {
   if (!['ADA', 'GOLINK'].includes(service)) throw new Division3FileValidationError('Choose ADA or GoLink duty data.', { code: 'INVALID_KIND' });
-  const source = table(buffer, fileName, DUTY_COLUMNS);
   const errors = [];
   const grouped = new Map();
   let sourceRowCount = 0;
   let excludedRowCount = 0;
 
-  for (const record of source.records) {
+  const source = await visitTable(input, fileName, DUTY_COLUMNS, {}, async (record) => {
     const provider = String(record.get('Provider') ?? '').trim().toLowerCase();
     const status = String(record.get('Duty Status') ?? '').trim().toLowerCase();
     const firstSeen = isoTime(record.get('First Seen In Service Area Time'));
     if (provider !== 'big star' || status !== 'completed' || !firstSeen) {
       excludedRowCount += 1;
-      continue;
+      return;
     }
     sourceRowCount += 1;
     const driverName = String(record.get('Driver Name') ?? '').trim().replace(/\s+/g, ' ');
@@ -187,7 +256,7 @@ export async function parseDivision3DutyFile(buffer, fileName, service) {
     const values = Object.fromEntries(numericNames.map((name) => [name, exactNumber(record.get(name), { blankAsZero: true })]));
     if (!driverName || !date || !lastSeen || Object.values(values).some((value) => value === null)) {
       errors.push(`Row ${record.rowNumber}: expected a driver, valid service timestamps, and numeric duty-hour values.`);
-      continue;
+      return;
     }
     const key = `${division3DriverKey(driverName)}|${date}`;
     const current = grouped.get(key) || {
@@ -213,7 +282,7 @@ export async function parseDivision3DutyFile(buffer, fileName, service) {
     current.firstSeen = minTime(current.firstSeen, firstSeen);
     current.lastSeen = maxTime(current.lastSeen, lastSeen);
     grouped.set(key, current);
-  }
+  });
   if (errors.length) {
     throw new Division3FileValidationError(`Division 3 ${service} duty validation failed. ${errors.slice(0, 20).join(' ')}`, {
       code: 'MALFORMED_ROWS', errors, detectedColumns: source.headers.filter(Boolean), sheetName: source.sheetName,
@@ -244,17 +313,16 @@ export async function parseDivision3DutyFile(buffer, fileName, service) {
 
 const FARE_COLUMNS = ['Trip Status', 'Pickup Arrived At', 'Driver Name', 'Provider', 'Number of Riders (Adult)'];
 
-export async function parseDivision3FareFile(buffer, fileName) {
-  const source = table(buffer, fileName, FARE_COLUMNS);
+export async function parseDivision3FareFile(input, fileName) {
   const grouped = new Map();
   const errors = [];
   let sourceRowCount = 0;
   let excludedRowCount = 0;
-  for (const record of source.records) {
+  const source = await visitTable(input, fileName, FARE_COLUMNS, {}, async (record) => {
     if (String(record.get('Provider') ?? '').trim().toLowerCase() !== 'big star'
       || String(record.get('Trip Status') ?? '').trim().toLowerCase() !== 'completed') {
       excludedRowCount += 1;
-      continue;
+      return;
     }
     sourceRowCount += 1;
     const driverName = String(record.get('Driver Name') ?? '').trim().replace(/\s+/g, ' ');
@@ -262,7 +330,7 @@ export async function parseDivision3FareFile(buffer, fileName) {
     const riders = exactNumber(record.get('Number of Riders (Adult)'), { blankAsZero: true });
     if (!driverName || !date || riders === null) {
       errors.push(`Row ${record.rowNumber}: expected Driver Name, Pickup Arrived At, and a numeric Number of Riders (Adult).`);
-      continue;
+      return;
     }
     const key = `${division3DriverKey(driverName)}|${date}`;
     const current = grouped.get(key) || { date, driverName, tripCount: 0, adultRiders: new Decimal(0), fareCost: new Decimal(0) };
@@ -270,7 +338,7 @@ export async function parseDivision3FareFile(buffer, fileName) {
     current.adultRiders = current.adultRiders.plus(riders);
     current.fareCost = current.fareCost.plus(decimal(riders).times(DIV3_ADA_FARE_RATE));
     grouped.set(key, current);
-  }
+  });
   if (errors.length) throw new Division3FileValidationError(`Division 3 ADA fare validation failed. ${errors.slice(0, 20).join(' ')}`, { code: 'MALFORMED_ROWS', errors, detectedColumns: source.headers.filter(Boolean) });
   const rows = [...grouped.values()].map((row) => ({ ...row, adultRiders: row.adultRiders.toString(), fareCost: row.fareCost.toFixed(2) }))
     .sort((a, b) => a.date.localeCompare(b.date) || a.driverName.localeCompare(b.driverName));
@@ -288,27 +356,25 @@ const RETURNED_REQUIRED = ['PARTNER NAME', 'DriverName', 'Date', 'Fare To Collec
 const RETURNED_ALIASES = { DriverName: ['Driver Name'], 'PARTNER NAME': ['Partner Name'] };
 const RETURNED_OPTIONAL = ['1029', '# Orange Coupon', '# Green Coupon', '$ Orange Coupon', '$ Green Coupon', '$ Stripe', '$ Wallet', 'Cash to be Deducted'];
 
-export async function parseDivision3ReturnedFareFile(buffer, fileName) {
-  const source = table(buffer, fileName, RETURNED_REQUIRED, RETURNED_ALIASES);
-  const has = Object.fromEntries(RETURNED_OPTIONAL.map((name) => [name, source.records[0]?.has(name) || false]));
-  const schemaComplete = has['1029'] && (has['$ Orange Coupon'] || has['# Orange Coupon'])
-    && (has['$ Green Coupon'] || has['# Green Coupon']) && has['$ Stripe'] && has['$ Wallet'];
+export async function parseDivision3ReturnedFareFile(input, fileName) {
+  let has = null;
   const rows = [];
   const errors = [];
-  for (const record of source.records) {
+  const source = await visitTable(input, fileName, RETURNED_REQUIRED, RETURNED_ALIASES, async (record) => {
+    if (!has) has = Object.fromEntries(RETURNED_OPTIONAL.map((name) => [name, record.has(name)]));
     const partnerName = String(record.get('PARTNER NAME') ?? '').trim().replace(/\s+/g, ' ');
     const driverName = String(record.get('DriverName') ?? '').trim().replace(/\s+/g, ' ');
     const date = isoDate(record.get('Date'));
     const fareToCollect = exactNumber(record.get('Fare To Collect'));
     if (!partnerName || !driverName || !date || fareToCollect === null) {
       errors.push(`Row ${record.rowNumber}: expected PARTNER NAME, DriverName, Date, and numeric Fare To Collect.`);
-      continue;
+      return;
     }
     const amount = (name) => (has[name] ? exactNumber(record.get(name), { blankAsZero: true }) : '0');
     const values = Object.fromEntries(RETURNED_OPTIONAL.map((name) => [name, amount(name)]));
     if (Object.values(values).some((value) => value === null)) {
       errors.push(`Row ${record.rowNumber}: an NSM reconciliation amount is not numeric.`);
-      continue;
+      return;
     }
     const orangeCoupon = has['$ Orange Coupon'] ? decimal(values['$ Orange Coupon']) : decimal(values['# Orange Coupon']).times(3);
     const greenCoupon = has['$ Green Coupon'] ? decimal(values['$ Green Coupon']) : decimal(values['# Green Coupon']).times('3.50');
@@ -320,9 +386,13 @@ export async function parseDivision3ReturnedFareFile(buffer, fileName) {
       orangeCoupon: orangeCoupon.toFixed(2), greenCoupon: greenCoupon.toFixed(2),
       stripe: values['$ Stripe'], wallet: values['$ Wallet'],
       cashToDeduct: decimal(fareToCollect).minus(deductions).toFixed(2),
-      schemaComplete,
+      schemaComplete: false,
     });
-  }
+  });
+  has ||= Object.fromEntries(RETURNED_OPTIONAL.map((name) => [name, false]));
+  const schemaComplete = has['1029'] && (has['$ Orange Coupon'] || has['# Orange Coupon'])
+    && (has['$ Green Coupon'] || has['# Green Coupon']) && has['$ Stripe'] && has['$ Wallet'];
+  rows.forEach((row) => { row.schemaComplete = schemaComplete; });
   if (errors.length) throw new Division3FileValidationError(`Division 3 returned-fare validation failed. ${errors.slice(0, 20).join(' ')}`, { code: 'MALFORMED_ROWS', errors, detectedColumns: source.headers.filter(Boolean) });
   if (!rows.length) throw new Division3FileValidationError('The returned-fare file has no reconciliation rows.', { code: 'NO_DATA_ROWS', detectedColumns: source.headers.filter(Boolean) });
   return {

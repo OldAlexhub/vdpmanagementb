@@ -1,5 +1,8 @@
 import { Router } from 'express';
 import multer from 'multer';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import { requireAuth, requireAdmin, requireStaff, requireProvider } from '../middleware/auth.js';
 import * as auth from '../controllers/authController.js';
 import * as divisions from '../controllers/divisionController.js';
@@ -21,10 +24,16 @@ import { cycleWorkbook } from '../services/exportService.js';
 import { registerPdf, cycleSchedulePdf, planReportPdf } from '../services/pdfService.js';
 import { leadershipReport, providerReport } from '../services/analyticsService.js';
 
-// Compass duty exports (especially DIV 3 GoLink) can exceed 25 MB before they
-// are reduced to driver/day records. The buffer is short-lived and the stored
-// Mongo document contains only normalized aggregates.
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } });
+// Large Compass duty exports are spooled outside MongoDB and processed one at
+// a time. The controller removes each temporary file after normalization.
+const division3Upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, done) => done(null, os.tmpdir()),
+    filename: (_req, file, done) => done(null, `bigstar-vdp-${crypto.randomUUID()}${path.extname(file.originalname).toLowerCase()}`),
+  }),
+  limits: { fileSize: 100 * 1024 * 1024, files: 20 },
+});
 const api = Router();
 
 api.get('/health', (_req, res) => res.json({ ok: true }));
@@ -123,7 +132,7 @@ api.delete('/uber-performance-imports/:id', uberPerformance.remove);
 api.post('/uber-driver-matches', uberPerformance.assignDriver);
 
 api.get('/division3-imports', division3Imports.list);
-api.post('/division3-imports', upload.array('files', 20), division3Imports.upload);
+api.post('/division3-imports', division3Upload.array('files', 20), division3Imports.upload);
 api.delete('/division3-imports/invalid', division3Imports.clearInvalid);
 api.delete('/division3-imports/:id', division3Imports.remove);
 api.post('/division3-driver-matches', division3Imports.assignDriver);

@@ -13,6 +13,7 @@ import {
   publicSourceDefinition,
 } from './divisionSourceDefinitions.js';
 import { DivisionSourceValidationError, parseDivisionSourceFile } from './divisionSourceParser.js';
+import { DIV10_ADAPTER_VERSION, refreshDivision10DerivedImport } from './division10Adapter.js';
 
 const activeFor = (cycleId, datasetType = null) => PerformanceImport.find({
   cycleId,
@@ -40,6 +41,7 @@ const summary = (doc) => ({
   processingErrors: doc.processingErrors || [],
   warnings: doc.warnings || [],
   sheetName: doc.stats?.sheetName || null,
+  adapterVersion: doc.stats?.adapterVersion || null,
 });
 
 async function divisionForUpload(cycle, divisionId) {
@@ -81,7 +83,7 @@ export async function uploadDivisionSourceFiles({ cycleId, divisionId, datasetTy
     }
     for (const file of files) {
       try {
-        preparsed.set(file, parseDivisionSourceFile(file.buffer, file.originalname, division.divisionNumber, datasetType));
+        preparsed.set(file, await parseDivisionSourceFile(file.buffer, file.originalname, division.divisionNumber, datasetType));
       } catch (error) {
         throw badRequest(`The pay period could not be identified from ${file.originalname}: ${parseError(error).errors[0]}`, parseError(error).details);
       }
@@ -94,31 +96,32 @@ export async function uploadDivisionSourceFiles({ cycleId, divisionId, datasetTy
   }
 
   const existing = await activeFor(cycle._id, datasetType);
-  const hashes = new Set(existing.map((doc) => doc.fileHash));
+  const existingByHash = new Map(existing.map((doc) => [doc.fileHash, doc]));
   const results = [];
   const from = isoDate(cycle.cycleStart);
   const to = isoDate(cycle.cycleEnd);
 
   for (const file of files) {
     const fileHash = crypto.createHash('sha256').update(file.buffer).digest('hex');
+    const duplicate = existingByHash.get(fileHash);
+    if (duplicate && (String(division.divisionNumber).trim() !== '10'
+      || duplicate.stats?.adapterVersion === DIV10_ADAPTER_VERSION)) {
+      results.push({ ...summary(duplicate), reused: true });
+      continue;
+    }
     let parsed = null;
     let errors = [];
     let details = {};
-    if (hashes.has(fileHash)) {
-      errors = ['This exact file is already active in this dataset slot for the selected VDP period.'];
-      details = { code: 'DUPLICATE_UPLOAD' };
-    } else {
-      try {
-        parsed = preparsed.get(file) || parseDivisionSourceFile(file.buffer, file.originalname, division.divisionNumber, datasetType, { cycle });
-        const inPeriod = parsed.datesDetected.filter((date) => date >= from && date <= to);
-        const outside = parsed.datesDetected.filter((date) => date < from || date > to);
-        if (!inPeriod.length) errors.push(`The file has no source dates inside this VDP period (${from} to ${to}).`);
-        if (outside.length && !definition.allowDatesOutsideCycle) {
-          errors.push(`Source date${outside.length === 1 ? '' : 's'} outside this VDP period: ${outside.slice(0, 10).join(', ')}${outside.length > 10 ? ', ...' : ''}.`);
-        }
-      } catch (error) {
-        ({ errors, details } = parseError(error));
+    try {
+      parsed = preparsed.get(file) || await parseDivisionSourceFile(file.buffer, file.originalname, division.divisionNumber, datasetType, { cycle });
+      const inPeriod = parsed.datesDetected.filter((date) => date >= from && date <= to);
+      const outside = parsed.datesDetected.filter((date) => date < from || date > to);
+      if (!inPeriod.length) errors.push(`The file has no source dates inside this VDP period (${from} to ${to}).`);
+      if (outside.length && !definition.allowDatesOutsideCycle) {
+        errors.push(`Source date${outside.length === 1 ? '' : 's'} outside this VDP period: ${outside.slice(0, 10).join(', ')}${outside.length > 10 ? ', ...' : ''}.`);
       }
+    } catch (error) {
+      ({ errors, details } = parseError(error));
     }
 
     const valid = Boolean(parsed) && errors.length === 0;
@@ -126,7 +129,7 @@ export async function uploadDivisionSourceFiles({ cycleId, divisionId, datasetTy
     const weeksDetected = [...new Set(datesInPeriod.map((date) => weekOf(date, cycle)).filter(Boolean).map((week) => (
       week === 1 ? isoDate(cycle.week1Start) : isoDate(cycle.week2Start)
     )))].sort();
-    const doc = new PerformanceImport({
+    const values = {
       divisionId: cycle.divisionId,
       cycleId: cycle._id,
       kind: 'DIVISION_SOURCE',
@@ -142,15 +145,31 @@ export async function uploadDivisionSourceFiles({ cycleId, divisionId, datasetTy
       dataRange: parsed?.dataRange,
       datesDetected: parsed?.datesDetected || [],
       weeksDetected,
-      detectedColumns: parsed?.detectedColumns || details.detectedColumns || [],
-      stats: { validationCode: details.code || null, sheetName: parsed?.sheetName || null },
-    });
+      detectedColumns: parsed?.performanceColumns || parsed?.detectedColumns || details.detectedColumns || [],
+      stats: {
+        validationCode: details.code || null,
+        sheetName: parsed?.sheetName || null,
+        adapterVersion: valid ? parsed?.adapterVersion || null : null,
+      },
+      warnings: parsed?.warnings || [],
+      rows: valid ? parsed?.rows || [] : [],
+      division10ManifestRows: valid ? parsed?.division10ManifestRows || [] : [],
+      division10FareRows: valid ? parsed?.division10FareRows || [] : [],
+      division10FuelRows: valid ? parsed?.division10FuelRows || [] : [],
+    };
+    const doc = duplicate && valid ? duplicate : new PerformanceImport();
+    doc.set(values);
     await doc.save();
     results.push(summary(doc));
-    if (valid) hashes.add(fileHash);
+    if (valid) {
+      existingByHash.set(fileHash, doc);
+    }
   }
 
   if (results.some((item) => item.validationStatus === 'VALID')) {
+    if (String(division.divisionNumber).trim() === '10') {
+      await refreshDivision10DerivedImport({ cycle, user });
+    }
     await markCycleStale(cycle._id);
     if (['UPCOMING', 'OPEN'].includes(cycle.status)) {
       cycle.status = 'PROCESSING';
@@ -182,6 +201,10 @@ export async function removeDivisionSourceImport(id, user) {
   doc.replacedBy = actor(user);
   doc.replaceReason = 'Removed from the active division source dataset';
   await doc.save();
+  const [cycle, division] = await Promise.all([VdpCycle.findById(doc.cycleId), Division.findById(doc.divisionId)]);
+  if (cycle && String(division?.divisionNumber || '').trim() === '10') {
+    await refreshDivision10DerivedImport({ cycle, user });
+  }
   await markCycleStale(doc.cycleId);
   return summary(doc);
 }
@@ -231,6 +254,10 @@ export async function divisionSourceReadiness({ cycle, division }) {
   ]));
   const required = Object.values(datasets).filter((dataset) => dataset.required && dataset.stage === 'REQUIRED');
   const additional = Object.values(datasets).filter((dataset) => dataset.required && dataset.stage === 'ADDITIONAL');
+  const division10 = String(division?.divisionNumber || '').trim() === '10';
+  const requiredFiles = required.flatMap((dataset) => dataset.files.filter((file) => file.status === 'ACTIVE' && file.validationStatus === 'VALID'));
+  const adapterReady = division10 && required.length > 0 && required.every((dataset) => dataset.ready)
+    && requiredFiles.every((file) => file.adapterVersion === DIV10_ADAPTER_VERSION);
   return {
     configured: definitions.length > 0,
     targetWorkbook: contract.targetWorkbook,
@@ -239,9 +266,10 @@ export async function divisionSourceReadiness({ cycle, division }) {
     requiredReady: required.length > 0 && required.every((dataset) => dataset.ready),
     additionalReady: additional.every((dataset) => dataset.ready),
     ready: required.length > 0 && required.every((dataset) => dataset.ready) && additional.every((dataset) => dataset.ready),
-    // Upload validation is ready now; normalized calculation adapters are
-    // intentionally enabled division-by-division after their formulas are verified.
-    processingSupported: false,
+    processingSupported: adapterReady,
+    processingBlockReason: division10 && required.every((dataset) => dataset.ready) && !adapterReady
+      ? 'These files were staged before the DIV 10 calculation adapter was enabled. Re-upload each listed file once; exact duplicates will be upgraded in place without creating another upload.'
+      : null,
   };
 }
 

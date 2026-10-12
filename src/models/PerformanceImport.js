@@ -169,6 +169,41 @@ const division3DriverExclusionSchema = new Schema(
   { _id: false },
 );
 
+// DIV 10 source reports are normalized at upload time. Only the route/day or
+// operator/day facts used by the VDP are retained; the raw source workbooks
+// and manifest event dumps are never stored in MongoDB.
+const division10ManifestRowSchema = new Schema(
+  {
+    date: { type: String, required: true },
+    route: { type: String, required: true },
+    operatorName: String,
+    actualStartMinutes: { type: Number, required: true },
+    actualEndMinutes: { type: Number, required: true },
+    actualHours: dec({ required: true }),
+    lunchHours: dec({ required: true }),
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
+const division10FareRowSchema = new Schema(
+  {
+    date: { type: String, required: true },
+    route: { type: String, required: true },
+    operatorName: String,
+    cashFares: dec({ required: true }),
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
+const division10FuelRowSchema = new Schema(
+  {
+    date: { type: String, required: true },
+    operatorName: { type: String, required: true },
+    amount: dec({ required: true }),
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
 const importSchema = new Schema(
   {
     divisionId: { type: Schema.Types.ObjectId, ref: 'Division', required: true },
@@ -203,6 +238,9 @@ const importSchema = new Schema(
     division3ReturnedFareRows: { type: [division3ReturnedFareRowSchema], default: [] },
     division3DriverMatches: { type: [division3DriverMatchSchema], default: [] },
     division3DriverExclusions: { type: [division3DriverExclusionSchema], default: [] },
+    division10ManifestRows: { type: [division10ManifestRowSchema], default: [] },
+    division10FareRows: { type: [division10FareRowSchema], default: [] },
+    division10FuelRows: { type: [division10FuelRowSchema], default: [] },
     datesDetected: { type: [String], default: [] },
     weeksDetected: { type: [String], default: [] },
     driversDetected: { type: Number, default: 0 },

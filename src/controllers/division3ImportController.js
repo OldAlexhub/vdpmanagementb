@@ -1,18 +1,27 @@
 import * as service from '../services/division3ImportService.js';
+import fs from 'node:fs/promises';
+
+async function removeTemporaryUploads(files = []) {
+  await Promise.allSettled(files.filter((file) => file.path).map((file) => fs.unlink(file.path)));
+}
 
 export async function list(req, res) {
   res.json(await service.listDivision3Imports({ cycleId: req.query.cycleId, divisionId: req.query.divisionId, kind: req.query.kind }));
 }
 
 export async function upload(req, res) {
-  const results = await service.uploadDivision3Files({
-    cycleId: req.body.cycleId,
-    divisionId: req.body.divisionId,
-    kind: req.body.kind,
-    files: req.files,
-    user: req.user,
-  });
-  res.status(201).json({ files: results, cycleId: results.find((result) => result.cycleId)?.cycleId || null });
+  try {
+    const results = await service.uploadDivision3Files({
+      cycleId: req.body.cycleId,
+      divisionId: req.body.divisionId,
+      kind: req.body.kind,
+      files: req.files,
+      user: req.user,
+    });
+    res.status(201).json({ files: results, cycleId: results.find((result) => result.cycleId)?.cycleId || null });
+  } finally {
+    await removeTemporaryUploads(req.files);
+  }
 }
 
 export async function remove(req, res) {

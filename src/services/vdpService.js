@@ -18,6 +18,7 @@ import { bestRouteMatches } from './routeMatching.js';
 import { D, sum, isBlank, str, fmtMoney, fmtRate, fmtNum } from './money.js';
 import { badRequest, conflict, notFound, actor } from './errors.js';
 import { isDivision3Division, processingDivisionsFor } from './divisionGroups.js';
+import { DIV10_ADAPTER_VERSION, division10ProviderSourceData, refreshDivision10DerivedImport } from './division10Adapter.js';
 
 const EDITABLE = ['DRAFT', 'NEEDS_REVIEW', 'READY'];
 const ACKNOWLEDGEABLE = new Set(['NO_PERFORMANCE_DATA', 'PLAN_CHANGES_MID_CYCLE']);
@@ -372,6 +373,8 @@ export async function computeVdp(vdp, preloaded = {}) {
   }
   const mixedPlans = [...opPlan.values()].some((x) => x.own);
   const settingsOf = (operatorId) => opPlan.get(operatorId)?.settings || settings;
+  const division10WindowSource = String(division?.divisionNumber || '').trim() === '10'
+    && importDoc?.stats?.sourceAdapter === DIV10_ADAPTER_VERSION;
   const compassTuiOperators = activeOperators(provider, cycle).filter((operator) => {
     const operatorSettings = settingsOf(operator.id);
     return operator.source?.system === 'COMPASS' && operatorSettings?.tuiEligible?.value;
@@ -381,7 +384,8 @@ export async function computeVdp(vdp, preloaded = {}) {
     exceptions.push(exception('TUI_COMPASS_WINDOW_MISSING',
       `Compass has no active run-cut start/end time for ${withoutCompassWindow.map((operator) => operator.name).join(', ')}. TUI fulfillment and tiers cannot be calculated.`));
   }
-  const withoutWindowHoursSource = compassTuiOperators.filter((operator) => settingsOf(operator.id)?.attainmentHourMetric?.value !== 'OTHER');
+  const withoutWindowHoursSource = compassTuiOperators.filter((operator) => !division10WindowSource
+    && settingsOf(operator.id)?.attainmentHourMetric?.value !== 'OTHER');
   if (withoutWindowHoursSource.length) {
     exceptions.push(exception('TUI_WINDOW_HOURS_SOURCE_REQUIRED',
       `TUI for ${withoutWindowHoursSource.map((operator) => operator.name).join(', ')} requires a source containing only hours worked inside the Compass start/end window. Paid, total, service, and revenue hours were not used to activate a tier.`));
@@ -432,6 +436,7 @@ export async function computeVdp(vdp, preloaded = {}) {
   let uberTollImports = [];
   let division3Imports = [];
   let sourceAdjustments = [];
+  let sourceFuelExpense = null;
   if (isUber && settings) {
     const operators = activeOperators(provider, cycle);
     const paymentUnitCount = uberPaymentUnits(operators).length;
@@ -489,13 +494,13 @@ export async function computeVdp(vdp, preloaded = {}) {
       if (!rows.length) {
         exceptions.push(exception('NO_UBER_PERFORMANCE_DATA', `No uploaded Uber rows are matched to ${provider.name}'s operators.`));
       }
-      if (String(division?.divisionNumber || '').trim() === '2') {
+      if (['2', '10'].includes(String(division?.divisionNumber || '').trim())) {
         const tolls = uberTollReadiness({ cycle, tollImports: uberTollImports, uberImports });
         if (!tolls.ready) {
           const detail = tolls.missingWeeks.length
             ? ` Missing week${tolls.missingWeeks.length === 1 ? '' : 's'}: ${tolls.missingWeeks.join(', ')}.`
             : ` ${tolls.unmatchedRows.length} non-zero toll row(s) do not match the Uber Report.`;
-          exceptions.push(exception('DIV2_TOLL_DATA_INCOMPLETE', `DIV 2 needs one valid Uber toll reimbursement CSV for each week.${detail}`));
+          exceptions.push(exception('DIV2_TOLL_DATA_INCOMPLETE', `DIV ${String(division.divisionNumber).trim()} needs one valid Uber toll reimbursement CSV for each week.${detail}`));
         }
       }
     }
@@ -557,6 +562,22 @@ export async function computeVdp(vdp, preloaded = {}) {
     } else if (!importDoc) {
       exceptions.push(exception('NO_PERFORMANCE_IMPORT', 'No Performance Report has been uploaded for this cycle.'));
     } else if (settings) {
+      const division10Source = String(division?.divisionNumber || '').trim() === '10'
+        ? division10ProviderSourceData({
+          importDoc,
+          provider,
+          matches: preloaded.matches || matchRoutes(importDoc, await Provider.find({ divisionId: provider.divisionId })),
+          cycle,
+        })
+        : { importDoc, cashFares: '0', fuelExpense: null, fareRows: 0, fuelRows: 0 };
+      const performanceImport = division10Source.importDoc;
+      sourceFuelExpense = division10Source.fuelExpense;
+      if (D(division10Source.cashFares || 0).gt(0)) {
+        sourceAdjustments.push({
+          type: 'FARES', amount: division10Source.cashFares,
+          description: `DIV 10 Jasper cash fares (${division10Source.fareRows} route/day row${division10Source.fareRows === 1 ? '' : 's'})`,
+        });
+      }
       const metric = settings.performanceHourMetric.value;
       const otherColumn = settings.performanceHourColumn.value;
       const metricOf = (operatorId) => {
@@ -565,6 +586,9 @@ export async function computeVdp(vdp, preloaded = {}) {
       };
       const attainmentOf = (operatorId) => {
         const x = settingsOf(operatorId);
+        if (division10WindowSource && x?.tuiEligible?.value) {
+          return { metric: 'OTHER', otherColumn: 'Incentive Hours' };
+        }
         const attainmentMetric = x.attainmentHourMetric?.value || 'SAME_AS_PAID';
         return attainmentMetric === 'SAME_AS_PAID'
           ? metricOf(operatorId)
@@ -572,17 +596,32 @@ export async function computeVdp(vdp, preloaded = {}) {
       };
       const inPlay = [{ metric, otherColumn }, ...[...opPlan.keys()].flatMap((operatorId) => [metricOf(operatorId), attainmentOf(operatorId)])];
       const missingMetrics = new Set(inPlay.filter((m) => !(m.metric === 'OTHER'
-        ? (importDoc.detectedColumns?.otherHourColumns || []).includes(m.otherColumn)
-        : importDoc.detectedColumns?.[m.metric])).map((m) => HOUR_METRICS[m.metric]?.label || m.otherColumn));
+        ? (performanceImport.detectedColumns?.otherHourColumns || []).includes(m.otherColumn)
+        : performanceImport.detectedColumns?.[m.metric])).map((m) => HOUR_METRICS[m.metric]?.label || m.otherColumn));
       for (const label of missingMetrics) {
         exceptions.push(exception('METRIC_NOT_IN_REPORT', `The plan pays on "${label}", which is not in the uploaded report.`));
       }
-      const matches = preloaded.matches || matchRoutes(importDoc, await Provider.find({ divisionId: provider.divisionId }));
+      const matches = preloaded.matches || matchRoutes(performanceImport, await Provider.find({ divisionId: provider.divisionId }));
       performance = providerPerformance({
-        provider, cycle, importDoc, matches, metric, otherColumn,
+        provider, cycle, importDoc: performanceImport, matches, metric, otherColumn,
         metricOf: mixedPlans ? metricOf : undefined,
         attainmentOf,
       });
+      if (String(division?.divisionNumber || '').trim() === '10') {
+        performance.sourceInputs = {
+          adapter: DIV10_ADAPTER_VERSION,
+          cashFares: division10Source.cashFares,
+          fareRows: division10Source.fareRows,
+          fuelExpense: division10Source.fuelExpense,
+          fuelRows: division10Source.fuelRows,
+        };
+        const missingWindowHours = performance.operators.filter((operator) => settingsOf(operator.id)?.tuiEligible?.value
+          && operator.weeks.some((week) => D(week.actualHours || 0).gt(0) && isBlank(week.attainmentHours)));
+        if (missingWindowHours.length) {
+          exceptions.push(exception('DIV10_TUI_WINDOW_HOURS_MISSING',
+            `Manifest activity could not be aligned to a Compass start/end window for ${missingWindowHours.map((operator) => operator.name).join(', ')}. TUI tiers were not calculated.`));
+        }
+      }
       if (performance.unassignedRoutes.length) {
         exceptions.push(exception('ROUTE_WITHOUT_OPERATOR',
           `Route ${performance.unassignedRoutes.join(', ')} is matched to ${provider.name} but not to any of its operators. Add it to an operator on the provider profile.`));
@@ -633,7 +672,7 @@ export async function computeVdp(vdp, preloaded = {}) {
         }
       }
     }
-    const amount = str(vdp.fuelExpense?.amount);
+    const amount = str(vdp.fuelExpense?.amount) ?? sourceFuelExpense;
     if (expenseFuelOps.length && amount === null) exceptions.push(exception('FUEL_EXPENSE_MISSING', 'Fuel expense has not been entered.'));
     fuel = { days, actualExpense: amount };
   }
@@ -740,22 +779,24 @@ export async function processCycle(cycleId, user) {
   const needsStandard = !division3 && expected.some((provider) => typeFor(provider) !== 'UBER');
   const needsUber = division3 || expected.some((provider) => typeFor(provider) === 'UBER');
   const division2 = String(division?.divisionNumber || '').trim() === '2';
+  const division10 = String(division?.divisionNumber || '').trim() === '10';
+  if (division10 && needsStandard) await refreshDivision10DerivedImport({ cycle, user });
   const [importDoc, uberImports, uberTollImports, division3Imports] = await Promise.all([
     needsStandard ? activeImportFor(cycle._id) : Promise.resolve(null),
     needsUber ? activeUberImportsFor(cycle._id) : Promise.resolve([]),
-    needsUber && division2 ? activeUberTollImportsFor(cycle._id) : Promise.resolve([]),
+    needsUber && (division2 || division10) ? activeUberTollImportsFor(cycle._id) : Promise.resolve([]),
     division3 ? activeDivision3ImportsFor(cycle._id) : Promise.resolve([]),
   ]);
   if (needsStandard && !importDoc) throw badRequest('Upload the Performance Report for this cycle before processing standard VDP plans.');
   if (needsUber && !division3 && !uberImports.length) throw badRequest('Upload valid Uber weekly data for this cycle before processing Uber VDP plans.');
-  if (needsUber && uberImports.length && (division2 || division3)) {
+  if (needsUber && uberImports.length && (division2 || division3 || division10)) {
     const loadedWeeks = new Set(uberImports.flatMap((doc) => doc.weeksDetected || []));
     const missingWeeks = [isoDate(cycle.week1Start), isoDate(cycle.week2Start)].filter((week) => !loadedWeeks.has(week));
-    if (missingWeeks.length) throw badRequest(`Upload the DIV ${division2 ? '2' : '3'} Uber Report for both weeks before processing. Missing: ${missingWeeks.join(', ')}.`);
+    if (missingWeeks.length) throw badRequest(`Upload the DIV ${division2 ? '2' : division10 ? '10' : '3'} Uber Report for both weeks before processing. Missing: ${missingWeeks.join(', ')}.`);
   }
-  if (needsUber && division2) {
+  if (needsUber && (division2 || division10)) {
     const tolls = uberTollReadiness({ cycle, tollImports: uberTollImports, uberImports });
-    if (!tolls.ready) throw badRequest(`Upload one valid DIV 2 Uber toll reimbursement CSV for each week before processing.${tolls.missingWeeks.length ? ` Missing: ${tolls.missingWeeks.join(', ')}.` : ''}`);
+    if (!tolls.ready) throw badRequest(`Upload one valid DIV ${division2 ? '2' : '10'} Uber toll reimbursement CSV for each week before processing.${tolls.missingWeeks.length ? ` Missing: ${tolls.missingWeeks.join(', ')}.` : ''}`);
   }
   const matches = importDoc ? matchRoutes(importDoc, providers) : [];
   const unresolved = unresolvedRoutes(matches);
