@@ -77,6 +77,7 @@ by later Compass refreshes. An individual provider can still be edited afterward
 | `npm start` | Start the API |
 | `npm run dev` | Start with nodemon (restarts on file changes) |
 | `npm run seed` | Load the base division, plans and roster (safe to run again) |
+| `npm run bootstrap:production` | Seed a clean production database with blueprints, source contracts, settings, and the current Compass roster; refuses a populated database |
 | `npm run import:json -- <folder> --uri "<MONGO_URI>" [--db name] [--drop]` | Load an Extended JSON export (one `<collection>.json` per collection) into a database, keeping ObjectIds, dates and decimals. Collections that already have data are skipped unless `--drop` is given |
 | `npm run test:engine` | Calculation engine, parser, cycles and plans (no database needed) |
 | `npm test` | Everything, including end-to-end API tests on the `bigstar_vdp_test` database |

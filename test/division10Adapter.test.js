@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { division10ImportForProvider, division10ProviderSourceData } from '../src/services/division10Adapter.js';
+import { DIV10_ADAPTER_VERSION, division10ImportForProvider, division10ProviderSourceData } from '../src/services/division10Adapter.js';
 
 const provider = {
   _id: 'provider-1',
@@ -51,6 +51,26 @@ test('a worked day outside the Compass run-cut weekdays contributes zero TUI hou
   };
   const result = division10ImportForProvider(tuesday, provider);
   assert.equal(result.rows[0].otherHours['Incentive Hours'], '0');
+});
+
+test('TUI overlap uses the division timezone across daylight-saving boundaries', () => {
+  const dstProvider = {
+    _id: 'provider-1', name: 'Provider One', routes: ['918'],
+    operators: [{
+      id: 'operator-1', name: 'Lisa Moore', status: 'ACTIVE', routes: ['918'],
+      tuiWindows: [{ route: '918', daysOfWeek: ['SUN'], startTime: '00:30', endTime: '03:30', weekdayTimes: [] }],
+    }],
+  };
+  const source = (date) => ({
+    stats: { sourceAdapter: DIV10_ADAPTER_VERSION, windowSource: true },
+    rows: [{ date, route: '918', trips: '1', otherHours: {} }],
+    division10ManifestRows: [{ date, route: '918', operatorName: 'Lisa Moore', actualStartMinutes: 30, actualEndMinutes: 210 }],
+  });
+  const spring = division10ImportForProvider(source('2026-03-08'), dstProvider, 'America/Los_Angeles');
+  const fall = division10ImportForProvider(source('2026-11-01'), dstProvider, 'America/Los_Angeles');
+  assert.equal(spring.rows[0].otherHours['Incentive Hours'], '2');
+  assert.equal(fall.rows[0].otherHours['Incentive Hours'], '4');
+  assert.equal(fall.rows[0].tui.timezone, 'America/Los_Angeles');
 });
 
 test('DIV 10 Jasper fares and Coast fuel are assigned without storing raw source rows', () => {

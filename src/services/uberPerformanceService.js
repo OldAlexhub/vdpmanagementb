@@ -37,7 +37,9 @@ const importSummary = (doc) => ({
 });
 
 async function markCycleStale(cycleId) {
-  await Vdp.updateMany({ cycleId, status: { $in: ['DRAFT', 'NEEDS_REVIEW', 'READY'] } }, { $set: { stale: true } });
+  await Vdp.updateMany({ cycleId, status: { $in: ['DRAFT', 'NEEDS_REVIEW', 'READY'] } }, {
+    $set: { stale: true }, $addToSet: { staleReasons: 'Uber weekly data or driver matching changed.' },
+  });
 }
 
 function invalidDetails(error) {

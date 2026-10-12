@@ -14,6 +14,7 @@ const rowSchema = new Schema(
     revenueHours: dec({ default: null }),
     serviceMiles: dec({ default: null }), // Miles → Service; null = not in the report or blank
     otherHours: { type: Map, of: String, default: {} },
+    tui: mongoose.Schema.Types.Mixed,
   },
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
 );
@@ -204,6 +205,18 @@ const division10FuelRowSchema = new Schema(
   { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
 );
 
+const sourceAdjustmentRowSchema = new Schema(
+  {
+    date: { type: String, required: true },
+    providerName: { type: String, trim: true, default: null },
+    operatorName: { type: String, trim: true, default: null },
+    type: { type: String, enum: ['FARES', 'FUEL', 'OTHER_DEDUCTION', 'OTHER_INCOME'], required: true },
+    amount: dec({ required: true }),
+    description: String,
+  },
+  { _id: false, toJSON: { getters: true }, toObject: { getters: true } },
+);
+
 const importSchema = new Schema(
   {
     divisionId: { type: Schema.Types.ObjectId, ref: 'Division', required: true },
@@ -218,12 +231,14 @@ const importSchema = new Schema(
     uploadedBy: actorSchema,
     uploadedAt: { type: Date, default: Date.now },
     rowCount: Number, // report rows inside the cycle
-    status: { type: String, enum: ['ACTIVE', 'REPLACED', 'INVALID'], default: 'ACTIVE' },
+    status: { type: String, enum: ['STAGED', 'ACTIVE', 'REPLACED', 'INVALID'], default: 'ACTIVE' },
     validationStatus: { type: String, enum: ['VALID', 'INVALID'], default: 'VALID' },
     processingErrors: { type: [String], default: [] },
     replacedAt: Date,
     replacedBy: actorSchema,
     replaceReason: String,
+    supersedesImportId: { type: Schema.Types.ObjectId, ref: 'PerformanceImport', default: null },
+    supersededByImportId: { type: Schema.Types.ObjectId, ref: 'PerformanceImport', default: null },
     reportRange: { from: String, to: String },
     dataRange: { from: String, to: String },
     detectedColumns: Schema.Types.Mixed,
@@ -241,6 +256,7 @@ const importSchema = new Schema(
     division10ManifestRows: { type: [division10ManifestRowSchema], default: [] },
     division10FareRows: { type: [division10FareRowSchema], default: [] },
     division10FuelRows: { type: [division10FuelRowSchema], default: [] },
+    sourceAdjustmentRows: { type: [sourceAdjustmentRowSchema], default: [] },
     datesDetected: { type: [String], default: [] },
     weeksDetected: { type: [String], default: [] },
     driversDetected: { type: Number, default: 0 },

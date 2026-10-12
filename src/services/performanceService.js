@@ -104,7 +104,9 @@ export function matchRoutes(importDoc, providers) {
 export const unresolvedRoutes = (matches) => matches.filter((m) => m.status === 'UNKNOWN' || m.status === 'AMBIGUOUS');
 
 async function markCycleVdpsStale(cycleId) {
-  await Vdp.updateMany({ cycleId, status: { $in: ['DRAFT', 'NEEDS_REVIEW', 'READY'] } }, { $set: { stale: true } });
+  await Vdp.updateMany({ cycleId, status: { $in: ['DRAFT', 'NEEDS_REVIEW', 'READY'] } }, {
+    $set: { stale: true }, $addToSet: { staleReasons: 'Performance data or route matching changed.' },
+  });
 }
 
 export async function importReport({ cycleId, divisionId, file, replace = false, replaceReason, user }) {

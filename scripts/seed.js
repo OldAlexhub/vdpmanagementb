@@ -83,7 +83,20 @@ export async function seed({ roster = true, log = console.log } = {}) {
   const plan = async (name, version, notes) => {
     let p = await VdpPlan.findOne({ divisionId: division._id, name });
     if (!p) {
-      p = await VdpPlan.create({ divisionId: division._id, name, notes, versions: [version] });
+      p = await VdpPlan.create({
+        divisionId: division._id,
+        name,
+        notes,
+        status: 'ACTIVE',
+        validation: {
+          schemaPassed: true,
+          boundariesPassed: true,
+          reconciliationPassed: true,
+          sourceReference: 'Development regression seed',
+          verifiedAt: new Date(),
+        },
+        versions: [version],
+      });
       log(`Created plan ${name}`);
     }
     return p;

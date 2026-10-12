@@ -76,7 +76,9 @@ function workbookSheets(buffer, fileName) {
   }
   let workbook;
   try {
-    workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true, raw: true });
+    workbook = typeof buffer === 'string'
+      ? XLSX.readFile(buffer, { cellDates: true, raw: true })
+      : XLSX.read(buffer, { type: 'buffer', cellDates: true, raw: true });
   } catch (error) {
     throw new DivisionSourceValidationError(`The file could not be read: ${error.message}`, { code: 'UNREADABLE_FILE' });
   }
@@ -185,8 +187,8 @@ function manifestRows(sheet, datesDetected) {
     const starts = item.starts.filter((value) => value !== null);
     const ends = item.ends.filter((value) => value !== null);
     if (!starts.length || !ends.length) return [];
-    const actualStartMinutes = Math.min(...starts);
-    let actualEndMinutes = Math.max(...ends);
+    const actualStartMinutes = starts[0];
+    let actualEndMinutes = ends[ends.length - 1];
     while (actualEndMinutes < actualStartMinutes) actualEndMinutes += 24 * 60;
     return [{
       date: item.date,
@@ -238,6 +240,21 @@ function fuelRows(sheet, cycle) {
   return [...grouped.values()].map((row) => ({ ...row, amount: row.amount.toString() }));
 }
 
+function lakesideFuelRows(sheet, cycle) {
+  const { columns, rows } = headerAndRows(sheet, 'Driver ID');
+  const grouped = new Map();
+  for (const row of rows) {
+    const date = dateValue(cell(row, columns, 'Date'), defaultYearFor(cycle));
+    const operatorName = text(cell(row, columns, 'Driver ID'));
+    if (!date || !operatorName) continue;
+    const key = `${date}|${operatorName}`;
+    const current = grouped.get(key) || { date, operatorName, amount: D(0) };
+    current.amount = current.amount.plus(number(cell(row, columns, 'Cost ($)')));
+    grouped.set(key, current);
+  }
+  return [...grouped.values()].map((row) => ({ ...row, amount: row.amount.toString() }));
+}
+
 function div10TrapezeRows(sheet, cycle) {
   const from = cycle ? new Date(cycle.cycleStart).toISOString().slice(0, 10) : null;
   const to = cycle ? new Date(cycle.cycleEnd).toISOString().slice(0, 10) : null;
@@ -269,6 +286,166 @@ function div10TrapezeRows(sheet, cycle) {
     });
   }
   return rows;
+}
+
+function headerAndRows(sheet, requiredHeader) {
+  const headerIndex = sheet.rows.findIndex((row) => row.map(headerKey).includes(headerKey(requiredHeader)));
+  if (headerIndex < 0) return { columns: new Map(), rows: [] };
+  return { columns: columnMap(sheet.rows[headerIndex]), rows: sheet.rows.slice(headerIndex + 1) };
+}
+
+function compactDate(value, cycle) {
+  const raw = text(value);
+  const match = /^(20\d{2})(\d{2})(\d{2})$/.exec(raw);
+  return match ? iso(match[1], match[2], match[3]) : dateValue(value, defaultYearFor(cycle));
+}
+
+function clockFromTimestamp(value) {
+  const raw = text(value);
+  const match = /(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?/i.exec(raw);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const suffix = String(match[3] || '').toUpperCase();
+  if (suffix === 'PM' && hour < 12) hour += 12;
+  if (suffix === 'AM' && hour === 12) hour = 0;
+  return hour * 60 + Number(match[2]);
+}
+
+function div5RprRows(sheet, cycle) {
+  return div10TrapezeRows(sheet, cycle);
+}
+
+function div6TrapezeRows(sheet, cycle) {
+  const { columns, rows } = headerAndRows(sheet, 'ldate');
+  const grouped = new Map();
+  for (const row of rows) {
+    const date = compactDate(cell(row, columns, 'ldate'), cycle);
+    const route = text(cell(row, columns, 'evstrname'));
+    if (!date || !route) continue;
+    const key = `${date}|${route}`;
+    const current = grouped.get(key) || { date, route, trips: D(0), serviceMiles: D(0) };
+    current.trips = current.trips.plus(1);
+    current.serviceMiles = current.serviceMiles.plus(number(cell(row, columns, 'Direct_Distance')));
+    grouped.set(key, current);
+  }
+  return [...grouped.values()].map((row) => ({
+    date: row.date, route: row.route, trips: row.trips.toString(),
+    totalHours: null, serviceHours: null, revenueHours: null,
+    serviceMiles: row.serviceMiles.toString(), otherHours: {},
+  }));
+}
+
+function div7ProductivityRows(sheet, cycle) {
+  let currentDate = null;
+  let pending = null;
+  const rows = [];
+  for (const row of sheet.rows) {
+    const possibleDate = dateValue(row[1], defaultYearFor(cycle));
+    if (possibleDate && !text(row[1]).includes(',')) { currentDate = possibleDate; pending = null; continue; }
+    const label = text(row[1]);
+    if (currentDate && label && /^BST\w+/i.test(label)) {
+      pending = { date: currentDate, route: label.split(',')[0].trim(), trips: number(row[6]).toString() };
+      continue;
+    }
+    if (pending && headerKey(row[7]) === 'act') {
+      rows.push({
+        ...pending,
+        totalHours: number(row[10]).toString(),
+        serviceHours: number(row[10]).toString(),
+        revenueHours: number(row[15]).toString(),
+        serviceMiles: number(row[13]).toString(),
+        otherHours: {},
+      });
+      pending = null;
+    }
+  }
+  return rows;
+}
+
+function div7DriverWindows(sheet, cycle) {
+  const { columns, rows } = headerAndRows(sheet, 'Driver Name');
+  return rows.flatMap((row) => {
+    const date = dateValue(cell(row, columns, 'Date'), defaultYearFor(cycle));
+    const route = text(cell(row, columns, 'Run'));
+    const start = clockFromTimestamp(cell(row, columns, 'Pull out act'));
+    let end = clockFromTimestamp(cell(row, columns, 'Pull in act'));
+    if (!date || !route || start === null || end === null) return [];
+    if (end <= start) end += 24 * 60;
+    return [{ date, route, operatorName: text(cell(row, columns, 'Driver Name')), actualStartMinutes: start, actualEndMinutes: end, actualHours: D(end - start).div(60).toString(), lunchHours: number(cell(row, columns, 'Scheduled breaks act')).toString() }];
+  });
+}
+
+function div8DutyRows(sheet, cycle) {
+  const { columns, rows } = headerAndRows(sheet, 'Duty ID');
+  const performance = [];
+  const windows = [];
+  for (const row of rows) {
+    const started = cell(row, columns, 'Duty Actual Started Time');
+    const date = dateValue(started, defaultYearFor(cycle));
+    const route = text(cell(row, columns, 'Duty Identifier'));
+    if (!date || !route) continue;
+    performance.push({
+      date, route, trips: number(cell(row, columns, 'Total Boardings')).toString(),
+      totalHours: number(cell(row, columns, 'Total Duty Duration (hours)')).toString(),
+      serviceHours: number(cell(row, columns, 'Total Time Without Passengers (hours)')).plus(number(cell(row, columns, 'Total Revenue Hours'))).toString(),
+      revenueHours: number(cell(row, columns, 'Total Revenue Hours')).toString(),
+      serviceMiles: number(cell(row, columns, 'Total Travel Distance (Mi)')).toString(), otherHours: {},
+    });
+    const start = clockFromTimestamp(started);
+    let end = clockFromTimestamp(cell(row, columns, 'Duty Actual Completed Time'));
+    if (end === null) end = clockFromTimestamp(cell(row, columns, 'Last Seen In Service Area Time'));
+    if (start !== null && end !== null) {
+      if (end <= start) end += 24 * 60;
+      windows.push({ date, route, operatorName: text(cell(row, columns, 'Driver Name')), actualStartMinutes: start, actualEndMinutes: end, actualHours: D(end - start).div(60).toString(), lunchHours: number(cell(row, columns, 'Total Actual Break (hours)')).toString() });
+    }
+  }
+  return { performance, windows };
+}
+
+function div11ShiftRows(sheet, cycle) {
+  const { columns, rows } = headerAndRows(sheet, 'Shift ID');
+  const performance = [];
+  const windows = [];
+  let carriedDate = null;
+  let carriedDriver = null;
+  for (const row of rows) {
+    carriedDate = dateValue(cell(row, columns, 'Date'), defaultYearFor(cycle)) || carriedDate;
+    carriedDriver = text(cell(row, columns, 'Driver')) || text(cell(row, columns, 'Full Name')) || carriedDriver;
+    const route = text(cell(row, columns, 'Shift'));
+    if (!carriedDate || !route) continue;
+    performance.push({
+      date: carriedDate, route, trips: number(cell(row, columns, 'Total Passengers')).toString(),
+      totalHours: number(cell(row, columns, 'Total Online Hours')).toString(),
+      serviceHours: number(cell(row, columns, 'Vehicle Hours')).toString(),
+      revenueHours: number(cell(row, columns, 'Vehicle Revenue Hours')).toString(),
+      serviceMiles: number(cell(row, columns, 'Total Vehicle Distance (Miles)')).toString(), otherHours: {},
+    });
+    const start = clockFromTimestamp(cell(row, columns, 'Actual Shift Start'));
+    let end = clockFromTimestamp(cell(row, columns, 'Actual Shift End'));
+    if (start !== null && end !== null) {
+      if (end <= start) end += 24 * 60;
+      windows.push({ date: carriedDate, route, operatorName: carriedDriver, actualStartMinutes: start, actualEndMinutes: end, actualHours: D(end - start).div(60).toString(), lunchHours: number(cell(row, columns, 'Total Break Hours')).toString() });
+    }
+  }
+  return { performance, windows };
+}
+
+function fareAdjustmentRows(sheet, cycle, type) {
+  const { columns, rows } = headerAndRows(sheet, type === 'DIV5_TICKETS' ? 'Trip Type' : 'PARTNER NAME');
+  const grouped = new Map();
+  for (const row of rows) {
+    const date = dateValue(cell(row, columns, 'Date'), defaultYearFor(cycle));
+    const providerName = text(cell(row, columns, 'PARTNER NAME'));
+    if (!date || !providerName) continue;
+    const amount = type === 'DIV5_TICKETS'
+      ? DecimalMax(number(cell(row, columns, 'Fare To Collect')).minus(number(cell(row, columns, 'Ticket Value'))), D(0))
+      : number(cell(row, columns, 'Cash to be Deducted'));
+    const key = `${date}|${providerName}`;
+    const current = grouped.get(key) || { date, providerName, operatorName: text(cell(row, columns, 'DriverName')) || text(cell(row, columns, 'Employee Name')), amount: D(0) };
+    current.amount = current.amount.plus(amount);
+    grouped.set(key, current);
+  }
+  return [...grouped.values()].filter((row) => !row.amount.isZero()).map((row) => ({ ...row, type: 'FARES', amount: row.amount.abs().toString(), description: `${type === 'DIV5_TICKETS' ? 'DIV 5 collected-ticket' : 'DIV 6 returned-ticket'} fare reconciliation` }));
 }
 
 const DecimalMax = (left, right) => (left.gte(right) ? left : right);
@@ -310,6 +487,36 @@ export async function parseDivisionSourceFile(buffer, fileName, divisionNumber, 
     if (datasetType === 'DIV10_MANIFESTS') result.division10ManifestRows = manifestRows(sheet, datesDetected);
     if (datasetType === 'DIV10_JASPER_TRIPS') result.division10FareRows = fareRows(sheet, cycle);
     if (datasetType === 'DIV10_COAST_FUEL') result.division10FuelRows = fuelRows(sheet, cycle);
+  }
+  const divisionKey = String(divisionNumber).trim().toUpperCase();
+  if (['5', '6', '7', '8', '11'].includes(divisionKey)) result.adapterVersion = `DIV${divisionKey}_V1`;
+  if (datasetType === 'DIV5_RPR') result.rows = div5RprRows(sheet, cycle);
+  if (datasetType === 'DIV5_TICKETS') result.sourceAdjustmentRows = fareAdjustmentRows(sheet, cycle, datasetType);
+  if (datasetType === 'DIV6_TRAPEZE') result.rows = div6TrapezeRows(sheet, cycle);
+  if (datasetType === 'DIV6_RETURNED_TICKETS') result.sourceAdjustmentRows = fareAdjustmentRows(sheet, cycle, datasetType);
+  if (datasetType === 'DIV7_DAILY_PRODUCTIVITY') result.rows = div7ProductivityRows(sheet, cycle);
+  if (datasetType === 'DIV7_DRIVER_HOURS') result.division10ManifestRows = div7DriverWindows(sheet, cycle);
+  if (datasetType === 'DIV7_COAST_FUEL') result.division10FuelRows = fuelRows(sheet, cycle);
+  if (datasetType === 'DIV7_LAKESIDE_FUEL') result.division10FuelRows = lakesideFuelRows(sheet, cycle);
+  if (datasetType === 'DIV8_DUTY') {
+    const adapted = div8DutyRows(sheet, cycle);
+    result.rows = adapted.performance;
+    result.division10ManifestRows = adapted.windows;
+  }
+  if (datasetType === 'DIV11_SHIFT_HOURS') {
+    const adapted = div11ShiftRows(sheet, cycle);
+    result.rows = adapted.performance;
+    result.division10ManifestRows = adapted.windows;
+  }
+  if (result.rows) {
+    result.performanceColumns = {
+      date: true, route: true, trips: true,
+      TOTAL_HOURS: result.rows.some((row) => row.totalHours !== null),
+      SERVICE_HOURS: result.rows.some((row) => row.serviceHours !== null),
+      REVENUE_HOURS: result.rows.some((row) => row.revenueHours !== null),
+      SERVICE_MILES: result.rows.some((row) => row.serviceMiles !== null),
+      otherHourColumns: result.division10ManifestRows?.length ? ['Incentive Hours'] : [],
+    };
   }
   return result;
 }

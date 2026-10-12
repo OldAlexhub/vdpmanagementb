@@ -8,9 +8,33 @@ import { D } from '../services/money.js';
 import { badRequest, conflict, notFound, actor } from '../services/errors.js';
 import { decimalInput } from './validate.js';
 import { planTemplates } from '../services/planTemplates.js';
+import { recordAudit } from '../services/auditService.js';
+import PlanBlueprint from '../models/PlanBlueprint.js';
 
-export function templates(req, res) {
-  res.json(planTemplates());
+async function availableBlueprints() {
+  const stored = await PlanBlueprint.find({ status: { $in: ['APPROVED', 'DRAFT'] } }).sort({ key: 1, version: -1 }).lean();
+  if (!stored.length) return planTemplates();
+  const latest = new Map();
+  for (const blueprint of stored) if (!latest.has(blueprint.key)) latest.set(blueprint.key, blueprint);
+  return [...latest.values()].map((blueprint) => ({
+    id: blueprint.key,
+    blueprintVersion: blueprint.version,
+    name: blueprint.name,
+    divisionNumber: blueprint.divisionNumber,
+    sourceDocument: blueprint.sourceDocument,
+    sourceChecksum: blueprint.sourceChecksum,
+    variant: blueprint.variant,
+    description: blueprint.specification?.notes || `${blueprint.variant === 'SIGNED_DOCUMENT' ? 'Signed-document' : 'Operational-workbook'} blueprint`,
+    version: blueprint.specification,
+    processingEnabled: blueprint.processingEnabled,
+    validation: blueprint.validation,
+    immutable: true,
+    status: blueprint.status,
+  }));
+}
+
+export async function templates(req, res) {
+  res.json(await availableBlueprints());
 }
 
 export function versionInput(body) {
@@ -237,10 +261,35 @@ export async function create(req, res) {
   if (!(await Division.exists({ _id: divisionId }))) throw badRequest('Choose a division.');
   const version = versionInput(req.body.version || req.body);
   if (!version.effectiveFrom) throw badRequest('Effective from date is required.');
+  const blueprint = req.body.blueprintId ? (await availableBlueprints()).find((item) => item.id === req.body.blueprintId) : null;
+  if (req.body.blueprintId && !blueprint) throw badRequest('Choose a valid VDP plan blueprint.');
   const plan = new VdpPlan({
     divisionId,
     name,
     notes,
+    blueprint: blueprint ? {
+      id: blueprint.id,
+      version: blueprint.blueprintVersion,
+      sourceDocument: blueprint.sourceDocument,
+      sourceChecksum: blueprint.sourceChecksum,
+      variant: blueprint.variant,
+    } : undefined,
+    // Every production copy is independently editable, so it must prove its
+    // own schema/boundaries/workbook fixture before it can become active.
+    status: process.env.NODE_ENV === 'production' ? 'DRAFT' : 'ACTIVE',
+    validation: blueprint ? {
+      ...blueprint.validation,
+      sourceReference: blueprint.sourceDocument,
+      verifiedAt: new Date(),
+      verifiedBy: actor(req.user),
+    } : {
+      schemaPassed: validateVersion(version).length === 0,
+      boundariesPassed: validateVersion(version).length === 0,
+      reconciliationPassed: process.env.NODE_ENV !== 'production',
+      sourceReference: process.env.NODE_ENV !== 'production' ? 'Development plan' : null,
+      verifiedAt: process.env.NODE_ENV !== 'production' ? new Date() : null,
+      verifiedBy: process.env.NODE_ENV !== 'production' ? actor(req.user) : undefined,
+    },
     versions: [{ ...version, versionNumber: 1, createdBy: actor(req.user) }],
   });
   const prices = req.body.fuelPrices ?? req.body.version?.fuelPrices;
@@ -267,10 +316,40 @@ export async function update(req, res) {
   if (req.body.name !== undefined) plan.name = req.body.name;
   if (req.body.notes !== undefined) plan.notes = req.body.notes;
   if (req.body.status !== undefined) {
-    if (!['ACTIVE', 'INACTIVE'].includes(req.body.status)) throw badRequest('Invalid status.');
+    if (!['DRAFT', 'ACTIVE', 'INACTIVE'].includes(req.body.status)) throw badRequest('Invalid status.');
+    if (req.body.status === 'ACTIVE' && !Object.values(plan.validation?.toObject?.() || plan.validation || {}).filter((value) => typeof value === 'boolean').every(Boolean)) {
+      throw conflict('This plan cannot be activated until schema, tier-boundary, and workbook reconciliation checks pass.');
+    }
     plan.status = req.body.status;
   }
   await plan.save();
+  res.json(await withUsage(plan));
+}
+
+export async function validateAndActivate(req, res) {
+  const plan = await VdpPlan.findById(req.params.id);
+  if (!plan) throw notFound('VDP plan');
+  const version = currentVersion(plan);
+  const errors = version ? validateVersion(version) : ['The plan has no version.'];
+  const fixture = req.body.reconciliationFixture || {};
+  const hasFixture = String(fixture.sourceReference || '').trim()
+    && fixture.expectedNet !== undefined && fixture.actualNet !== undefined;
+  const reconciliationPassed = hasFixture && D(fixture.expectedNet).toDecimalPlaces(2).eq(D(fixture.actualNet).toDecimalPlaces(2));
+  plan.validation = {
+    schemaPassed: errors.length === 0,
+    boundariesPassed: errors.length === 0,
+    reconciliationPassed,
+    sourceReference: hasFixture ? String(fixture.sourceReference).trim() : null,
+    verifiedAt: new Date(),
+    verifiedBy: actor(req.user),
+  };
+  if (errors.length || !reconciliationPassed) {
+    await plan.save();
+    throw conflict('Plan validation did not pass.', { errors, reconciliationPassed });
+  }
+  plan.status = 'ACTIVE';
+  await plan.save();
+  await recordAudit({ action: 'PLAN_VALIDATED_AND_ACTIVATED', entityType: 'VDP plan', entityId: plan._id, entityLabel: plan.name, user: req.user, metadata: { sourceReference: plan.validation.sourceReference } });
   res.json(await withUsage(plan));
 }
 
@@ -302,6 +381,9 @@ export async function updateVersion(req, res) {
   if (!plan) throw notFound('VDP plan');
   const v = plan.versions.id(req.params.versionId);
   if (!v) throw notFound('Plan version');
+  if (plan.status === 'ACTIVE') {
+    throw conflict('Active plan versions cannot be edited in place. Add an effective-dated version instead.');
+  }
   if (await vdpUsesVersion(v._id)) {
     throw conflict('Approved VDPs were calculated with this version, so it cannot be edited. Add a new version with a new effective date.');
   }

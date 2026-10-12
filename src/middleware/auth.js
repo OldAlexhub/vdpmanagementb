@@ -18,17 +18,17 @@ export const cookieOptions = () => {
 };
 
 export function issueSession(res, user) {
-  const token = jwt.sign({ sub: String(user._id) }, jwtSecret(), { expiresIn: '12h' });
-  res.cookie(COOKIE, token, { ...cookieOptions(), maxAge: 12 * 60 * 60 * 1000 });
+  const token = jwt.sign({ sub: String(user._id), ver: user.sessionVersion || 1 }, jwtSecret(), { expiresIn: '8h' });
+  res.cookie(COOKIE, token, { ...cookieOptions(), maxAge: 8 * 60 * 60 * 1000, path: '/' });
 }
 
 export async function requireAuth(req, _res, next) {
   const token = req.cookies?.[COOKIE];
   if (!token) return next(new HttpError(401, 'Please sign in.'));
   try {
-    const { sub } = jwt.verify(token, jwtSecret());
-    const user = await User.findById(sub);
-    if (!user || !user.active) return next(new HttpError(401, 'Please sign in.'));
+    const { sub, ver } = jwt.verify(token, jwtSecret());
+    const user = await User.findById(sub).select('+sessionVersion');
+    if (!user || !user.active || Number(ver || 1) !== Number(user.sessionVersion || 1)) return next(new HttpError(401, 'Please sign in.'));
     req.user = user;
     return next();
   } catch {
@@ -41,7 +41,17 @@ export const requireAdmin = (req, _res, next) =>
 
 // Everything outside the provider portal is for Big Star staff only.
 export const requireStaff = (req, _res, next) =>
-  ['ADMIN', 'USER'].includes(req.user?.role) ? next() : next(new HttpError(403, 'This page is for Big Star staff.'));
+  ['ADMIN', 'ACCOUNTING', 'NSM', 'USER'].includes(req.user?.role) ? next() : next(new HttpError(403, 'This page is for Big Star staff.'));
+
+export const requireAccounting = (req, _res, next) =>
+  ['ADMIN', 'ACCOUNTING', 'USER'].includes(req.user?.role)
+    ? next()
+    : next(new HttpError(403, 'Accounting access is required.'));
+
+export const requireNsm = (req, _res, next) =>
+  ['ADMIN', 'ACCOUNTING', 'NSM', 'USER'].includes(req.user?.role)
+    ? next()
+    : next(new HttpError(403, 'NSM access is required.'));
 
 export const requireProvider = (req, _res, next) =>
   req.user?.role === 'PROVIDER' && req.user.providerId

@@ -58,7 +58,8 @@ export async function cycleSummary(cycleId) {
   // The finalized DIV 3 and DIV 10 workbooks consume the same Uber driver-week
   // toll feed. It becomes required only when that optional/conditional Uber
   // branch is actually in use.
-  const tollsRequired = division2 || division12 || (division3 && uberImports.length > 0) || (division10 && uberProviderCount > 0);
+  const tollsRequired = division2 || (division3 && uberImports.length > 0) || (division10 && uberProviderCount > 0);
+  const tollsAvailable = division2 || division3 || division10 || division12;
   const driverMatches = matchUberDrivers(uberImports, providers, cycle);
   const tollReadiness = uberTollReadiness({ cycle, tollImports, uberImports });
   const expectedUberWeeks = [isoDate(cycle.week1Start), isoDate(cycle.week2Start)];
@@ -68,6 +69,21 @@ export async function cycleSummary(cycleId) {
     : [];
   const division3Data = division3 ? division3Readiness({ cycle, imports: division3Imports, providers, processingDivisions }) : null;
   const divisionSources = await divisionSourceReadiness({ cycle, division });
+  const activePlanAssignments = expected.map((provider) => {
+    const plan = plansById.get(String(provider.planId));
+    return plan ? { provider, plan, version: resolveVersion(plan, cycle).version } : null;
+  }).filter(Boolean);
+  const actualFuelAssignments = activePlanAssignments.filter(({ version }) => version?.fuelMethod === 'ACTUAL_EXPENSE_REIMBURSEMENT');
+  for (const dataset of Object.values(divisionSources.datasets || {})) {
+    dataset.applicable = true;
+    if (dataset.id === 'DIV7_LAKESIDE_FUEL') {
+      dataset.applicable = actualFuelAssignments.some(({ plan, provider }) => plan.blueprint?.id === 'div7-lakeside' || /lakeside/i.test(`${plan.name} ${provider.name}`));
+    } else if (dataset.id === 'DIV7_COAST_FUEL') {
+      dataset.applicable = actualFuelAssignments.some(({ plan, provider }) => plan.blueprint?.id !== 'div7-lakeside' && !/lakeside/i.test(`${plan.name} ${provider.name}`));
+    } else if (dataset.id === 'DIV10_COAST_FUEL') {
+      dataset.applicable = actualFuelAssignments.length > 0;
+    }
+  }
   if (division3Data) {
     for (const source of Object.values(division3Data.sources)) {
       source.files = division3Uploads.filter((upload) => upload.kind === source.kind);
@@ -125,6 +141,7 @@ export async function cycleSummary(cycleId) {
       uberRequired,
       uberOptional: division3,
       tollsRequired,
+      tollsAvailable,
       division3Required: division3,
       divisionSourcesRequired: divisionSources.configured,
       // No generic fallback: an unconfigured division must provide sample

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import PerformanceImport from '../models/PerformanceImport.js';
+import NormalizedFact from '../models/NormalizedFact.js';
 import Provider from '../models/Provider.js';
 import { actor } from './errors.js';
 import { D, sum, str } from './money.js';
@@ -10,18 +11,63 @@ import { normalizeName, suggestOperator } from './uberDriverMatching.js';
 
 export const DIV10_ADAPTER_VERSION = 'DIV10_V2';
 const REQUIRED = ['DIV10_MANIFESTS', 'DIV10_JASPER_TRIPS', 'DIV10_TRAPEZE_HOURS'];
+const DIVISION_ADAPTERS = {
+  5: { version: 'DIV5_V1', required: ['DIV5_BIG_EXPORT', 'DIV5_RPR', 'DIV5_TICKETS'], performance: ['DIV5_RPR'] },
+  6: { version: 'DIV6_V1', required: ['DIV6_TRAPEZE', 'DIV6_RETURNED_TICKETS'], performance: ['DIV6_TRAPEZE'] },
+  7: { version: 'DIV7_V1', required: ['DIV7_DAILY_PRODUCTIVITY', 'DIV7_DRIVER_HOURS', 'DIV7_FARES', 'DIV7_MANIFESTS', 'DIV7_MESSAGES'], performance: ['DIV7_DAILY_PRODUCTIVITY'], windows: ['DIV7_DRIVER_HOURS'] },
+  8: { version: 'DIV8_V1', required: ['DIV8_DUTY', 'DIV8_RIDERSHIP'], performance: ['DIV8_DUTY'], windows: ['DIV8_DUTY'] },
+  11: { version: 'DIV11_V1', required: ['DIV11_RIDES', 'DIV11_SHIFT_HOURS'], performance: ['DIV11_SHIFT_HOURS'], windows: ['DIV11_SHIFT_HOURS'] },
+};
 
-const activeSources = (cycleId) => PerformanceImport.find({
-  cycleId,
-  kind: 'DIVISION_SOURCE',
-  status: 'ACTIVE',
-  validationStatus: 'VALID',
-}).sort({ uploadedAt: 1 });
+export const divisionAdapterFor = (divisionNumber) => DIVISION_ADAPTERS[String(divisionNumber || '').trim()] || null;
+
+const FACT_FIELD = {
+  PERFORMANCE: 'rows',
+  OBSERVED_WINDOW: 'division10ManifestRows',
+  FARE: 'division10FareRows',
+  FUEL: 'division10FuelRows',
+  ADJUSTMENT: 'sourceAdjustmentRows',
+};
+
+const activeSources = async (cycleId) => {
+  const docs = await PerformanceImport.find({
+    cycleId,
+    kind: 'DIVISION_SOURCE',
+    status: 'ACTIVE',
+    validationStatus: 'VALID',
+  }).sort({ uploadedAt: 1 });
+  if (!docs.length) return docs;
+  const facts = await NormalizedFact.find({ importId: { $in: docs.map((doc) => doc._id) } }).sort({ sequence: 1 }).lean();
+  const byImport = new Map();
+  for (const fact of facts) {
+    const key = String(fact.importId);
+    if (!byImport.has(key)) byImport.set(key, {});
+    const field = FACT_FIELD[fact.factType];
+    if (field) (byImport.get(key)[field] ||= []).push(fact.payload);
+  }
+  for (const doc of docs) {
+    const stored = byImport.get(String(doc._id));
+    // Backward compatibility keeps already-normalized legacy imports usable
+    // while every newly uploaded source uses the bounded fact collection.
+    if (!stored) continue;
+    for (const field of Object.values(FACT_FIELD)) doc[field] = stored[field] || [];
+  }
+  return docs;
+};
 
 export function division10SourcesAdapterReady(sources) {
   return REQUIRED.every((datasetType) => {
     const files = sources.filter((doc) => doc.datasetType === datasetType);
     return files.length > 0 && files.every((doc) => doc.stats?.adapterVersion === DIV10_ADAPTER_VERSION);
+  });
+}
+
+export function divisionSourcesAdapterReady(divisionNumber, sources) {
+  const config = divisionAdapterFor(divisionNumber);
+  if (!config) return false;
+  return config.required.every((datasetType) => {
+    const files = sources.filter((doc) => doc.datasetType === datasetType);
+    return files.length > 0 && files.every((doc) => doc.stats?.adapterVersion === config.version);
   });
 }
 
@@ -220,11 +266,123 @@ export async function refreshDivision10DerivedImport({ cycle, user = null }) {
   return derived;
 }
 
+export async function refreshDivisionDerivedImport({ cycle, division, user = null }) {
+  const config = divisionAdapterFor(division?.divisionNumber);
+  if (!config) return null;
+  const sources = await activeSources(cycle._id);
+  const current = await PerformanceImport.findOne({ cycleId: cycle._id, kind: 'STANDARD', status: 'ACTIVE' });
+  const latest = current?.stats?.sourceAdapter === config.version ? current : await PerformanceImport.findOne({
+    cycleId: cycle._id, kind: 'STANDARD', 'stats.sourceAdapter': config.version,
+  }).sort({ uploadedAt: -1 });
+  if (!divisionSourcesAdapterReady(division.divisionNumber, sources)) {
+    if (current?.stats?.sourceAdapter === config.version) {
+      current.status = 'REPLACED';
+      current.replacedAt = new Date();
+      current.replaceReason = `DIV ${division.divisionNumber} source coverage is incomplete`;
+      if (user) current.replacedBy = actor(user);
+      await current.save();
+    }
+    return null;
+  }
+  const rows = newestRows(sources.filter((doc) => config.performance.includes(doc.datasetType)), 'rows', (row) => `${row.date}|${row.route}`)
+    .sort((a, b) => a.date === b.date ? a.route.localeCompare(b.route, undefined, { numeric: true }) : a.date.localeCompare(b.date));
+  const manifests = newestRows(sources.filter((doc) => config.windows?.includes(doc.datasetType)), 'division10ManifestRows', (row) => `${row.date}|${row.route}`);
+  const adjustments = newestRows(sources, 'sourceAdjustmentRows', (row) => `${row.date}|${row.providerName}|${row.type}|${row.description}`);
+  const fuel = newestRows(sources, 'division10FuelRows', (row) => `${row.date}|${normalizeName(row.operatorName)}`);
+  const hash = crypto.createHash('sha256').update(sources.map((doc) => doc.fileHash).sort().join('|')).digest('hex');
+  const dates = [...new Set(rows.map((row) => row.date))].sort();
+  const weeks = [...new Set(dates.map((date) => weekOf(date, cycle)).filter(Boolean).map((week) => week === 1 ? isoDate(cycle.week1Start) : isoDate(cycle.week2Start)))].sort();
+  let derived = latest;
+  if (!derived) derived = new PerformanceImport({
+    divisionId: cycle.divisionId,
+    cycleId: cycle._id,
+    kind: 'STANDARD',
+    originalFileName: `DIV ${division.divisionNumber} normalized source pipeline`,
+    uploadedBy: user ? actor(user) : { name: 'System' },
+  });
+  if (current && String(current._id) !== String(derived._id)) {
+    current.status = 'REPLACED';
+    current.replacedAt = new Date();
+    current.replaceReason = `Replaced by normalized DIV ${division.divisionNumber} source pipeline`;
+    if (user) current.replacedBy = actor(user);
+    await current.save();
+  }
+  derived.status = 'ACTIVE';
+  derived.validationStatus = 'VALID';
+  derived.fileHash = hash;
+  derived.fileSize = sources.reduce((total, doc) => total + Number(doc.fileSize || 0), 0);
+  derived.rowCount = rows.length;
+  derived.dataRange = dates.length ? { from: dates[0], to: dates[dates.length - 1] } : null;
+  derived.datesDetected = dates;
+  derived.weeksDetected = weeks;
+  derived.rows = rows;
+  derived.division10ManifestRows = manifests;
+  derived.sourceAdjustmentRows = adjustments;
+  derived.division10FuelRows = fuel;
+  derived.detectedColumns = {
+    date: true,
+    route: true,
+    trips: true,
+    TOTAL_HOURS: rows.some((row) => row.totalHours !== null && row.totalHours !== undefined),
+    SERVICE_HOURS: rows.some((row) => row.serviceHours !== null && row.serviceHours !== undefined),
+    REVENUE_HOURS: rows.some((row) => row.revenueHours !== null && row.revenueHours !== undefined),
+    SERVICE_MILES: rows.some((row) => row.serviceMiles !== null && row.serviceMiles !== undefined),
+    otherHourColumns: manifests.length ? ['Incentive Hours'] : [],
+  };
+  derived.stats = {
+    sourceAdapter: config.version,
+    windowSource: manifests.length > 0,
+    sourceImportIds: sources.map((doc) => String(doc._id)),
+    sourceFileNames: sources.map((doc) => doc.originalFileName),
+    adjustmentRows: adjustments.length,
+    fuelRows: fuel.length,
+  };
+  await derived.save();
+  return derived;
+}
+
 const weekday = (date) => ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'][new Date(`${date}T12:00:00Z`).getUTCDay()];
 const clock = (value) => {
   const match = /^(\d{1,2}):(\d{2})$/.exec(String(value || '').trim());
   return match ? (Number(match[1]) * 60) + Number(match[2]) : null;
 };
+
+function timezoneOffset(epoch, timezone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date(epoch));
+  const value = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)]));
+  return Date.UTC(value.year, value.month - 1, value.day, value.hour, value.minute, value.second) - epoch;
+}
+
+function zonedEpoch(date, minutes, timezone) {
+  const [year, month, day] = date.split('-').map(Number);
+  const dayOffset = Math.floor(minutes / (24 * 60));
+  const minuteOfDay = ((minutes % (24 * 60)) + (24 * 60)) % (24 * 60);
+  const wall = Date.UTC(year, month - 1, day + dayOffset, Math.floor(minuteOfDay / 60), minuteOfDay % 60);
+  let epoch = wall;
+  for (let iteration = 0; iteration < 3; iteration += 1) epoch = wall - timezoneOffset(epoch, timezone);
+  return epoch;
+}
+
+function overlapMinutes(date, observed, scheduled, timezone) {
+  try {
+    const observedStart = zonedEpoch(date, observed.start, timezone);
+    const observedEnd = zonedEpoch(date, observed.end, timezone);
+    const scheduledStart = zonedEpoch(date, scheduled.start, timezone);
+    const scheduledEnd = zonedEpoch(date, scheduled.end, timezone);
+    return {
+      overlap: Math.max(0, Math.min(observedEnd, scheduledEnd) - Math.max(observedStart, scheduledStart)) / 60000,
+      observed: Math.max(0, observedEnd - observedStart) / 60000,
+    };
+  } catch {
+    return {
+      overlap: Math.max(0, Math.min(observed.end, scheduled.end) - Math.max(observed.start, scheduled.start)),
+      observed: Math.max(0, observed.end - observed.start),
+    };
+  }
+}
 
 function windowFor(operator, route, date, allowOperatorFallback = false, scheduledOnly = true) {
   const day = weekday(date);
@@ -268,8 +426,8 @@ function operatorFor(provider, route, date, sourceName) {
   return operator ? { operator, byName: true } : null;
 }
 
-export function division10ImportForProvider(importDoc, provider) {
-  if (importDoc?.stats?.sourceAdapter !== DIV10_ADAPTER_VERSION) return importDoc;
+export function division10ImportForProvider(importDoc, provider, timezone = 'America/Los_Angeles') {
+  if (!importDoc?.stats?.windowSource && importDoc?.stats?.sourceAdapter !== DIV10_ADAPTER_VERSION) return importDoc;
   const manifests = new Map((importDoc.division10ManifestRows || []).map((row) => [`${row.date}|${row.route}`, row]));
   const rows = importDoc.rows.map((stored) => {
     const row = stored.toObject ? stored.toObject() : { ...stored };
@@ -280,14 +438,30 @@ export function division10ImportForProvider(importDoc, provider) {
     const configuredWindows = windowFor(operatorMatch?.operator, row.route, row.date, operatorMatch?.byName, false);
     const start = Number(manifest.actualStartMinutes);
     const end = Number(manifest.actualEndMinutes);
+    const overlaps = windows.map((window) => {
+      const calculated = overlapMinutes(row.date, { start, end }, window, timezone);
+      return { window, minutes: calculated.overlap, observedMinutes: calculated.observed };
+    });
+    const best = overlaps.sort((a, b) => b.minutes - a.minutes)[0] || null;
     const incentiveMinutes = windows.length
-      ? Math.max(...windows.map((window) => Math.max(0, Math.min(end, window.end) - Math.max(start, window.start))))
+      ? best.minutes
       // A known Compass window that is not scheduled for this weekday means
       // zero qualifying hours, not missing source data.
       : configuredWindows.length ? 0 : null;
     row.otherHours = {
       ...plainOtherHours(row),
       'Incentive Hours': incentiveMinutes === null ? null : D(incentiveMinutes).div(60).toString(),
+    };
+    row.tui = {
+      route: row.route,
+      date: row.date,
+      compassWindow: best ? { startMinutes: best.window.start, endMinutes: best.window.end } : null,
+      observedInterval: { startMinutes: start, endMinutes: end },
+      overlapMinutes: incentiveMinutes,
+      excludedMinutes: incentiveMinutes === null ? null : Math.max(0, (best?.observedMinutes ?? end - start) - incentiveMinutes),
+      timezone,
+      sourceOperatorName: manifest.operatorName || null,
+      sourceRule: 'FIRST_LAST_ARRIVED',
     };
     return row;
   });
@@ -301,7 +475,7 @@ const belongsToProvider = (match, providerId, date) => {
   return !match.split && String(match.providerId) === String(providerId);
 };
 
-export function division10ProviderSourceData({ importDoc, provider, matches, cycle }) {
+export function division10ProviderSourceData({ importDoc, provider, matches, cycle, timezone }) {
   if (importDoc?.stats?.sourceAdapter !== DIV10_ADAPTER_VERSION) {
     return { importDoc, cashFares: '0', fuelExpense: null };
   }
@@ -317,11 +491,43 @@ export function division10ProviderSourceData({ importDoc, provider, matches, cyc
   const fuelRows = (importDoc.division10FuelRows || []).filter((row) => row.date >= from && row.date <= to
     && Boolean(suggestOperator(row.operatorName, fuelCandidates).suggestion));
   return {
-    importDoc: division10ImportForProvider(importDoc, provider),
+    importDoc: division10ImportForProvider(importDoc, provider, timezone),
     cashFares: sum(fareRows.map((row) => row.cashFares || 0)).toString(),
     fuelExpense: fuelRows.length ? sum(fuelRows.map((row) => row.amount || 0)).toString() : null,
     fareRows: fareRows.length,
     fuelRows: fuelRows.length,
   };
+}
+
+const sameProviderName = (source, provider) => {
+  const left = normalizeName(source);
+  const right = normalizeName(provider.name);
+  return left && right && (left === right || left.includes(right) || right.includes(left));
+};
+
+export function divisionProviderSourceData({ importDoc, provider, matches, cycle, timezone }) {
+  if (!importDoc?.stats?.sourceAdapter) return { importDoc, adjustments: [], fuelExpense: null };
+  const base = importDoc.stats.sourceAdapter === DIV10_ADAPTER_VERSION
+    ? division10ProviderSourceData({ importDoc, provider, matches, cycle, timezone })
+    : (() => {
+        const fuelCandidates = activeOperators(provider, cycle).map((operator) => ({
+          providerId: provider._id, providerName: provider.name,
+          operatorId: operator.id, operatorName: operator.name,
+        }));
+        const fuelRows = (importDoc.division10FuelRows || []).filter((row) => row.date >= isoDate(cycle.cycleStart)
+          && row.date <= isoDate(cycle.cycleEnd) && Boolean(suggestOperator(row.operatorName, fuelCandidates).suggestion));
+        return {
+          importDoc: division10ImportForProvider(importDoc, provider, timezone),
+          fuelExpense: fuelRows.length ? sum(fuelRows.map((row) => row.amount || 0)).toString() : null,
+          fuelRows: fuelRows.length,
+        };
+      })();
+  const from = isoDate(cycle.cycleStart);
+  const to = isoDate(cycle.cycleEnd);
+  const adjustments = (importDoc.sourceAdjustmentRows || [])
+    .filter((row) => row.date >= from && row.date <= to && sameProviderName(row.providerName, provider))
+    .map((row) => ({ type: row.type, amount: str(row.amount), description: row.description }));
+  if (D(base.cashFares || 0).gt(0)) adjustments.push({ type: 'FARES', amount: base.cashFares, description: 'DIV 10 Jasper cash fares' });
+  return { ...base, adjustments };
 }
 

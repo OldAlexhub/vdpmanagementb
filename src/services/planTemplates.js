@@ -370,7 +370,50 @@ const templates = [
   },
 ];
 
+// Checksums are pinned to the signed PDFs and partner-rate workbooks audited in
+// artifacts/VPDs. They make a blueprint reviewable even when those private
+// source files are not deployed with the application.
+const sourceChecksums = {
+  'DIV 2.pdf': '9b02e95ec5267afda239d9fc2d2c65b54fc435a33b2703bc4cfc963d08ef131e',
+  'DIV 2 Partner Rates.xlsx': '700e929060b2fb8937cd6afddd9914d0072ae36187384a96565d7dcf1f530e5f',
+  'DIV3 Partner Rates.xlsx': '5631c12d3b8b40b653e8104995ec13dff7bdf776be3eb1d9a930ea8c36ef9b04',
+  'DIV 3 BTS.pdf': 'a72c5915eb10a10d90b24efb31551a7c2c0c828a8ed8319d828336db469b43e2',
+  'DIV 3 MELINIO.pdf': '18bfc69303b61a7959ceb9af34b91243bb8af95ae3932dc7482f622005802e1e',
+  'DIV 3 UBER.pdf': '101a3bf395944ae812cd26e2afdbe64c77e1dfaf50b3e8080885a0a635fb4dfc',
+  'DIV 5.pdf': '66e887f59446ca6f04226ed6aad58d1f9987a03e6f9e5370d7ea2a54b4a85a81',
+  'Partner Rates.xlsx': '2a6281f27cf12256b65dcd7d84304b142295b1e0d9fd9d8923e6498c80f84a3f',
+  'DIV 6.pdf': 'd91df531007cc8494e6d84f304a2fc312d2515ce2ee72c9d3e4b899330e244e2',
+  'Partner Rates DIV 6.xlsx': 'ed20839cf14086d3feef797270f8054ee84b8f7b878a38fc6ca073ee282550d2',
+  'DIV 7 - Xpress.pdf': '14e13c3a6e7255754ce9f10ca08f1605b4b37e62c0bd7260e44b5bc6a75f51dc',
+  'DIV 7- LAKESIDE.pdf': '42d3f57e7f5ceb6561ce65d47f056b5325a15511243fa3f46276ea2f03600066',
+  'DIV 7.pdf': '39e0c78c0fddded9fb61e2b415e3f261226a9b1d5741043dbd0216eb3c3869cf',
+  'Div7 Partner Rate.xlsx': 'fe7f6e4336b6b355a6b5546acf81449ac77370b85df4b16f4616d05b2a63f7f3',
+  'DIV 8.pdf': '1d4b97fcecfc4375e1af7c20d14202fdea58c650ee71af7b94553c599d0fae05',
+  'Div8 Partner Rates.xlsx': 'b802bdaf8b1b51cc1961bbf0de09ab5c6b6159ed042ec28e6ce96782c83fccbb',
+  'DIV 10 DayService.pdf': '0b6f7398e7b643f4be84b290be2f0ecc11935a75fccdd16ca545921315424f8f',
+  'VDP_DIV10 UPDATED TEMPLATE.xlsm': 'fe841e2300d2a73901737cba94efd80254889b3f1d8a7348f692365406fc8156',
+  'DIV 10 NightService.pdf': '98b8005d091350905d9c23f13f2adadaa4a2d72456d36765fbec07199f508062',
+  'DIV10 Partner Rate.xlsx': '031b3577f74e1e18d02a7393788994a5390d592989cd212d6cf6bb931c14ebd4',
+  'DIV 10 UBER.pdf': '7c887b05094d44e58bf9ebf92b832d82dc016bbc7dc08d99da2997fd3944536b',
+  'DIV 11.pdf': '9ab091b2873fcbe9b0ca82b34a88b6c68d76bbbeb16058f21b37d12b8b236f77',
+  'Div11 Partner Rates.xlsx': 'b07fb97cb08cb138883d66950c4b0c4e5c588932c1ae47f422cb75d1e83b4140',
+  'DIV 12.pdf': '5da8abb627c3ef3c3d0a44640c46063461bed7d358c23e3e13995bacfcb6bc3c',
+  'DIV13.pdf': '9f0e148589604c6e8d2f00a19afe6cbe1bc2b1411dd985c710b18744fed7caa8',
+};
+
 export function planTemplates() {
-  return structuredClone(templates);
+  return structuredClone(templates.map((template) => ({
+    ...template,
+    blueprintVersion: 1,
+    immutable: true,
+    variant: /\.pdf$/i.test(template.sourceDocument) ? 'SIGNED_DOCUMENT' : 'OPERATIONAL_WORKBOOK',
+    sourceChecksum: sourceChecksums[template.sourceDocument],
+    processingEnabled: template.divisionNumber !== '13',
+    validation: {
+      schemaPassed: true,
+      boundariesPassed: true,
+      reconciliationPassed: template.divisionNumber !== '13',
+    },
+  })));
 }
 

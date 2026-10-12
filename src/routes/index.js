@@ -3,7 +3,8 @@ import multer from 'multer';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { requireAuth, requireAdmin, requireStaff, requireProvider } from '../middleware/auth.js';
+import { requireAuth, requireAdmin, requireStaff, requireProvider, requireAccounting, requireNsm } from '../middleware/auth.js';
+import { loginThrottle } from '../middleware/security.js';
 import * as auth from '../controllers/authController.js';
 import * as divisions from '../controllers/divisionController.js';
 import * as plans from '../controllers/planController.js';
@@ -20,6 +21,8 @@ import * as portal from '../controllers/portalController.js';
 import * as imports from '../controllers/importController.js';
 import * as compass from '../controllers/compassController.js';
 import * as liftLeases from '../controllers/liftLeaseController.js';
+import * as processingRuns from '../controllers/processingRunController.js';
+import * as lifecycle from '../controllers/lifecycleController.js';
 import { cycleWorkbook } from '../services/exportService.js';
 import { registerPdf, cycleSchedulePdf, planReportPdf } from '../services/pdfService.js';
 import { leadershipReport, providerReport } from '../services/analyticsService.js';
@@ -36,11 +39,9 @@ const division3Upload = multer({
 });
 const api = Router();
 
-api.get('/health', (_req, res) => res.json({ ok: true }));
-
 api.get('/auth/status', auth.status);
 api.post('/auth/setup', auth.setup);
-api.post('/auth/login', auth.login);
+api.post('/auth/login', loginThrottle, auth.login);
 api.post('/auth/logout', auth.logout);
 
 api.use(requireAuth);
@@ -91,17 +92,19 @@ api.get('/vdp-plans/:id/report.pdf', async (req, res) => {
   vdps.sendPdf(res, buffer, fileName);
 });
 api.put('/vdp-plans/:id', requireAdmin, plans.update);
+api.post('/vdp-plans/:id/validate-and-activate', requireAdmin, plans.validateAndActivate);
 api.post('/vdp-plans/:id/versions', requireAdmin, plans.addVersion);
 api.put('/vdp-plans/:id/versions/:versionId', requireAdmin, plans.updateVersion);
-// Fuel prices change often and are entered by Accounting, so any staff user may edit them.
-api.put('/vdp-plans/:id/fuel-prices', plans.setFuelPrices);
+// Fuel schedules are versioned configuration and remain Admin-controlled.
+api.put('/vdp-plans/:id/fuel-prices', requireAdmin, plans.setFuelPrices);
 
 api.get('/providers', providers.list);
-api.post('/providers', providers.create);
+api.post('/providers', requireAdmin, providers.create);
 api.put('/providers/division/:divisionId/plan', requireAdmin, providers.assignDivisionPlan);
+api.post('/providers/plans/unassign', requireAdmin, providers.batchUnassignPlans);
 api.get('/providers/:id', providers.get);
-api.put('/providers/:id', providers.update);
-api.post('/providers/:id/operators/:operatorId/transfer', providers.transferOperator);
+api.put('/providers/:id', requireAdmin, providers.update);
+api.post('/providers/:id/operators/:operatorId/transfer', requireAdmin, providers.transferOperator);
 
 // Bulk import from Excel: divisions | plans | providers. Admin-only kinds are checked in the controller.
 api.get('/imports/:kind/template', imports.template);
@@ -115,57 +118,68 @@ api.get('/settings/processing-groups', processingGroups.list);
 api.put('/settings/processing-groups', requireAdmin, processingGroups.update);
 api.get('/cycles', cycles.list);
 api.get('/cycles/periods', cycles.periods);
-api.post('/cycles/generate', cycles.generate);
+api.post('/cycles/generate', requireAdmin, cycles.generate);
 api.get('/cycles/preview', cycles.preview);
 api.get('/cycles/:id', cycles.get);
-api.patch('/cycles/:id', cycles.update);
+api.patch('/cycles/:id', requireAccounting, cycles.update);
+
+api.get('/processing-runs', processingRuns.list);
+api.post('/processing-runs', requireAccounting, processingRuns.open);
+api.get('/processing-runs/:id', processingRuns.get);
+api.post('/processing-runs/:id/process', requireAccounting, processingRuns.process);
+api.post('/processing-runs/:id/archive', requireAdmin, processingRuns.archive);
 
 api.get('/performance-imports', performance.list);
-api.post('/performance-imports', upload.single('file'), performance.upload);
+api.post('/performance-imports', requireAccounting, upload.single('file'), performance.upload);
 api.get('/performance-imports/:id', performance.get);
-api.post('/performance-imports/:id/routes', performance.resolve);
+api.post('/performance-imports/:id/routes', requireAccounting, performance.resolve);
 
 api.get('/uber-performance-imports', uberPerformance.list);
-api.post('/uber-performance-imports', upload.array('files', 20), uberPerformance.upload);
-api.delete('/uber-performance-imports/invalid', uberPerformance.clearInvalid);
-api.delete('/uber-performance-imports/:id', uberPerformance.remove);
-api.post('/uber-driver-matches', uberPerformance.assignDriver);
+api.post('/uber-performance-imports', requireAccounting, upload.array('files', 20), uberPerformance.upload);
+api.delete('/uber-performance-imports/invalid', requireAccounting, uberPerformance.clearInvalid);
+api.delete('/uber-performance-imports/:id', requireAccounting, uberPerformance.remove);
+api.post('/uber-driver-matches', requireAccounting, uberPerformance.assignDriver);
 
 api.get('/division3-imports', division3Imports.list);
 api.post('/division3-imports', division3Upload.array('files', 20), division3Imports.upload);
 api.delete('/division3-imports/invalid', division3Imports.clearInvalid);
 api.delete('/division3-imports/:id', division3Imports.remove);
-api.post('/division3-driver-matches', division3Imports.assignDriver);
-api.post('/division3-driver-matches/clear', division3Imports.clearDriverMatch);
-api.post('/division3-driver-exclusions', division3Imports.setAsideDriver);
-api.post('/division3-driver-exclusions/restore', division3Imports.restoreDriver);
+api.post('/division3-driver-matches', requireNsm, division3Imports.assignDriver);
+api.post('/division3-driver-matches/clear', requireNsm, division3Imports.clearDriverMatch);
+api.post('/division3-driver-exclusions', requireNsm, division3Imports.setAsideDriver);
+api.post('/division3-driver-exclusions/restore', requireNsm, division3Imports.restoreDriver);
 
 api.get('/division-source-contracts/:divisionId', divisionSources.contract);
 api.get('/division-source-imports', divisionSources.list);
-api.post('/division-source-imports', upload.array('files', 100), divisionSources.upload);
-api.delete('/division-source-imports/:id', divisionSources.remove);
+api.post('/division-source-imports', requireAccounting, division3Upload.array('files', 100), divisionSources.upload);
+api.delete('/division-source-imports/:id', requireAccounting, divisionSources.remove);
 
 api.get('/uber-toll-imports', uberTolls.list);
-api.post('/uber-toll-imports', upload.array('files', 20), uberTolls.upload);
-api.delete('/uber-toll-imports/invalid', uberTolls.clearInvalid);
-api.delete('/uber-toll-imports/:id', uberTolls.remove);
+api.post('/uber-toll-imports', requireAccounting, upload.array('files', 20), uberTolls.upload);
+api.delete('/uber-toll-imports/invalid', requireAccounting, uberTolls.clearInvalid);
+api.delete('/uber-toll-imports/:id', requireAccounting, uberTolls.remove);
 
 api.get('/vdps', vdps.list);
 api.get('/vdps/adjustment-types', vdps.adjustmentTypes);
-api.post('/vdps/process', vdps.process);
+api.post('/vdps/process', requireAccounting, vdps.process);
+api.post('/vdps/bulk-approve', requireAccounting, vdps.bulkApprove);
 api.get('/vdps/:id', vdps.get);
 api.get('/vdps/:id/statement.pdf', vdps.statement);
-api.post('/vdps/:id/recalculate', vdps.recalculate);
-api.post('/vdps/:id/adjustments', vdps.addAdjustment);
-api.delete('/vdps/:id/adjustments/:adjustmentId', vdps.removeAdjustment);
-api.patch('/vdps/:id/lease', vdps.setLease);
-api.patch('/vdps/:id/fuel-expense', vdps.setFuelExpense);
-api.put('/vdps/:id/uber-weekly-adjustment', vdps.setUberWeeklyAdjustment);
-api.post('/vdps/:id/acknowledge', vdps.acknowledge);
-api.post('/vdps/:id/approve', vdps.approve);
-api.post('/vdps/:id/reopen', vdps.reopen);
-api.post('/vdps/:id/mark-paid', vdps.markPaid);
-api.post('/vdps/:id/issues/respond', vdps.respondToIssue);
+api.post('/vdps/:id/recalculate', requireAccounting, vdps.recalculate);
+api.post('/vdps/:id/adjustments', requireAccounting, vdps.addAdjustment);
+api.delete('/vdps/:id/adjustments/:adjustmentId', requireAccounting, vdps.removeAdjustment);
+api.patch('/vdps/:id/lease', requireAccounting, vdps.setLease);
+api.patch('/vdps/:id/fuel-expense', requireAccounting, vdps.setFuelExpense);
+api.put('/vdps/:id/uber-weekly-adjustment', requireAccounting, vdps.setUberWeeklyAdjustment);
+api.post('/vdps/:id/acknowledge', requireAccounting, vdps.acknowledge);
+api.post('/vdps/:id/approve', requireAccounting, vdps.approve);
+api.post('/vdps/:id/reopen', requireAccounting, vdps.reopen);
+api.post('/vdps/:id/mark-paid', requireAccounting, vdps.markPaid);
+api.post('/vdps/:id/issues/respond', requireNsm, vdps.respondToIssue);
+
+api.get('/records/:type/:id/dependencies', requireAdmin, lifecycle.dependencies);
+api.post('/records/:type/:id/archive', requireAdmin, lifecycle.archive);
+api.post('/records/:type/:id/purge', requireAdmin, lifecycle.purge);
 
 api.get('/exports/cycle-schedule.pdf', async (req, res) => {
   const year = /^\d{4}$/.test(String(req.query.year || '')) ? Number(req.query.year) : undefined;

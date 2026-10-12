@@ -226,7 +226,7 @@ test('DIV 3 stages ADA, GoLink, Uber, fares, and an incomplete NSM return before
   assert.equal(response.status, 400, JSON.stringify(response.data));
   assert.match(response.data.error, /already matched to Deferred Driver \(ADA\)/);
   response = await call('POST', '/division3-driver-exclusions', {
-    cycleId, sourceName: 'Deferred Driver', service: 'ADA',
+    cycleId, sourceName: 'Deferred Driver', service: 'ADA', reason: 'Awaiting provider roster correction',
   });
   assert.equal(response.status, 200, JSON.stringify(response.data));
   response = await call('GET', `/cycles/${cycleId}`);

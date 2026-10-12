@@ -152,11 +152,13 @@ const vdpSchema = new Schema(
     settings: Schema.Types.Mixed, // resolved settings with sources
     performance: Schema.Types.Mixed, // per-day rows used
     calculation: Schema.Types.Mixed, // serialised engine result
+    provenance: Schema.Types.Mixed, // provider/operator/week/metric/plan/import lineage
     gross: dec({ default: null }),
     net: dec({ default: null }),
     exceptions: { type: [exceptionSchema], default: [] },
     calculatedAt: Date,
     stale: { type: Boolean, default: false }, // inputs changed since calculation
+    staleReasons: { type: [String], default: [] },
 
     snapshot: { type: Schema.Types.Mixed, default: null }, // frozen at approval
     approvedAt: Date,

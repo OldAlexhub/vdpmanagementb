@@ -3,7 +3,7 @@ import { jsonOptions } from './common.js';
 
 const { Schema } = mongoose;
 
-export const CYCLE_STATUSES = ['UPCOMING', 'OPEN', 'PROCESSING', 'READY_FOR_REVIEW', 'APPROVED', 'PAID', 'CLOSED'];
+export const CYCLE_STATUSES = ['UPCOMING', 'OPEN', 'PROCESSING', 'READY_FOR_REVIEW', 'APPROVED', 'PAID', 'CLOSED', 'ARCHIVED'];
 
 const cycleSchema = new Schema(
   {

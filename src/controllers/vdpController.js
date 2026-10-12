@@ -67,6 +67,10 @@ export async function process(req, res) {
   res.json(await svc.processCycle(req.body.cycleId, req.user));
 }
 
+export async function bulkApprove(req, res) {
+  res.json(await svc.bulkApprove(req.body || {}, req.user));
+}
+
 export const recalculate = async (req, res) => respond(res, await svc.recalculate(req.params.id, req.user));
 export const addAdjustment = async (req, res) => respond(res, await svc.addAdjustment(req.params.id, req.body, req.user));
 export const removeAdjustment = async (req, res) =>

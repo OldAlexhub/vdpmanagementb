@@ -35,7 +35,9 @@ const importSummary = (doc) => ({
 });
 
 async function markCycleStale(cycleId) {
-  await Vdp.updateMany({ cycleId, status: { $in: ['DRAFT', 'NEEDS_REVIEW', 'READY'] } }, { $set: { stale: true } });
+  await Vdp.updateMany({ cycleId, status: { $in: ['DRAFT', 'NEEDS_REVIEW', 'READY'] } }, {
+    $set: { stale: true }, $addToSet: { staleReasons: 'Uber toll reimbursement data changed.' },
+  });
 }
 
 function invalidDetails(error) {

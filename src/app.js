@@ -7,6 +7,8 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import api from './routes/index.js';
 import { errorHandler, notFoundHandler } from './middleware/errors.js';
+import mongoose from 'mongoose';
+import { csrfProtection, structuredRequestLog } from './middleware/security.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -15,7 +17,7 @@ const defaultClientOrigins = [
   'https://vdpmanagementf.onrender.com',
 ];
 
-function clientOrigins() {
+export function clientOrigins() {
   const configured = (process.env.CLIENT_ORIGIN || '').split(',');
   return [...new Set([...defaultClientOrigins, ...configured]
     .map((origin) => origin.trim().replace(/\/+$/, ''))
@@ -24,11 +26,33 @@ function clientOrigins() {
 
 export function createApp() {
   const app = express();
-  app.use(helmet({ contentSecurityPolicy: false }));
-  app.use(cors({ origin: clientOrigins(), credentials: true }));
+  const origins = clientOrigins();
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", 'data:'],
+        connectSrc: ["'self'", ...origins],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+      },
+    },
+    referrerPolicy: { policy: 'no-referrer' },
+  }));
+  app.use(cors({ origin: origins, credentials: true }));
   app.use(express.json({ limit: '1mb' }));
   app.use(cookieParser());
+  app.use(structuredRequestLog);
+  app.use(csrfProtection(origins));
 
+  app.get('/api/health', (_req, res) => {
+    const databaseReady = mongoose.connection.readyState === 1;
+    res.status(databaseReady ? 200 : 503).json({ ok: databaseReady, database: databaseReady ? 'ready' : 'unavailable' });
+  });
   app.use('/api', api);
   app.use('/api', notFoundHandler);
 

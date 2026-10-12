@@ -227,6 +227,9 @@ export const publicSourceDefinition = (definition) => definition && ({
   accept: definition.accept,
   coverage: definition.coverage,
   cycleLocator: Boolean(definition.cycleLocator),
+  classification: definition.classification || (definition.required ? 'GLOBAL_REQUIRED' : 'PROVIDER_CONDITIONAL'),
+  schemaVersion: definition.schemaVersion || '1',
+  parserVersion: definition.parserVersion || '1',
 });
 
 export const publicContractForDivision = (division) => {
@@ -235,6 +238,7 @@ export const publicContractForDivision = (division) => {
   return {
     divisionNumber,
     configured: contractForDivisionNumber(divisionNumber).length > 0,
+    processingEnabled: divisionNumber !== '13',
     targetWorkbook: targetWorkbooks[0] || null,
     targetWorkbooks,
     datasets: contractForDivisionNumber(divisionNumber).map(publicSourceDefinition),

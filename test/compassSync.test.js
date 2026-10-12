@@ -115,8 +115,8 @@ test('Compass takeover preserves VDP settings and leaves absent divisions untouc
   assert.equal(assigned.operators.find((operator) => operator.source.externalId === 'o3').contractedHours.toString(), '47.5');
 
   const [divisionPlan, exceptionPlan] = await VdpPlan.create([
-    { divisionId: div12._id, name: 'Reusable Division Standard' },
-    { divisionId: div10._id, name: 'Provider Exception' },
+    { divisionId: div12._id, name: 'Reusable Division Standard', status: 'ACTIVE' },
+    { divisionId: div10._id, name: 'Provider Exception', status: 'ACTIVE' },
   ]);
   await assignDivisionPlan(
     { params: { divisionId: div10._id }, body: { planId: divisionPlan._id } },

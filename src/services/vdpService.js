@@ -4,6 +4,7 @@ import Provider from '../models/Provider.js';
 import VdpPlan from '../models/VdpPlan.js';
 import VdpCycle from '../models/VdpCycle.js';
 import Division from '../models/Division.js';
+import PerformanceImport from '../models/PerformanceImport.js';
 import { calculateVdp, serializeResult, CalculationError, ADJUSTMENT_TYPES, priceOn } from './calculationEngine.js';
 import { calculateUberVdp, serializeUberResult, UberCalculationError } from './uberCalculationEngine.js';
 import { resolveVersion, resolveSettings, engineSettings, uberEngineSettings, validateVersion, SERVICE_MILE_ALLOWANCE } from './planService.js';
@@ -17,8 +18,15 @@ import { activeOperators, operatorsOf, worksOn, leaseWeeksInCycle } from './oper
 import { bestRouteMatches } from './routeMatching.js';
 import { D, sum, isBlank, str, fmtMoney, fmtRate, fmtNum } from './money.js';
 import { badRequest, conflict, notFound, actor } from './errors.js';
+import { recordAudit } from './auditService.js';
 import { isDivision3Division, processingDivisionsFor } from './divisionGroups.js';
-import { DIV10_ADAPTER_VERSION, division10ProviderSourceData, refreshDivision10DerivedImport } from './division10Adapter.js';
+import {
+  DIV10_ADAPTER_VERSION,
+  divisionAdapterFor,
+  divisionProviderSourceData,
+  refreshDivision10DerivedImport,
+  refreshDivisionDerivedImport,
+} from './division10Adapter.js';
 
 const EDITABLE = ['DRAFT', 'NEEDS_REVIEW', 'READY'];
 const ACKNOWLEDGEABLE = new Set(['NO_PERFORMANCE_DATA', 'PLAN_CHANGES_MID_CYCLE']);
@@ -213,6 +221,7 @@ function providerPerformance({ provider, cycle, importDoc, matches, metric, othe
         hours: str(hoursForMetric(r, m.metric, m.otherColumn)),
         attainmentHours: str(hoursForMetric(r, a.metric, a.otherColumn)),
         serviceMiles: str(r.serviceMiles),
+        tui: r.tui || null,
       };
     })
     .filter((d) => d.week);
@@ -301,6 +310,9 @@ export async function computeVdp(vdp, preloaded = {}) {
     if (!plan) {
       exceptions.push(exception('NO_PLAN', `The VDP plan assigned to ${provider.name} no longer exists.`));
     } else {
+      if (plan.status !== 'ACTIVE') {
+        exceptions.push(exception('PLAN_NOT_ACTIVE', `Plan "${plan.name}" is ${String(plan.status || 'draft').toLowerCase()}. Activate a validated plan before processing.`));
+      }
       const resolved = resolveVersion(plan, cycle);
       version = resolved.version;
       if (!version) {
@@ -341,6 +353,9 @@ export async function computeVdp(vdp, preloaded = {}) {
         exceptions.push(exception('NO_PLAN', `The VDP plan assigned to operator ${o.name} no longer exists. Choose another on the provider profile.`));
         continue;
       }
+      if (p.status !== 'ACTIVE') {
+        exceptions.push(exception('PLAN_NOT_ACTIVE', `Plan "${p.name}" (operator ${o.name}) is ${String(p.status || 'draft').toLowerCase()}. Activate a validated plan before processing.`));
+      }
       const res = resolveVersion(p, cycle);
       if (!res.version) {
         exceptions.push(exception('PLAN_NOT_EFFECTIVE', `Plan "${p.name}" (operator ${o.name}) has no version effective on ${isoDate(cycle.cycleStart)}. Add or extend a plan version.`));
@@ -373,8 +388,8 @@ export async function computeVdp(vdp, preloaded = {}) {
   }
   const mixedPlans = [...opPlan.values()].some((x) => x.own);
   const settingsOf = (operatorId) => opPlan.get(operatorId)?.settings || settings;
-  const division10WindowSource = String(division?.divisionNumber || '').trim() === '10'
-    && importDoc?.stats?.sourceAdapter === DIV10_ADAPTER_VERSION;
+  const normalizedWindowSource = Boolean(importDoc?.stats?.windowSource)
+    || importDoc?.stats?.sourceAdapter === DIV10_ADAPTER_VERSION;
   const compassTuiOperators = activeOperators(provider, cycle).filter((operator) => {
     const operatorSettings = settingsOf(operator.id);
     return operator.source?.system === 'COMPASS' && operatorSettings?.tuiEligible?.value;
@@ -384,7 +399,7 @@ export async function computeVdp(vdp, preloaded = {}) {
     exceptions.push(exception('TUI_COMPASS_WINDOW_MISSING',
       `Compass has no active run-cut start/end time for ${withoutCompassWindow.map((operator) => operator.name).join(', ')}. TUI fulfillment and tiers cannot be calculated.`));
   }
-  const withoutWindowHoursSource = compassTuiOperators.filter((operator) => !division10WindowSource
+  const withoutWindowHoursSource = compassTuiOperators.filter((operator) => !normalizedWindowSource
     && settingsOf(operator.id)?.attainmentHourMetric?.value !== 'OTHER');
   if (withoutWindowHoursSource.length) {
     exceptions.push(exception('TUI_WINDOW_HOURS_SOURCE_REQUIRED',
@@ -494,7 +509,7 @@ export async function computeVdp(vdp, preloaded = {}) {
       if (!rows.length) {
         exceptions.push(exception('NO_UBER_PERFORMANCE_DATA', `No uploaded Uber rows are matched to ${provider.name}'s operators.`));
       }
-      if (['2', '10'].includes(String(division?.divisionNumber || '').trim())) {
+      if (String(division?.divisionNumber || '').trim() === '10') {
         const tolls = uberTollReadiness({ cycle, tollImports: uberTollImports, uberImports });
         if (!tolls.ready) {
           const detail = tolls.missingWeeks.length
@@ -562,22 +577,18 @@ export async function computeVdp(vdp, preloaded = {}) {
     } else if (!importDoc) {
       exceptions.push(exception('NO_PERFORMANCE_IMPORT', 'No Performance Report has been uploaded for this cycle.'));
     } else if (settings) {
-      const division10Source = String(division?.divisionNumber || '').trim() === '10'
-        ? division10ProviderSourceData({
+      const divisionSource = importDoc?.stats?.sourceAdapter
+        ? divisionProviderSourceData({
           importDoc,
           provider,
           matches: preloaded.matches || matchRoutes(importDoc, await Provider.find({ divisionId: provider.divisionId })),
           cycle,
+          timezone: division.timezone,
         })
-        : { importDoc, cashFares: '0', fuelExpense: null, fareRows: 0, fuelRows: 0 };
-      const performanceImport = division10Source.importDoc;
-      sourceFuelExpense = division10Source.fuelExpense;
-      if (D(division10Source.cashFares || 0).gt(0)) {
-        sourceAdjustments.push({
-          type: 'FARES', amount: division10Source.cashFares,
-          description: `DIV 10 Jasper cash fares (${division10Source.fareRows} route/day row${division10Source.fareRows === 1 ? '' : 's'})`,
-        });
-      }
+        : { importDoc, adjustments: [], fuelExpense: null, fareRows: 0, fuelRows: 0 };
+      const performanceImport = divisionSource.importDoc;
+      sourceFuelExpense = divisionSource.fuelExpense;
+      sourceAdjustments.push(...(divisionSource.adjustments || []));
       const metric = settings.performanceHourMetric.value;
       const otherColumn = settings.performanceHourColumn.value;
       const metricOf = (operatorId) => {
@@ -586,7 +597,7 @@ export async function computeVdp(vdp, preloaded = {}) {
       };
       const attainmentOf = (operatorId) => {
         const x = settingsOf(operatorId);
-        if (division10WindowSource && x?.tuiEligible?.value) {
+        if (normalizedWindowSource && x?.tuiEligible?.value) {
           return { metric: 'OTHER', otherColumn: 'Incentive Hours' };
         }
         const attainmentMetric = x.attainmentHourMetric?.value || 'SAME_AS_PAID';
@@ -607,18 +618,18 @@ export async function computeVdp(vdp, preloaded = {}) {
         metricOf: mixedPlans ? metricOf : undefined,
         attainmentOf,
       });
-      if (String(division?.divisionNumber || '').trim() === '10') {
+      if (importDoc?.stats?.sourceAdapter) {
         performance.sourceInputs = {
-          adapter: DIV10_ADAPTER_VERSION,
-          cashFares: division10Source.cashFares,
-          fareRows: division10Source.fareRows,
-          fuelExpense: division10Source.fuelExpense,
-          fuelRows: division10Source.fuelRows,
+          adapter: importDoc.stats.sourceAdapter,
+          adjustmentRows: divisionSource.adjustments?.length || 0,
+          fuelExpense: divisionSource.fuelExpense,
+          fareRows: divisionSource.fareRows || 0,
+          fuelRows: divisionSource.fuelRows || 0,
         };
         const missingWindowHours = performance.operators.filter((operator) => settingsOf(operator.id)?.tuiEligible?.value
           && operator.weeks.some((week) => D(week.actualHours || 0).gt(0) && isBlank(week.attainmentHours)));
         if (missingWindowHours.length) {
-          exceptions.push(exception('DIV10_TUI_WINDOW_HOURS_MISSING',
+          exceptions.push(exception('TUI_WINDOW_HOURS_MISSING',
             `Manifest activity could not be aligned to a Compass start/end window for ${missingWindowHours.map((operator) => operator.name).join(', ')}. TUI tiers were not calculated.`));
         }
       }
@@ -754,15 +765,44 @@ function applyComputation(vdp, c) {
   vdp.settings = c.settings;
   vdp.performance = c.performance;
   vdp.calculation = c.calculation;
+  vdp.provenance = {
+    providerId: String(c.provider._id),
+    divisionId: String(c.cycle.divisionId),
+    cycleId: String(c.cycle._id),
+    plan: c.plan ? {
+      id: String(c.plan._id),
+      versionId: String(c.version?._id || ''),
+      versionNumber: c.version?.versionNumber,
+      blueprint: c.plan.blueprint || null,
+    } : null,
+    importIds: [
+      ...(c.importDoc ? [String(c.importDoc._id)] : []),
+      ...(c.uberImports || []).map((doc) => String(doc._id)),
+      ...(c.uberTollImports || []).map((doc) => String(doc._id)),
+      ...(c.division3Imports || []).map((doc) => String(doc._id)),
+    ],
+    dailyFacts: (c.performance?.days || []).map((day) => ({
+      date: day.date,
+      week: day.week,
+      route: day.route,
+      operatorId: day.operatorId,
+      paidHours: day.hours,
+      attainmentHours: day.attainmentHours,
+      trips: day.trips,
+      tui: day.tui || null,
+    })),
+    calculatedAt: new Date(),
+  };
   vdp.gross = c.calculation?.gross ?? null;
   vdp.net = c.calculation?.net ?? null;
   vdp.exceptions = c.exceptions;
   vdp.status = c.status;
   vdp.calculatedAt = new Date();
   vdp.stale = false;
+  vdp.staleReasons = [];
 }
 
-export async function processCycle(cycleId, user) {
+export async function processCycle(cycleId, user, { partial = false } = {}) {
   const cycle = await VdpCycle.findById(cycleId);
   if (!cycle) throw notFound('VDP cycle');
   const division = await Division.findById(cycle.divisionId);
@@ -781,6 +821,7 @@ export async function processCycle(cycleId, user) {
   const division2 = String(division?.divisionNumber || '').trim() === '2';
   const division10 = String(division?.divisionNumber || '').trim() === '10';
   if (division10 && needsStandard) await refreshDivision10DerivedImport({ cycle, user });
+  else if (needsStandard && divisionAdapterFor(division?.divisionNumber)) await refreshDivisionDerivedImport({ cycle, division, user });
   const [importDoc, uberImports, uberTollImports, division3Imports] = await Promise.all([
     needsStandard ? activeImportFor(cycle._id) : Promise.resolve(null),
     needsUber ? activeUberImportsFor(cycle._id) : Promise.resolve([]),
@@ -794,13 +835,13 @@ export async function processCycle(cycleId, user) {
     const missingWeeks = [isoDate(cycle.week1Start), isoDate(cycle.week2Start)].filter((week) => !loadedWeeks.has(week));
     if (missingWeeks.length) throw badRequest(`Upload the DIV ${division2 ? '2' : division10 ? '10' : '3'} Uber Report for both weeks before processing. Missing: ${missingWeeks.join(', ')}.`);
   }
-  if (needsUber && (division2 || division10)) {
+  if (needsUber && division10) {
     const tolls = uberTollReadiness({ cycle, tollImports: uberTollImports, uberImports });
     if (!tolls.ready) throw badRequest(`Upload one valid DIV ${division2 ? '2' : '10'} Uber toll reimbursement CSV for each week before processing.${tolls.missingWeeks.length ? ` Missing: ${tolls.missingWeeks.join(', ')}.` : ''}`);
   }
   const matches = importDoc ? matchRoutes(importDoc, providers) : [];
   const unresolved = unresolvedRoutes(matches);
-  if (unresolved.length) {
+  if (unresolved.length && !partial) {
     throw conflict(
       `${unresolved.length} route(s) in the Performance Report need review before VDPs can be processed.`,
       { code: 'UNRESOLVED_ROUTES', routes: unresolved },
@@ -808,7 +849,7 @@ export async function processCycle(cycleId, user) {
   }
   const driverMatches = needsUber ? matchUberDrivers(uberImports, providers, cycle) : [];
   const unmatchedDrivers = driverMatches.filter((match) => match.status !== 'MATCHED');
-  if (unmatchedDrivers.length) {
+  if (unmatchedDrivers.length && !partial) {
     throw conflict(
       `${unmatchedDrivers.length} Uber driver(s) need to be matched to provider operators before VDPs can be processed.`,
       { code: 'UNRESOLVED_UBER_DRIVERS', drivers: unmatchedDrivers },
@@ -821,7 +862,7 @@ export async function processCycle(cycleId, user) {
       const missing = Object.values(readiness.sources).filter((source) => source.required && !source.ready).map((source) => source.label);
       throw badRequest(`Upload both DIV 3 weeks for ${missing.join(', ')} before processing.`);
     }
-    if (readiness.unresolvedCount) {
+    if (readiness.unresolvedCount && !partial) {
       throw conflict(
         `${readiness.unresolvedCount} ADA/GoLink driver(s) need to be matched to provider operators before VDPs can be processed.`,
         { code: 'UNRESOLVED_DIV3_DRIVERS', drivers: readiness.driverMatches.filter((match) => ['UNMATCHED', 'AMBIGUOUS'].includes(match.status)) },
@@ -830,7 +871,13 @@ export async function processCycle(cycleId, user) {
     division3Rows = division3RowsForCalculation({ imports: division3Imports, providers, cycle, processingDivisions });
   }
   const uberRows = needsUber ? await uberRowsForCycle(cycle._id) : [];
-  const counts = { processed: 0, ready: 0, needsReview: 0, skippedLocked: 0 };
+  const counts = {
+    processed: 0,
+    ready: 0,
+    needsReview: 0,
+    skippedLocked: 0,
+    intakeExceptions: unresolved.length + unmatchedDrivers.length + Number(division3 ? division3Readiness({ cycle, imports: division3Imports, providers, processingDivisions }).unresolvedCount : 0),
+  };
 
   for (const provider of expected) {
     let vdp = await Vdp.findOne({ providerId: provider._id, cycleId: cycle._id });
@@ -1073,6 +1120,10 @@ const providerView = (p, routes) => ({
 
 async function buildSnapshot(vdp, c, user) {
   const division = await Division.findById(vdp.divisionId);
+  const normalizedSourceIds = c.importDoc?.stats?.sourceImportIds || [];
+  const normalizedSourceImports = normalizedSourceIds.length
+    ? await PerformanceImport.find({ _id: { $in: normalizedSourceIds } }).select('datasetType originalFileName fileHash uploadedAt stats').lean()
+    : [];
   return {
     capturedAt: new Date(),
     provider: providerView(c.provider, c.performance?.routes),
@@ -1097,6 +1148,18 @@ async function buildSnapshot(vdp, c, user) {
       id: doc._id, kind: doc.kind, fileName: doc.originalFileName, fileHash: doc.fileHash,
       uploadedAt: doc.uploadedAt, rowCount: doc.rowCount, datesDetected: doc.datesDetected,
     })),
+    provenance: {
+      ...vdp.provenance,
+      normalizedSourceImports: normalizedSourceImports.map((doc) => ({
+        id: doc._id,
+        datasetType: doc.datasetType,
+        fileName: doc.originalFileName,
+        checksum: doc.fileHash,
+        schemaVersion: doc.stats?.schemaVersion,
+        parserVersion: doc.stats?.parserVersion,
+        uploadedAt: doc.uploadedAt,
+      })),
+    },
     adjustments: vdp.adjustments.map((a) => ({
       type: a.type, amount: str(a.amount), description: a.description, date: a.date,
       operatorId: a.operatorId ? String(a.operatorId) : null, operatorName: a.operatorName, week: a.week,
@@ -1153,6 +1216,36 @@ export async function approve(id, user) {
   await autoApproveDue(); // approved after the deadline → processed straight away
   await syncCycleStatus(vdp.cycleId);
   return Vdp.findById(vdp._id);
+}
+
+// Queue action used by Accounting. Every VDP is recomputed independently by
+// approve(), so a stale or newly exceptional record is skipped without holding
+// the clean records behind it.
+export async function bulkApprove({ ids, cycleId, divisionId }, user) {
+  const filter = { status: 'READY', stale: { $ne: true } };
+  if (Array.isArray(ids) && ids.length) filter._id = { $in: ids };
+  if (cycleId) filter.cycleId = cycleId;
+  if (divisionId) filter.divisionId = divisionId;
+  if (!filter._id && !filter.cycleId) throw badRequest('Choose VDPs or a VDP cycle to approve.');
+  const candidates = await Vdp.find(filter, '_id');
+  const result = { requested: candidates.length, approved: [], skipped: [] };
+  for (const candidate of candidates) {
+    try {
+      await approve(candidate._id, user);
+      result.approved.push(String(candidate._id));
+    } catch (error) {
+      result.skipped.push({ id: String(candidate._id), message: error.message, details: error.details || null });
+    }
+  }
+  await recordAudit({
+    action: 'BULK_APPROVE',
+    entityType: 'VdpCycle',
+    entityId: cycleId || null,
+    reason: `Approved ${result.approved.length}; skipped ${result.skipped.length}`,
+    user,
+    metadata: { divisionId: divisionId || null, requestedIds: ids || null, ...result },
+  });
+  return result;
 }
 
 // After Big Star answers a provider issue the provider always gets at least this long to review again.
@@ -1380,8 +1473,10 @@ export async function vdpView(vdp) {
 }
 
 // Mark open VDPs as needing recalculation after their inputs change.
-export async function markStale(filter) {
-  await Vdp.updateMany({ ...filter, status: { $in: EDITABLE } }, { $set: { stale: true } });
+export async function markStale(filter, reason = 'A provider, plan, or configuration input changed.') {
+  await Vdp.updateMany({ ...filter, status: { $in: EDITABLE } }, {
+    $set: { stale: true }, $addToSet: { staleReasons: reason },
+  });
 }
 
 export async function vdpUsesVersion(versionId) {

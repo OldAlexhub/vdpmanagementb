@@ -11,6 +11,7 @@ import { isoDate, addDays, toDateOnly } from '../services/cycleService.js';
 import { badRequest, conflict, notFound, actor } from '../services/errors.js';
 import { decimalInput, pick } from './validate.js';
 import { isCompassRosterAuthority } from '../services/compassClient.js';
+import { recordAudit } from '../services/auditService.js';
 
 const normRoutes = (routes) =>
   [...new Set((Array.isArray(routes) ? routes : String(routes || '').split(/[,\s]+/))
@@ -311,6 +312,44 @@ export async function assignDivisionPlan(req, res) {
     plan: { _id: plan._id, name: plan.name },
     applied: { providers: result.matchedCount },
   });
+}
+
+export async function batchUnassignPlans(req, res) {
+  const providerIds = Array.isArray(req.body.providerIds) ? req.body.providerIds.filter(Boolean) : [];
+  const divisionId = req.body.divisionId || null;
+  if (!providerIds.length && !divisionId) throw badRequest('Choose at least one provider or a division.');
+  const filter = {
+    ...(providerIds.length ? { _id: { $in: providerIds } } : {}),
+    ...(divisionId ? { divisionId } : {}),
+  };
+  const providers = await Provider.find(filter);
+  if (!providers.length) throw badRequest('No providers matched the selection.');
+  const includeOperators = req.body.includeOperators !== false;
+  let operatorAssignmentsCleared = 0;
+  for (const provider of providers) {
+    const before = {
+      planId: provider.planId,
+      operators: provider.operators.map((operator) => ({ id: operator._id, planId: operator.planId })),
+    };
+    provider.planId = null;
+    if (includeOperators) provider.operators.forEach((operator) => {
+      if (operator.planId) operatorAssignmentsCleared += 1;
+      operator.planId = null;
+    });
+    await provider.save();
+    await recordAudit({
+      action: 'BATCH_PLAN_UNASSIGNED',
+      entityType: 'Provider',
+      entityId: provider._id,
+      entityLabel: provider.name,
+      reason: req.body.reason || 'Batch plan unassignment',
+      user: req.user,
+      before,
+      after: { planId: null, includeOperators },
+    });
+  }
+  await markStale({ providerId: { $in: providers.map((provider) => provider._id) } });
+  res.json({ providersUpdated: providers.length, operatorAssignmentsCleared });
 }
 
 // A provider saved before operators existed gets its one operator as a real record first.

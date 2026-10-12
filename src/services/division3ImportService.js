@@ -91,7 +91,9 @@ async function requireDivision3(divisionId) {
 }
 
 async function markCycleStale(cycleId) {
-  await Vdp.updateMany({ cycleId, status: { $in: ['DRAFT', 'NEEDS_REVIEW', 'READY'] } }, { $set: { stale: true } });
+  await Vdp.updateMany({ cycleId, status: { $in: ['DRAFT', 'NEEDS_REVIEW', 'READY'] } }, {
+    $set: { stale: true }, $addToSet: { staleReasons: 'A Division 3 source or match resolution changed.' },
+  });
 }
 
 const operatorKey = (providerId, operatorId) => `${String(providerId)}|${String(operatorId)}`;
@@ -468,7 +470,9 @@ export async function clearDivision3DriverMatch({ cycleId, sourceName, service: 
   return { sourceName, service, cleared };
 }
 
-export async function setAsideDivision3Driver({ cycleId, sourceName, service: requestedService }, user) {
+export async function setAsideDivision3Driver({ cycleId, sourceName, service: requestedService, reason }, user) {
+  const setAsideReason = String(reason || '').trim();
+  if (!setAsideReason) throw badRequest('A reason is required to set a source driver aside.');
   const cycle = await VdpCycle.findById(cycleId);
   if (!cycle) throw notFound('VDP cycle');
   const imports = await activeDivision3ImportsFor(cycle._id);
@@ -477,11 +481,11 @@ export async function setAsideDivision3Driver({ cycleId, sourceName, service: re
     if (!docHasSource(doc, key)) continue;
     doc.division3DriverMatches = (doc.division3DriverMatches || []).filter((match) => sourceMatchKey(match.sourceName, serviceForStoredMatch(doc, match)) !== key);
     doc.division3DriverExclusions = (doc.division3DriverExclusions || []).filter((exclusion) => sourceMatchKey(exclusion.sourceName, exclusion.service) !== key);
-    doc.division3DriverExclusions.push({ sourceName, service, excludedBy: actor(user), excludedAt: new Date() });
+    doc.division3DriverExclusions.push({ sourceName, service, reason: setAsideReason, excludedBy: actor(user), excludedAt: new Date() });
     await doc.save();
   }
   await markCycleStale(cycle._id);
-  return { sourceName, service, status: 'SET_ASIDE' };
+  return { sourceName, service, reason: setAsideReason, status: 'SET_ASIDE' };
 }
 
 export async function restoreDivision3Driver({ cycleId, sourceName, service: requestedService }) {
