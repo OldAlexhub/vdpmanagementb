@@ -3,6 +3,7 @@ import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import mongoose from 'mongoose';
 import { parseDivisionSourceFile } from '../src/services/divisionSourceParser.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -74,12 +75,21 @@ test('launch division parsers normalize the representative source artifacts', as
   });
 
   await t.test('DIV 11 shift report produces performance facts and observed windows', async () => {
-    const result = await parse(
-      ['DIV11', 'VDP AUTOMATION', 'Shift Hours and Mileage', '9.0 Shift Hours Mileage Report 9.7 - 9.13.xlsx'],
-      '11', 'DIV11_SHIFT_HOURS',
-    );
-    assert.equal(result.adapterVersion, 'DIV11_V1');
-    assert.ok(result.rows.length > 0);
-    assert.ok(result.division10ManifestRows.length > 0);
+    for (const fileName of [
+      '9.0 Shift Hours Mileage Report 9.7 - 9.13.xlsx',
+      '9.0 Shift Hours Mileage Report 9.14 - 9.20.xlsx',
+    ]) {
+      const result = await parse(
+        ['DIV11', 'VDP AUTOMATION', 'Shift Hours and Mileage', fileName],
+        '11', 'DIV11_SHIFT_HOURS',
+      );
+      assert.equal(result.adapterVersion, 'DIV11_V1');
+      assert.ok(result.rows.length > 0);
+      assert.ok(result.division10ManifestRows.length > 0);
+      assert.doesNotThrow(() => result.division10ManifestRows.forEach((row) => {
+        mongoose.Types.Decimal128.fromString(row.actualHours);
+        mongoose.Types.Decimal128.fromString(row.lunchHours);
+      }));
+    }
   });
 });

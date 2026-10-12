@@ -29,6 +29,24 @@ const FACT_FIELD = {
   ADJUSTMENT: 'sourceAdjustmentRows',
 };
 
+const storageHours = (value) => (
+  value === null || value === undefined || value === ''
+    ? value
+    : D(value).toDecimalPlaces(12).toString()
+);
+
+function storedFactPayload(fact) {
+  if (fact.factType !== 'OBSERVED_WINDOW' || !fact.payload) return fact.payload;
+  // Facts written before the time parser's Decimal128 boundary may contain a
+  // repeating 40-digit duration. Normalize those legacy facts while hydrating
+  // them so an already-uploaded cycle can recover without another upload.
+  return {
+    ...fact.payload,
+    actualHours: storageHours(fact.payload.actualHours),
+    lunchHours: storageHours(fact.payload.lunchHours),
+  };
+}
+
 const activeSources = async (cycleId) => {
   const docs = await PerformanceImport.find({
     cycleId,
@@ -43,7 +61,7 @@ const activeSources = async (cycleId) => {
     const key = String(fact.importId);
     if (!byImport.has(key)) byImport.set(key, {});
     const field = FACT_FIELD[fact.factType];
-    if (field) (byImport.get(key)[field] ||= []).push(fact.payload);
+    if (field) (byImport.get(key)[field] ||= []).push(storedFactPayload(fact));
   }
   for (const doc of docs) {
     const stored = byImport.get(String(doc._id));

@@ -311,6 +311,14 @@ function clockFromTimestamp(value) {
   return hour * 60 + Number(match[2]);
 }
 
+// Decimal128 supports 34 significant digits. Durations such as 641 / 60 are
+// repeating decimals, so allowing Decimal.js' 40-digit working precision to
+// leak into normalized facts makes otherwise valid shifts impossible to
+// materialize in MongoDB. Twelve decimal places is sub-microsecond precision
+// for an hour value and matches the other normalized time parsers.
+const storageHours = (value) => D(value).toDecimalPlaces(12).toString();
+const hoursFromMinutes = (minutes) => storageHours(D(minutes).div(60));
+
 function div5RprRows(sheet, cycle) {
   return div10TrapezeRows(sheet, cycle);
 }
@@ -371,7 +379,7 @@ function div7DriverWindows(sheet, cycle) {
     let end = clockFromTimestamp(cell(row, columns, 'Pull in act'));
     if (!date || !route || start === null || end === null) return [];
     if (end <= start) end += 24 * 60;
-    return [{ date, route, operatorName: text(cell(row, columns, 'Driver Name')), actualStartMinutes: start, actualEndMinutes: end, actualHours: D(end - start).div(60).toString(), lunchHours: number(cell(row, columns, 'Scheduled breaks act')).toString() }];
+    return [{ date, route, operatorName: text(cell(row, columns, 'Driver Name')), actualStartMinutes: start, actualEndMinutes: end, actualHours: hoursFromMinutes(end - start), lunchHours: storageHours(number(cell(row, columns, 'Scheduled breaks act'))) }];
   });
 }
 
@@ -396,7 +404,7 @@ function div8DutyRows(sheet, cycle) {
     if (end === null) end = clockFromTimestamp(cell(row, columns, 'Last Seen In Service Area Time'));
     if (start !== null && end !== null) {
       if (end <= start) end += 24 * 60;
-      windows.push({ date, route, operatorName: text(cell(row, columns, 'Driver Name')), actualStartMinutes: start, actualEndMinutes: end, actualHours: D(end - start).div(60).toString(), lunchHours: number(cell(row, columns, 'Total Actual Break (hours)')).toString() });
+      windows.push({ date, route, operatorName: text(cell(row, columns, 'Driver Name')), actualStartMinutes: start, actualEndMinutes: end, actualHours: hoursFromMinutes(end - start), lunchHours: storageHours(number(cell(row, columns, 'Total Actual Break (hours)'))) });
     }
   }
   return { performance, windows };
@@ -424,7 +432,7 @@ function div11ShiftRows(sheet, cycle) {
     let end = clockFromTimestamp(cell(row, columns, 'Actual Shift End'));
     if (start !== null && end !== null) {
       if (end <= start) end += 24 * 60;
-      windows.push({ date: carriedDate, route, operatorName: carriedDriver, actualStartMinutes: start, actualEndMinutes: end, actualHours: D(end - start).div(60).toString(), lunchHours: number(cell(row, columns, 'Total Break Hours')).toString() });
+      windows.push({ date: carriedDate, route, operatorName: carriedDriver, actualStartMinutes: start, actualEndMinutes: end, actualHours: hoursFromMinutes(end - start), lunchHours: storageHours(number(cell(row, columns, 'Total Break Hours'))) });
     }
   }
   return { performance, windows };
