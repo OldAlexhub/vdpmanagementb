@@ -9,7 +9,7 @@ const summary = (d) => {
 };
 
 export async function list(req, res) {
-  const filter = { kind: { $nin: ['UBER', 'UBER_TOLLS'] } };
+  const filter = { kind: { $nin: ['UBER', 'UBER_TOLLS', 'COMPASS'] } };
   if (req.query.cycleId) filter.cycleId = req.query.cycleId;
   if (req.query.divisionId) filter.divisionId = req.query.divisionId;
   const docs = await PerformanceImport.find(filter).sort({ uploadedAt: -1 });

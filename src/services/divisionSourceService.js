@@ -8,6 +8,7 @@ import NormalizedFact from '../models/NormalizedFact.js';
 import { actor, badRequest, conflict, notFound } from './errors.js';
 import { addDays, isoDate, weekOf } from './cycleService.js';
 import { inferCycleFromDates } from './cycleInference.js';
+import { compassDatasetReplacement } from './compassPerformanceService.js';
 import {
   contractForDivisionNumber,
   definitionForDataset,
@@ -368,7 +369,7 @@ function datasetReadiness(definition, files, cycle) {
   };
 }
 
-export async function divisionSourceReadiness({ cycle, division }) {
+export async function divisionSourceReadiness({ cycle, division, compassView }) {
   const definitions = contractForDivisionNumber(division?.divisionNumber);
   const contract = publicContractForDivision(division);
   const docs = await listDivisionSourceImports({ cycleId: cycle._id });
@@ -376,13 +377,21 @@ export async function divisionSourceReadiness({ cycle, division }) {
     definition.id,
     datasetReadiness(definition, docs.filter((doc) => doc.datasetType === definition.id), cycle),
   ]));
+  const replacement = await compassDatasetReplacement(cycle, division, compassView);
+  if (replacement && datasets[replacement.datasetType]) {
+    Object.assign(datasets[replacement.datasetType], {
+      ready: true, loaded: true, satisfiedBy: 'COMPASS', datesDetected: replacement.dates,
+      missingDates: [], missingWeeks: [], rowCount: replacement.rows.length,
+    });
+  }
   const required = Object.values(datasets).filter((dataset) => dataset.required && dataset.stage === 'REQUIRED');
   const additional = Object.values(datasets).filter((dataset) => dataset.required && dataset.stage === 'ADDITIONAL');
   const division10 = String(division?.divisionNumber || '').trim() === '10';
   const genericAdapter = divisionAdapterFor(division?.divisionNumber);
-  const requiredFiles = required.flatMap((dataset) => dataset.files.filter((file) => file.status === 'ACTIVE' && file.validationStatus === 'VALID'));
-  const allSources = Object.values(datasets).flatMap((dataset) => dataset.files)
+  const requiredFiles = required.filter((dataset) => dataset.satisfiedBy !== 'COMPASS').flatMap((dataset) => dataset.files.filter((file) => file.status === 'ACTIVE' && file.validationStatus === 'VALID'));
+  const allSources = Object.values(datasets).filter((dataset) => dataset.satisfiedBy !== 'COMPASS').flatMap((dataset) => dataset.files)
     .filter((file) => file.status === 'ACTIVE' && file.validationStatus === 'VALID');
+  if (replacement) allSources.push({ datasetType: replacement.datasetType, adapterVersion: division10 ? DIV10_ADAPTER_VERSION : genericAdapter?.version });
   const adapterReady = division10
     ? required.length > 0 && required.every((dataset) => dataset.ready)
       && requiredFiles.every((file) => file.adapterVersion === DIV10_ADAPTER_VERSION)

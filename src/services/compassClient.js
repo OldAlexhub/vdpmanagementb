@@ -5,6 +5,8 @@ const ENDPOINTS = Object.freeze({
   operators: { path: '/api/operators', key: 'operators' },
   providers: { path: '/api/providers', key: 'providers' },
   runCuts: { path: '/api/run-cuts', key: 'runCuts', query: { includeStandby: '1' } },
+  performance: { path: '/api/network-success/performance' },
+  entries: { path: '/api/network-success/entries', key: 'entries' },
 });
 
 const value = (name) => String(process.env[name] || '').trim();
@@ -46,7 +48,7 @@ export function isCompassRosterAuthority() {
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function getCollection(name) {
+export async function requestCompass(name, query = {}) {
   const current = config();
   if (!current.configured) {
     throw badRequest(`Compass API configuration is incomplete: ${current.missing.join(', ')}.`, {
@@ -54,8 +56,9 @@ async function getCollection(name) {
     });
   }
   const endpoint = ENDPOINTS[name];
+  if (!endpoint) throw badRequest('Unknown Compass endpoint.');
   const url = new URL(endpoint.path, `${current.baseUrl}/`);
-  for (const [key, item] of Object.entries(endpoint.query || {})) url.searchParams.set(key, item);
+  for (const [key, item] of Object.entries({ ...endpoint.query, ...query })) url.searchParams.set(key, item);
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
     let response;
@@ -64,6 +67,7 @@ async function getCollection(name) {
         method: 'GET',
         headers: { Authorization: `Bearer ${current.token}`, Accept: 'application/json' },
         signal: AbortSignal.timeout(current.timeout),
+        redirect: 'error',
       });
     } catch (error) {
       if (attempt < 2) { await pause(250 * (attempt + 1)); continue; }
@@ -82,13 +86,15 @@ async function getCollection(name) {
     }
     let body;
     try { body = await response.json(); } catch { throw badRequest(`Compass ${name} response was not valid JSON.`, { code: 'COMPASS_INVALID_RESPONSE' }); }
-    if (!Array.isArray(body?.[endpoint.key])) {
+    if (!body || typeof body !== 'object' || (endpoint.key && !Array.isArray(body[endpoint.key]))) {
       throw badRequest(`Compass ${name} response did not contain ${endpoint.key}.`, { code: 'COMPASS_INVALID_RESPONSE' });
     }
-    return body[endpoint.key];
+    return body;
   }
   throw badRequest(`Compass ${name} request failed.`, { code: 'COMPASS_UNAVAILABLE' });
 }
+
+const getCollection = async (name) => (await requestCompass(name))[ENDPOINTS[name].key];
 
 export async function readCompassSnapshot() {
   const [divisions, operators, providers, runCuts] = await Promise.all([

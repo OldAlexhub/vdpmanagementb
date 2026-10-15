@@ -20,6 +20,7 @@ import * as vdps from '../controllers/vdpController.js';
 import * as portal from '../controllers/portalController.js';
 import * as imports from '../controllers/importController.js';
 import * as compass from '../controllers/compassController.js';
+import * as compassPerformance from '../controllers/compassPerformanceController.js';
 import * as liftLeases from '../controllers/liftLeaseController.js';
 import * as processingRuns from '../controllers/processingRunController.js';
 import * as lifecycle from '../controllers/lifecycleController.js';
@@ -121,6 +122,9 @@ api.get('/cycles/periods', cycles.periods);
 api.post('/cycles/generate', requireAdmin, cycles.generate);
 api.get('/cycles/preview', cycles.preview);
 api.get('/cycles/:id', cycles.get);
+api.get('/cycles/:cycleId/compass-performance', compassPerformance.get);
+api.post('/cycles/:cycleId/compass-performance/sync', requireAccounting, compassPerformance.sync);
+api.post('/cycles/:cycleId/compass-performance/corrections', requireAccounting, compassPerformance.correct);
 api.patch('/cycles/:id', requireAccounting, cycles.update);
 
 api.get('/processing-runs', processingRuns.list);

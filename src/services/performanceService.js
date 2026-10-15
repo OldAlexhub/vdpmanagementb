@@ -35,6 +35,13 @@ export function matchRoutes(importDoc, providers) {
   return routes.map((route) => {
     const rows = importDoc.rows.filter((r) => r.route === route);
     const summary = { route, days: rows.length };
+    if (rows.some((r) => r.compass && (!r.providerId || !r.operatorId))) {
+      return { ...summary, status: 'UNKNOWN', compass: true, message: 'Resolve the dated operator assignment in Compass performance corrections.' };
+    }
+    if (rows.every((r) => r.compass && r.providerId && r.operatorId)) {
+      const ids = [...new Set(rows.map((r) => String(r.providerId)))];
+      return { ...summary, status: 'MATCHED', compass: true, providerId: ids.length === 1 ? ids[0] : null, providerName: ids.map((id) => byId.get(id)?.name || id).join(' / ') };
+    }
     // Carry an explicit decision across corrected reports when only formatting changed. A suffix
     // change is not carried forward because one prior route could otherwise decide several rows.
     const res = resolutions.get(route) || normalizedResolutions.get(routeKey(route));

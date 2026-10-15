@@ -59,12 +59,52 @@ or the applicable default marks open VDPs stale; approved and paid statements ke
 
 ## VDP processing pipeline
 
-Processing starts with a division, then moves through required datasets, additional datasets,
+Processing starts with a division/program and a generated pay period, then moves through required datasets, additional datasets,
 validation/calculation, and VDP review. A Performance Report or Uber dataset may be uploaded with
 the division only; the server infers the pay period from source dates and binds the import to the
 single generated cycle containing all dates. It refuses ambiguous, cross-period, or unmatched date
 ranges. The additional-data stage is intentionally ready for division-specific requirements without
 assuming toll, fare, or other feeds before those divisions are configured.
+
+### Compass performance and corrections
+
+Opening a processing period as an Accounting-authorized user attempts its first Compass performance
+import. Later updates use **Refresh from Compass** in VDP Management; performance has no scheduler.
+The integration reuses the roster connection settings above and only sends GET requests to Compass.
+It fetches `/api/network-success/entries` separately for each inclusive date, source, and linked
+division external ID, and uses `/api/network-success/performance` for assignment and reconciliation.
+A 2,000-entry response, invalid response, or mismatch rejects the refresh and retains the prior snapshot.
+Empty dates remain visibly missing. Shared-route components are counted once without parent totals.
+
+Versioned `PerformanceImport` records (`kind: COMPASS`) and bounded `NormalizedFact` records preserve
+source IDs, original metrics, checksums, date coverage and retrieval time. `CompassPerformanceState`
+holds each cycle's active snapshot pointer, revision, update lock, and separately audited corrections.
+Identical imports reuse the snapshot and do not mark statements stale. Materialized Compass metrics
+are tagged so that older derived imports cannot masquerade as uploaded fallback after a refresh.
+
+Metrics resolve as **manual correction → Compass → uploaded fallback**, never by adding overlapping
+sources. Supplemental file fields remain available when they can be assigned unambiguously. Only
+performance source slots whose complete required inputs are supplied become optional; mileage,
+manifest/duty details, TUI window hours, fares, fuel and toll requirements remain. Service hours never
+replace total paid hours or duty/TUI hours. Negative upstream hours are preserved for reconciliation,
+flagged in review, and cannot be used as payable hours; unaffected metrics remain usable.
+
+Accounting-authorized users can correct completed trips, service hours, or a record's dated operator
+assignment. Every change, retain, and revert requires a nonblank reason and the current revision.
+Trips must be nonnegative whole numbers; corrected hours must be nonnegative decimals. Corrections
+survive refreshes. Changed source values or removed corrected records block approval until reviewed.
+Explicitly keeping a removed record retains its work locally; reverting removes that local correction.
+Changes mark editable statements stale. Approved and paid statements keep their frozen snapshots and
+must follow the existing reopening workflow before their corrections can be changed.
+
+| Cycle-scoped endpoint (under `/api`) | Purpose |
+|---|---|
+| `GET /cycles/:cycleId/compass-performance` | Coverage, refresh status, daily source/effective values, issues and correction history |
+| `POST /cycles/:cycleId/compass-performance/sync` | Refresh with `{ expectedRevision }` |
+| `POST /cycles/:cycleId/compass-performance/corrections` | `{ expectedRevision, rowKey, action, reason, values?, assignment? }`; action is `CORRECT`, `RETAIN`, or `REVERT` |
+
+Both mutation endpoints use the existing Accounting authorization. The integration does not write
+to Compass, automatically recalculate historical statements, or change compensation plan definitions.
 
 On the **Providers** tab, administrators can filter to a division and batch assign one of that
 division's existing active VDP plans. The selection also becomes the default for providers discovered

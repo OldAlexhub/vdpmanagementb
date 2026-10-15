@@ -2,6 +2,9 @@ import crypto from 'node:crypto';
 import PerformanceImport from '../models/PerformanceImport.js';
 import NormalizedFact from '../models/NormalizedFact.js';
 import Provider from '../models/Provider.js';
+import Division from '../models/Division.js';
+import VdpCycle from '../models/VdpCycle.js';
+import { compassDatasetReplacement } from './compassPerformanceService.js';
 import { actor } from './errors.js';
 import { D, sum, str } from './money.js';
 import { isoDate, weekOf } from './cycleService.js';
@@ -54,6 +57,19 @@ const activeSources = async (cycleId) => {
     status: 'ACTIVE',
     validationStatus: 'VALID',
   }).sort({ uploadedAt: 1 });
+  const cycle = await VdpCycle.findById(cycleId);
+  const division = cycle && await Division.findById(cycle.divisionId);
+  const replacement = division && await compassDatasetReplacement(cycle, division);
+  if (replacement) {
+    const version = String(division.divisionNumber) === '10' ? DIV10_ADAPTER_VERSION : divisionAdapterFor(division.divisionNumber)?.version;
+    for (let i = docs.length - 1; i >= 0; i -= 1) if (docs[i].datasetType === replacement.datasetType) docs.splice(i, 1);
+    docs.push({
+      _id: replacement.view.importId, datasetType: replacement.datasetType, rows: replacement.rows.map((row) => ({ ...row, compassDerived: true })),
+      originalFileName: 'Compass performance', fileHash: `compass:${replacement.view.importId}:${replacement.view.revision}`,
+      stats: { adapterVersion: version }, detectedColumns: { SERVICE_HOURS: true, REVENUE_HOURS: true },
+      datesDetected: replacement.dates, warnings: [], compassVirtual: true,
+    });
+  }
   if (!docs.length) return docs;
   const facts = await NormalizedFact.find({ importId: { $in: docs.map((doc) => doc._id) } }).sort({ sequence: 1 }).lean();
   const byImport = new Map();
@@ -64,6 +80,7 @@ const activeSources = async (cycleId) => {
     if (field) (byImport.get(key)[field] ||= []).push(storedFactPayload(fact));
   }
   for (const doc of docs) {
+    if (doc.compassVirtual) continue;
     const stored = byImport.get(String(doc._id));
     // Backward compatibility keeps already-normalized legacy imports usable
     // while every newly uploaded source uses the bounded fact collection.
@@ -118,6 +135,7 @@ function derivedRows(sources) {
   const byKey = new Map(trapeze.map((row) => [`${row.date}|${row.route}`, {
     date: row.date,
     route: row.route,
+    compassDerived: Boolean(row.compassDerived),
     trips: str(row.trips) || '0',
     totalHours: str(row.totalHours),
     serviceHours: str(row.serviceHours),

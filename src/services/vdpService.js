@@ -20,6 +20,9 @@ import { D, sum, isBlank, str, fmtMoney, fmtRate, fmtNum } from './money.js';
 import { badRequest, conflict, notFound, actor } from './errors.js';
 import { recordAudit } from './auditService.js';
 import { isDivision3Division, processingDivisionsFor } from './divisionGroups.js';
+import { compassPerformanceView, compassPerformanceForCalculation, withCompassPerformance, assertCompassRevision, withCompassApprovalLock } from './compassPerformanceService.js';
+import { needsPaidHours, needsAttainmentHours } from './compassPerformanceData.js';
+import { divisionSourceReadiness } from './divisionSourceService.js';
 import {
   DIV10_ADAPTER_VERSION,
   divisionAdapterFor,
@@ -188,7 +191,7 @@ function providerPerformance({ provider, cycle, importDoc, matches, metric, othe
     if (part) mine.set(m.route, part);
     else if (!m.split && String(m.providerId) === me) mine.set(m.route, null);
   }
-  const routes = [...mine.keys()];
+  const routes = [...new Set([...mine.keys(), ...importDoc.rows.filter((r) => r.compass && String(r.providerId) === me).map((r) => r.route)])];
   const ops = activeOperators(provider, cycle);
   // The operator with the best route match that day. Ties stay unassigned for review rather than
   // guessing between operators (for example a bare 1029 against separate 1029A and 1029B routes).
@@ -205,10 +208,10 @@ function providerPerformance({ provider, cycle, importDoc, matches, metric, othe
     return (pick(ops.filter((o) => worksOn(o, day))) ?? pick(ops) ?? (ops.length === 1 ? ops[0] : null))?.id ?? null;
   };
   const days = importDoc.rows
-    .filter((r) => mine.has(r.route))
-    .filter((r) => { const part = mine.get(r.route); return !part || (r.date >= part.from && r.date <= part.to); })
+    .filter((r) => r.compass ? String(r.providerId) === me : mine.has(r.route))
+    .filter((r) => { if (r.compass) return true; const part = mine.get(r.route); return !part || (r.date >= part.from && r.date <= part.to); })
     .map((r) => {
-      const operatorId = operatorFor(r.route, r.date);
+      const operatorId = r.compass ? r.operatorId : operatorFor(r.route, r.date);
       // An operator on another plan counts the hours column that plan pays on.
       const m = metricOf(operatorId) || { metric, otherColumn };
       const a = attainmentOf(operatorId) || m;
@@ -221,6 +224,10 @@ function providerPerformance({ provider, cycle, importDoc, matches, metric, othe
         hours: str(hoursForMetric(r, m.metric, m.otherColumn)),
         attainmentHours: str(hoursForMetric(r, a.metric, a.otherColumn)),
         serviceMiles: str(r.serviceMiles),
+        serviceHours: str(r.serviceHours),
+        revenueHours: str(r.revenueHours),
+        source: r.compass ? 'COMPASS' : 'UPLOAD',
+        sourceRowKeys: r.sourceRowKeys || [],
         tui: r.tui || null,
       };
     })
@@ -297,8 +304,14 @@ export async function computeVdp(vdp, preloaded = {}) {
   const provider = preloaded.provider || (await Provider.findById(vdp.providerId));
   const cycle = preloaded.cycle || (await VdpCycle.findById(vdp.cycleId));
   const division = preloaded.division || (await Division.findById(cycle.divisionId));
-  const importDoc = preloaded.importDoc !== undefined ? preloaded.importDoc : await activeImportFor(vdp.cycleId);
+  const uploadedImport = preloaded.importDoc !== undefined ? preloaded.importDoc : await activeImportFor(vdp.cycleId);
+  const compassView = preloaded.compassView || uploadedImport?.compassView || await compassPerformanceForCalculation(cycle._id);
+  const importDoc = uploadedImport?.compassView ? uploadedImport : await withCompassPerformance(cycle, uploadedImport, compassView);
   const exceptions = [];
+  const relevantCompass = compassView.rows.filter((row) => row.divisionId === String(provider.divisionId) && (!row.providerId || row.providerId === String(provider._id)));
+  if (compassView.refreshing) exceptions.push(exception('COMPASS_REFRESHING', 'Compass performance is being updated. Recalculate when the refresh finishes.'));
+  if (relevantCompass.some((r) => r.conflict)) exceptions.push(exception('COMPASS_CORRECTION_CONFLICT', 'Review corrected records whose Compass source changed or disappeared.'));
+  if (relevantCompass.some((r) => r.assignmentIssue)) exceptions.push(exception('COMPASS_ASSIGNMENT_REQUIRED', 'Resolve unassigned Compass performance records for this division before approval.'));
 
   let plan = null;
   let version = null;
@@ -436,6 +449,11 @@ export async function computeVdp(vdp, preloaded = {}) {
   const isUber = settings?.calculationType?.value === 'UBER';
   const isDivision3 = isDivision3Division(division);
   const isDivision10 = String(division?.divisionNumber || '').trim() === '10';
+  if (compassView.importId && !isUber && !isDivision3) {
+    const readiness = preloaded.compassReadiness || await divisionSourceReadiness({ cycle, division, compassView });
+    if (readiness.configured && (!readiness.ready || !readiness.processingSupported)) exceptions.push(exception('COMPASS_INPUTS_REQUIRED',
+      'Required performance or supplemental inputs are incomplete. Supply the remaining inputs before approval.'));
+  }
 
   for (const o of activeOperators(provider, cycle)) {
     const lease = o.liftLease;
@@ -581,6 +599,11 @@ export async function computeVdp(vdp, preloaded = {}) {
         })
         : { importDoc, adjustments: [], fuelExpense: null, fareRows: 0, fuelRows: 0 };
       const performanceImport = divisionSource.importDoc;
+      const ambiguousSupplement = performanceImport.rows.some((r) => r.supplementalAmbiguous && String(r.providerId) === String(provider._id));
+      const needsSupplement = [...opPlan.values()].some(({ settings: s }) =>
+        !['SERVICE_HOURS', 'REVENUE_HOURS'].includes(s.performanceHourMetric?.value)
+        || s.tuiEligible?.value || ['SERVICE_MILE_ALLOWANCE', 'PRICE_THRESHOLD_SURCHARGE'].includes(s.fuelMethod?.value));
+      if (ambiguousSupplement && needsSupplement) exceptions.push(exception('COMPASS_SUPPLEMENTAL_AMBIGUOUS', 'A route/day has multiple Compass operators. Supplemental file hours or miles cannot be assigned to each driver automatically.'));
       sourceFuelExpense = divisionSource.fuelExpense;
       sourceAdjustments.push(...(divisionSource.adjustments || []));
       const metric = settings.performanceHourMetric.value;
@@ -599,7 +622,12 @@ export async function computeVdp(vdp, preloaded = {}) {
           ? metricOf(operatorId)
           : { metric: attainmentMetric, otherColumn: x.attainmentHourColumn?.value || null };
       };
-      const inPlay = [{ metric, otherColumn }, ...[...opPlan.keys()].flatMap((operatorId) => [metricOf(operatorId), attainmentOf(operatorId)])];
+      const inPlay = compassView.loaded
+        ? [...opPlan.keys()].flatMap((operatorId) => [
+          ...(needsPaidHours(settingsOf(operatorId)) ? [metricOf(operatorId)] : []),
+          ...(needsAttainmentHours(settingsOf(operatorId)) ? [attainmentOf(operatorId)] : []),
+        ])
+        : [{ metric, otherColumn }, ...[...opPlan.keys()].flatMap((operatorId) => [metricOf(operatorId), attainmentOf(operatorId)])];
       const missingMetrics = new Set(inPlay.filter((m) => !(m.metric === 'OTHER'
         ? (performanceImport.detectedColumns?.otherHourColumns || []).includes(m.otherColumn)
         : performanceImport.detectedColumns?.[m.metric])).map((m) => HOUR_METRICS[m.metric]?.label || m.otherColumn));
@@ -612,6 +640,14 @@ export async function computeVdp(vdp, preloaded = {}) {
         metricOf: mixedPlans ? metricOf : undefined,
         attainmentOf,
       });
+      if (compassView.loaded) {
+        const missingHours = performance.days.filter((day) => {
+          const s = settingsOf(day.operatorId);
+          return s && ((needsPaidHours(s) && (day.hours === null || D(day.hours).lt(0))) || (needsAttainmentHours(s) && (day.attainmentHours === null || D(day.attainmentHours).lt(0))));
+        });
+        if (missingHours.length) exceptions.push(exception('PERFORMANCE_HOURS_MISSING',
+          `Required plan hours are missing or negative on ${dateList([...new Set(missingHours.map((day) => day.date))])}. Supply valid hours for the required metric before approval.`));
+      }
       if (importDoc?.stats?.sourceAdapter) {
         performance.sourceInputs = {
           adapter: importDoc.stats.sourceAdapter,
@@ -739,6 +775,12 @@ export async function computeVdp(vdp, preloaded = {}) {
     }
   }
 
+  if (performance && compassView.loaded) {
+    performance.compassDays = relevantCompass.filter((row) => row.providerId === String(provider._id)).map((row) => ({
+      date: row.date, route: row.route, operatorId: row.operatorId, trips: row.trips, serviceHours: row.serviceHours,
+      original: row.original, rowKey: row.rowKey, corrected: Boolean(row.correction), reason: row.correction?.reason || null,
+    }));
+  }
   const acknowledged = new Set(vdp.acknowledgements.map((a) => a.code));
   const open = exceptions.filter((e) => !(e.acknowledgeable && acknowledged.has(e.code)));
   const status = open.length || !calculation ? 'NEEDS_REVIEW' : 'READY';
@@ -746,7 +788,7 @@ export async function computeVdp(vdp, preloaded = {}) {
   return {
     provider, plan, version, cycle, settings, performance, calculation, exceptions, status,
     importDoc: isUber || isDivision3 ? null : importDoc,
-    uberImports, uberTollImports, division3Imports,
+    uberImports, uberTollImports, division3Imports, compassView,
   };
 }
 
@@ -760,6 +802,7 @@ function applyComputation(vdp, c) {
   vdp.performance = c.performance;
   vdp.calculation = c.calculation;
   vdp.provenance = {
+    compass: c.compassView?.importId ? { importId: c.compassView.importId, revision: c.compassView.revision, retrievedAt: c.compassView.lastSyncedAt } : null,
     providerId: String(c.provider._id),
     divisionId: String(c.cycle.divisionId),
     cycleId: String(c.cycle._id),
@@ -774,6 +817,7 @@ function applyComputation(vdp, c) {
       ...(c.uberImports || []).map((doc) => String(doc._id)),
       ...(c.uberTollImports || []).map((doc) => String(doc._id)),
       ...(c.division3Imports || []).map((doc) => String(doc._id)),
+      ...(c.compassView?.importId ? [String(c.compassView.importId)] : []),
     ],
     dailyFacts: (c.performance?.days || []).map((day) => ({
       date: day.date,
@@ -783,6 +827,9 @@ function applyComputation(vdp, c) {
       paidHours: day.hours,
       attainmentHours: day.attainmentHours,
       trips: day.trips,
+      serviceHours: day.serviceHours,
+      source: day.source,
+      sourceRowKeys: day.sourceRowKeys,
       tui: day.tui || null,
     })),
     calculatedAt: new Date(),
@@ -816,12 +863,20 @@ export async function processCycle(cycleId, user, { partial = false } = {}) {
   const division10 = String(division?.divisionNumber || '').trim() === '10';
   if (division10 && needsStandard) await refreshDivision10DerivedImport({ cycle, user });
   else if (needsStandard && divisionAdapterFor(division?.divisionNumber)) await refreshDivisionDerivedImport({ cycle, division, user });
-  const [importDoc, uberImports, uberTollImports, division3Imports] = await Promise.all([
+  const [uploadedImport, uberImports, uberTollImports, division3Imports] = await Promise.all([
     needsStandard ? activeImportFor(cycle._id) : Promise.resolve(null),
     needsUber ? activeUberImportsFor(cycle._id) : Promise.resolve([]),
     needsUber && division2 ? activeUberTollImportsFor(cycle._id) : Promise.resolve([]),
     division3 ? activeDivision3ImportsFor(cycle._id) : Promise.resolve([]),
   ]);
+  const compassView = await compassPerformanceView(cycleId, { providers });
+  const importDoc = await withCompassPerformance(cycle, uploadedImport, compassView);
+  if (compassView.refreshing) throw conflict('Wait for the Compass performance refresh to finish.');
+  let compassReadiness;
+  if (compassView.importId && !division3 && needsStandard) {
+    compassReadiness = await divisionSourceReadiness({ cycle, division, compassView });
+    if (compassReadiness.configured && (!compassReadiness.ready || !compassReadiness.processingSupported)) throw badRequest('Supply the remaining required performance and supplemental inputs before processing.');
+  }
   if (needsStandard && !importDoc) throw badRequest('Upload the Performance Report for this cycle before processing standard VDP plans.');
   if (needsUber && !division3 && !uberImports.length) throw badRequest('Upload valid Uber weekly data for this cycle before processing Uber VDP plans.');
   if (needsUber && uberImports.length && (division2 || division3 || division10)) {
@@ -879,11 +934,13 @@ export async function processCycle(cycleId, user, { partial = false } = {}) {
     vdp ||= new Vdp({ providerId: provider._id, divisionId: provider.divisionId, cycleId: cycle._id });
     const c = await computeVdp(vdp, {
       provider, cycle, division, importDoc, matches, plans, uberImports, uberTollImports, uberRows,
-      division3Imports, division3Rows,
+      division3Imports, division3Rows, compassView, compassReadiness,
     });
     applyComputation(vdp, c);
     vdp.history.push({ action: isNew ? 'PROCESSED' : 'RECALCULATED', by: actor(user) });
+    await assertCompassRevision(cycleId, compassView.importId ? compassView.revision : null);
     await vdp.save();
+    await assertCompassRevision(cycleId, compassView.importId ? compassView.revision : null).catch(async (error) => { await Vdp.updateOne({ _id: vdp._id }, { $set: { stale: true } }); throw error; });
     counts.processed += 1;
     if (vdp.status === 'READY') counts.ready += 1; else counts.needsReview += 1;
   }
@@ -903,7 +960,9 @@ async function loadEditable(id) {
 async function recalcAndSave(vdp, user, action, reason) {
   applyComputation(vdp, await computeVdp(vdp));
   vdp.history.push({ action, reason, by: actor(user) });
+  await assertCompassRevision(vdp.cycleId, vdp.provenance?.compass?.revision);
   await vdp.save();
+  await assertCompassRevision(vdp.cycleId, vdp.provenance?.compass?.revision).catch(async (error) => { await Vdp.updateOne({ _id: vdp._id }, { $set: { stale: true } }); throw error; });
   await syncCycleStatus(vdp.cycleId);
   return vdp;
 }
@@ -1202,7 +1261,7 @@ export async function approve(id, user) {
     by: actor(user),
     reason: corrected.length ? 'Corrected and sent back to the provider for approval' : 'Sent to provider for approval',
   });
-  await vdp.save();
+  await withCompassApprovalLock(vdp.cycleId, vdp.provenance?.compass?.revision, () => vdp.save());
   await autoApproveDue(); // approved after the deadline → processed straight away
   await syncCycleStatus(vdp.cycleId);
   return Vdp.findById(vdp._id);

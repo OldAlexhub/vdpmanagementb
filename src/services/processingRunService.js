@@ -9,6 +9,7 @@ import { processingDivisionsFor } from './divisionGroups.js';
 import { processCycle } from './vdpService.js';
 import { actor, badRequest, notFound } from './errors.js';
 import { recordAudit } from './auditService.js';
+import { ensureCompassPerformance } from './compassPerformanceService.js';
 
 function readinessFrom(summary) {
   const div3 = summary.division3Data;
@@ -147,6 +148,7 @@ export async function openRun({ cycleId, user }) {
     });
     await recordAudit({ action: 'PROCESSING_RUN_CREATED', entityType: 'ProcessingRun', entityId: run._id, entityLabel: `${division.divisionNumber} ${cycle.cycleStart.toISOString().slice(0, 10)}`, user });
   }
+  await ensureCompassPerformance(cycleId, user);
   return hydrate(run, { touch: true, user });
 }
 

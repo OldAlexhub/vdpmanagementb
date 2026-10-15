@@ -14,6 +14,7 @@ import { notFound } from './errors.js';
 import { autoApproveDue } from './vdpService.js';
 import { isDivision3Division, processingDivisionsFor } from './divisionGroups.js';
 import { divisionSourceReadiness } from './divisionSourceService.js';
+import { compassPerformanceView, compassSummary, withCompassPerformance } from './compassPerformanceService.js';
 
 export async function cycleSummary(cycleId) {
   await autoApproveDue();
@@ -22,7 +23,7 @@ export async function cycleSummary(cycleId) {
   const division = await Division.findById(cycle.divisionId);
   const processingDivisions = await processingDivisionsFor(division);
   const divisionIds = processingDivisions.map((item) => item._id);
-  const [providers, vdps, importDoc, uberImports, uberUploads, tollImports, tollUploads, plans, division3Imports, division3Uploads] = await Promise.all([
+  const [providers, vdps, uploadedImport, uberImports, uberUploads, tollImports, tollUploads, plans, division3Imports, division3Uploads] = await Promise.all([
     Provider.find({ divisionId: { $in: divisionIds } }),
     Vdp.find({ cycleId: cycle._id }, 'status gross net calculation.totalDeductions calculation.totalAdditions stale providerId exceptions'),
     activeImportFor(cycle._id),
@@ -35,6 +36,8 @@ export async function cycleSummary(cycleId) {
     listDivision3Imports({ cycleId: cycle._id }),
   ]);
 
+  const compassView = await compassPerformanceView(cycleId, { providers });
+  const importDoc = await withCompassPerformance(cycle, uploadedImport, compassView);
   const matches = importDoc ? matchRoutes(importDoc, providers) : [];
   const counts = { DRAFT: 0, NEEDS_REVIEW: 0, READY: 0, APPROVED: 0, DISPUTED: 0, PROCESSED: 0, PAID: 0 };
   vdps.forEach((v) => { counts[v.status] += 1; });
@@ -66,7 +69,7 @@ export async function cycleSummary(cycleId) {
     ? expectedUberWeeks.filter((week) => !loadedUberWeeks.includes(week))
     : [];
   const division3Data = division3 ? division3Readiness({ cycle, imports: division3Imports, providers, processingDivisions }) : null;
-  const divisionSources = await divisionSourceReadiness({ cycle, division });
+  const divisionSources = await divisionSourceReadiness({ cycle, division, compassView });
   const activePlanAssignments = expected.map((provider) => {
     const plan = plansById.get(String(provider.planId));
     return plan ? { provider, plan, version: resolveVersion(plan, cycle).version } : null;
@@ -91,6 +94,7 @@ export async function cycleSummary(cycleId) {
     cycle,
     division,
     processingDivisions,
+    compassPerformance: compassSummary(compassView),
     performance: importDoc
       ? {
           loaded: true,

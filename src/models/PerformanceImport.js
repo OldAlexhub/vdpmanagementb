@@ -8,6 +8,7 @@ const rowSchema = new Schema(
   {
     date: { type: String, required: true }, // YYYY-MM-DD
     route: { type: String, required: true },
+    compassDerived: { type: Boolean, default: false }, // materialized Compass metrics are never uploaded fallback
     trips: dec(),
     totalHours: dec({ default: null }),
     serviceHours: dec({ default: null }),
@@ -221,7 +222,7 @@ const importSchema = new Schema(
   {
     divisionId: { type: Schema.Types.ObjectId, ref: 'Division', required: true },
     cycleId: { type: Schema.Types.ObjectId, ref: 'VdpCycle', required: true },
-    kind: { type: String, enum: ['STANDARD', 'UBER', 'UBER_TOLLS', 'DIV3_ADA', 'DIV3_GOLINK', 'DIV3_ADA_FARE', 'DIV3_RETURNED_FARE', 'DIVISION_SOURCE'], default: 'STANDARD', index: true },
+    kind: { type: String, enum: ['STANDARD', 'COMPASS', 'UBER', 'UBER_TOLLS', 'DIV3_ADA', 'DIV3_GOLINK', 'DIV3_ADA_FARE', 'DIV3_RETURNED_FARE', 'DIVISION_SOURCE'], default: 'STANDARD', index: true },
     // Exact source slot from the division-specific upload contract. Keeping a
     // single kind avoids pretending these unlike reports share one schema.
     datasetType: { type: String, trim: true, default: null, index: true },
